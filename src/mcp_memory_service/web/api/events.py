@@ -7,10 +7,10 @@ from pydantic import BaseModel
 from typing import List, Optional
 
 # OAuth config no longer needed - auth is always enabled
-from ..sse import create_event_stream, sse_manager
+from ..sse import create_event_stream, sse_manager, parse_store_subscription
 
 # OAuth authentication imports
-from ..oauth.middleware import require_read_access, AuthenticationResult
+from ..oauth.middleware import require_read_access, get_current_user, AuthenticationResult
 
 router = APIRouter()
 
@@ -45,7 +45,7 @@ async def events_endpoint(
             "regardless of this filter."
         ),
     ),
-    user: AuthenticationResult = Depends(require_read_access)
+    user: AuthenticationResult = Depends(get_current_user)
 ):
     """
     Server-Sent Events endpoint for real-time updates.
@@ -59,13 +59,23 @@ async def events_endpoint(
     - connection_established: Welcome message
 
     memory_stored / memory_deleted events carry the store partition they
-    belong to and can be filtered with the ``store`` query parameter. This is
-    an opt-in convenience filter, not an access control boundary: any caller
-    with read access may subscribe to any store or to the firehose.
+    belong to and are filtered with the ``store`` query parameter. The filter
+    is scope-enforced: a caller may subscribe only to stores it has read
+    access to. A caller with a global ``read`` scope may use the firehose
+    (every store); a store-restricted caller (e.g. ``read:projectA``) must name
+    its stores and cannot subscribe to the firehose. System events (heartbeat,
+    health, connection lifecycle) are always delivered.
     """
-    # `store` is declared for OpenAPI/validation; create_event_stream reads it
-    # back off request.query_params so repeated and comma-separated forms are
-    # parsed in one place.
+    # Enforce read scope against the requested subscription. `store` is also
+    # declared above for OpenAPI; create_event_stream re-reads it off
+    # request.query_params so parsing lives in one place.
+    requested = parse_store_subscription(request.query_params)
+    if requested is None:
+        # Firehose (no store / "all"): spans every partition -> needs global read.
+        user.require_store_scope("read", None)
+    else:
+        for name in requested:
+            user.require_store_scope("read", name)
     return await create_event_stream(request)
 
 
