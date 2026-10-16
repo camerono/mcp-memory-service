@@ -88,6 +88,40 @@ class AuthenticationResult:
                 }
             )
 
+    def has_store_scope(self, operation: str, store: Optional[str]) -> bool:
+        """Check access to a store partition for ``operation`` ("read"/"write").
+
+        A global ``operation`` scope ("read"/"write") grants every store, which
+        is the pre-existing behaviour (all tokens were global). Otherwise a
+        parameterized ``operation:<store>`` scope grants exactly that store.
+        ``store`` is ``None`` for a cross-partition request (the ``all``
+        sentinel, resolved by ``resolve_store``); that spans every partition and
+        so requires the global scope — a store-restricted token cannot use it.
+        """
+        if not self.authenticated or not self.scope:
+            return False
+        scopes = self.scope.split()
+        if operation in scopes:
+            return True
+        if store is None:
+            return False
+        return f"{operation}:{store}" in scopes
+
+    def require_store_scope(self, operation: str, store: Optional[str]) -> None:
+        """Raise 403 if ``operation`` on ``store`` is not permitted."""
+        if not self.has_store_scope(operation, store):
+            if store is None:
+                needed = f"'{operation}' (global, for cross-store access)"
+            else:
+                needed = f"'{operation}' or '{operation}:{store}'"
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={
+                    "error": "insufficient_scope",
+                    "error_description": f"Access to store requires scope {needed}",
+                }
+            )
+
 
 def validate_jwt_token(token: str) -> Optional[Dict[str, Any]]:
     """
@@ -461,6 +495,38 @@ async def require_write_access(user: AuthenticationResult = Depends(get_current_
 async def require_admin_access(user: AuthenticationResult = Depends(get_current_user)) -> AuthenticationResult:
     """Require admin access to the resource."""
     user.require_scope("admin")
+    return user
+
+
+# Store-aware access dependencies for routes that carry a `store` query param.
+# A global "read"/"write" scope grants every store (backward compatible); a
+# parameterized "read:<store>"/"write:<store>" scope grants just that store. The
+# `store=all` sentinel is cross-partition and requires the global scope. Routes
+# whose store arrives in the request body enforce in-handler via
+# AuthenticationResult.require_store_scope instead (a dependency cannot read the
+# body). The store is read straight off the query string (mirroring the route's
+# default of "default") rather than re-declared as a Query param, so it does not
+# duplicate the route's own `store` parameter in the OpenAPI schema.
+def _query_store(request: Request) -> Optional[str]:
+    store = request.query_params.get("store", "default")
+    return None if store == "all" else store
+
+
+async def require_store_read(
+    request: Request,
+    user: AuthenticationResult = Depends(get_current_user),
+) -> AuthenticationResult:
+    """Require read access to the store named by the `store` query param."""
+    user.require_store_scope("read", _query_store(request))
+    return user
+
+
+async def require_store_write(
+    request: Request,
+    user: AuthenticationResult = Depends(get_current_user),
+) -> AuthenticationResult:
+    """Require write access to the store named by the `store` query param."""
+    user.require_store_scope("write", _query_store(request))
     return user
 
 
