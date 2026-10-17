@@ -8,8 +8,12 @@ env/
 .Python
 
 # Python Cache Files
+# The bare patterns only match the build context root, so the nested caches
+# under src/ and scripts/ were being copied into the image.
 __pycache__/
+**/__pycache__/
 *.py[cod]
+**/*.py[cod]
 *$py.class
 *.so
 .pytest_cache/

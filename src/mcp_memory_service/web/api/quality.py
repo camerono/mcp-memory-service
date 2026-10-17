@@ -126,13 +126,15 @@ async def rate_memory(
         memory.metadata['user_feedback'] = request.feedback
         memory.metadata['user_rating_timestamp'] = time.time()
 
-        # Recalculate quality score with user rating weighted higher
-        # User rating: 0.6 weight, AI/implicit: 0.4 weight
-        user_score = (request.rating + 1) / 2.0  # Convert -1,0,1 to 0.0,0.5,1.0
+        # Quality model split (#1312): keep computed_quality (machine) separate from
+        # user_rating (human), preserve computed_quality, materialize effective score.
+        from ...quality.config import effective_quality
+        computed = memory.metadata.get('computed_quality')
+        if computed is None:
+            computed = memory.metadata.get('quality_score', 0.5)
+            memory.metadata['computed_quality'] = computed
         old_score = memory.metadata.get('quality_score', 0.5)
-
-        # Combine scores
-        new_quality_score = 0.6 * user_score + 0.4 * old_score
+        new_quality_score = effective_quality(computed=computed, user_rating=request.rating)
         memory.metadata['quality_score'] = new_quality_score
 
         # Track historical ratings
@@ -166,7 +168,7 @@ async def rate_memory(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error rating memory {_sanitize_log_value(content_hash)}: {e}")
+        logger.error("Error rating memory %s: %s", _sanitize_log_value(content_hash), _sanitize_log_value(e))
         raise HTTPException(status_code=500, detail=f"Error rating memory: {str(e)}")
 
 
@@ -213,8 +215,10 @@ async def evaluate_memory_quality(
         scorer = QualityScorer()
         old_score = memory.metadata.get('quality_score', 0.5)
 
-        # Calculate quality score (this updates memory.metadata internally)
-        quality_score = await scorer.calculate_quality_score(memory, query)
+        # Calculate quality score (this updates memory.metadata internally:
+        # writes computed_quality + materialized effective quality_score, #1312)
+        await scorer.calculate_quality_score(memory, query)
+        quality_score = memory.metadata.get('quality_score', 0.5)
 
         # Extract component scores from metadata
         ai_score = None
@@ -228,6 +232,7 @@ async def evaluate_memory_quality(
         # Prepare updates with only the quality-related fields
         updates = {
             'quality_score': quality_score,
+            'computed_quality': memory.metadata.get('computed_quality', quality_score),
             'quality_provider': quality_provider,
         }
         if ai_scores:
@@ -235,7 +240,7 @@ async def evaluate_memory_quality(
         if 'quality_components' in memory.metadata:
             updates['quality_components'] = memory.metadata['quality_components']
 
-        logger.info(f"Persisting quality metadata for {_sanitize_log_value(content_hash[:8])}...: {updates}")
+        logger.info("Persisting quality metadata for %s...: %s", _sanitize_log_value(content_hash[:8]), _sanitize_log_value(updates))
 
         # Persist updated metadata to storage
         success, message = await storage.update_memory_metadata(
@@ -245,13 +250,19 @@ async def evaluate_memory_quality(
         )
 
         if not success:
-            logger.error(f"Failed to persist quality metadata: {_sanitize_log_value(message)}")
+            logger.error("Failed to persist quality metadata: %s", _sanitize_log_value(message))
         else:
-            logger.info(f"Successfully persisted quality metadata for {_sanitize_log_value(content_hash[:8])}...")
+            logger.info("Successfully persisted quality metadata for %s...", _sanitize_log_value(content_hash[:8]))
 
         evaluation_time_ms = (time.time() - start_time) * 1000
 
-        logger.info(f"Evaluated memory {_sanitize_log_value(content_hash[:8])}... score: {quality_score:.3f} ({_sanitize_log_value(quality_provider)}) in {evaluation_time_ms:.1f}ms")
+        logger.info(
+            "Evaluated memory %s... score: %.3f (%s) in %.1fms",
+            _sanitize_log_value(content_hash[:8]),
+            quality_score,
+            _sanitize_log_value(quality_provider),
+            evaluation_time_ms,
+        )
 
         return EvaluateResponse(
             success=True,
@@ -267,7 +278,7 @@ async def evaluate_memory_quality(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error("Error evaluating memory %s: %s", _sanitize_log_value(content_hash), e)
+        logger.error("Error evaluating memory %s: %s", _sanitize_log_value(content_hash), _sanitize_log_value(e))
         raise HTTPException(status_code=500, detail="Error evaluating memory quality")
 
 
@@ -312,7 +323,7 @@ async def get_memory_quality(content_hash: str, storage=Depends(get_storage), us
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error getting memory quality {_sanitize_log_value(content_hash)}: {e}")
+        logger.error("Error getting memory quality %s: %s", _sanitize_log_value(content_hash), _sanitize_log_value(e))
         raise HTTPException(status_code=500, detail=f"Error getting memory quality: {str(e)}")
 
 
@@ -343,17 +354,18 @@ async def get_quality_distribution(
         Distribution statistics
     """
     try:
-        # Retrieve all memories
+        # Retrieve all memories. The fallback that used to sit here called
+        # storage.semantic_search(), which no backend implements — an
+        # AttributeError caught by an except AttributeError, one layer down.
+        # get_all_memories() is declared on MemoryStorage and implemented by
+        # every backend, so there is nothing to fall back to.
         try:
             all_memories_result = await storage.get_all_memories()
         except AttributeError:
-            try:
-                all_memories_result = await storage.semantic_search("", n_results=10000)
-            except Exception:
-                raise HTTPException(
-                    status_code=500,
-                    detail="Unable to retrieve all memories from storage backend"
-                )
+            raise HTTPException(
+                status_code=500,
+                detail="Unable to retrieve all memories from storage backend"
+            )
 
         if not all_memories_result:
             return DistributionResponse(
@@ -442,7 +454,7 @@ async def get_quality_distribution(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error analyzing quality distribution: {e}")
+        logger.error("Error analyzing quality distribution: %s", _sanitize_log_value(e))
         raise HTTPException(status_code=500, detail=f"Error analyzing quality distribution: {str(e)}")
 
 
@@ -469,26 +481,17 @@ async def get_quality_trends(days: int = 30, storage=Depends(get_storage), user:
         start_timestamp = start_date.timestamp()
         end_timestamp = end_date.timestamp()
 
-        # Retrieve memories in timeframe
-        try:
-            # Try to get memories by timeframe if supported
-            memories_result = await storage.recall_by_timeframe(
-                start_date.strftime("%Y-%m-%d"),
-                end_date.strftime("%Y-%m-%d"),
-                n_results=10000
-            )
-        except AttributeError:
-            # Fallback to all memories and filter
-            all_memories_result = await storage.search_all_memories()
-            memories_result = [
-                m for m in all_memories_result
-                if start_timestamp <= m.get('created_at', 0) <= end_timestamp
-            ]
+        # DB-side timeframe filter on all backends (issue #981).
+        # The previous storage.recall_by_timeframe / storage.search_all_memories
+        # calls hit non-existent methods and 500'd on every backend.
+        memories_in_range = await storage.get_memories_by_time_range(
+            start_time=start_timestamp,
+            end_time=end_timestamp,
+        )
 
         # Group by day and calculate daily statistics
         daily_stats = {}
-        for mem_dict in memories_result:
-            memory = Memory.from_dict(mem_dict)
+        for memory in memories_in_range:
             created_date = datetime.fromtimestamp(memory.created_at).date()
             day_key = created_date.isoformat()
 
@@ -523,5 +526,5 @@ async def get_quality_trends(days: int = 30, storage=Depends(get_storage), user:
         }
 
     except Exception as e:
-        logger.error(f"Error getting quality trends: {e}")
+        logger.error("Error getting quality trends: %s", _sanitize_log_value(e))
         raise HTTPException(status_code=500, detail=f"Error getting quality trends: {str(e)}")

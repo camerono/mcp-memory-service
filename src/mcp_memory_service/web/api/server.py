@@ -36,6 +36,8 @@ try:
 except (ImportError, AttributeError):
     __version__ = "0.0.0.dev0"
 
+from ...compat import _sanitize_log_value
+
 # OAuth authentication imports
 from ..oauth.middleware import require_read_access, require_admin_access, AuthenticationResult
 
@@ -212,9 +214,9 @@ async def _restart_server_delayed():
     except PermissionError:
         logger.error("Failed to restart server: insufficient permissions")
     except FileNotFoundError:
-        logger.error(f"Failed to restart server: executable not found: {sys.executable}")
+        logger.error("Failed to restart server: executable not found: %s", _sanitize_log_value(sys.executable))
     except Exception as e:
-        logger.error(f"Failed to restart server: {type(e).__name__} - {e}")
+        logger.error("Failed to restart server: %s - %s", _sanitize_log_value(type(e).__name__), _sanitize_log_value(e))
         sys.exit(1)
 
 
@@ -254,8 +256,16 @@ async def check_for_updates(
     Returns number of commits behind and list of commit messages.
     Requires admin access.
     """
+    # The remote name and branch are configurable so installs whose remote is
+    # named differently (codeberg, upstream, ...) or tracks a non-main branch can
+    # still check for updates without editing the source. Defaults preserve the
+    # historical origin/main behavior.
+    remote = os.getenv('MCP_UPDATE_GIT_REMOTE', 'origin')
+    branch = os.getenv('MCP_UPDATE_GIT_BRANCH', 'main')
+    upstream_ref = f'{remote}/{branch}'
+
     # Try to fetch latest changes
-    fetch_output, fetch_success = _run_git_command(['fetch', 'origin'])
+    fetch_output, fetch_success = _run_git_command(['fetch', remote])
 
     if not fetch_success:
         return VersionCheckResponse(
@@ -268,8 +278,8 @@ async def check_for_updates(
             error=fetch_output
         )
 
-    # Count commits behind origin/main
-    count_output, count_success = _run_git_command(['rev-list', '--count', 'HEAD..origin/main'])
+    # Count commits behind the configured upstream ref
+    count_output, count_success = _run_git_command(['rev-list', '--count', f'HEAD..{upstream_ref}'])
 
     if not count_success:
         return VersionCheckResponse(
@@ -291,7 +301,7 @@ async def check_for_updates(
     latest_commits = []
     if commits_behind > 0:
         log_output, log_success = _run_git_command([
-            'log', '--oneline', '--no-decorate', f'HEAD..origin/main', '-n', '5'
+            'log', '--oneline', '--no-decorate', f'HEAD..{upstream_ref}', '-n', '5'
         ])
         if log_success and log_output:
             latest_commits = [line.strip() for line in log_output.split('\n') if line.strip()]
@@ -404,7 +414,7 @@ async def update_server(
     git_output, git_success = _run_git_command(['pull', 'origin', 'main'])
 
     if not git_success:
-        logger.error(f"AUDIT: Server update aborted — git pull failed: {git_output}")
+        logger.error("AUDIT: Server update aborted — git pull failed: %s", _sanitize_log_value(git_output))
         raise HTTPException(
             status_code=500,
             detail=f"Git pull failed: {git_output}",
@@ -414,7 +424,7 @@ async def update_server(
     pip_output, pip_success = _run_pip_command(['install', '-e', '.'])
 
     if not pip_success:
-        logger.error(f"AUDIT: Server update aborted — pip install failed: {pip_output}")
+        logger.error("AUDIT: Server update aborted — pip install failed: %s", _sanitize_log_value(pip_output))
         raise HTTPException(
             status_code=500,
             detail=f"Pip install failed (git pull already succeeded — repository is at the new revision but dependencies are not installed): {pip_output}",

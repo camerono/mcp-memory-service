@@ -49,7 +49,8 @@ else
     PIP_BIN="$(command -v pip3 || command -v pip)"
     PYTEST_BIN="$(command -v pytest)"
 fi
-[ -x "$PYTEST_BIN" ] || PYTEST_BIN="$PYTHON_BIN -m pytest"
+# An array, so a path with spaces survives and the fallback needs no word splitting.
+if [ -x "$PYTEST_BIN" ]; then PYTEST_CMD=("$PYTEST_BIN"); else PYTEST_CMD=("$PYTHON_BIN" -m pytest); fi
 
 echo -e "${BLUE}╔═══════════════════════════════════════════════════════════════╗${NC}"
 echo -e "${BLUE}║         Pre-PR Quality Gate - MCP Memory Service             ║${NC}"
@@ -57,9 +58,11 @@ echo -e "${BLUE}╚════════════════════�
 echo ""
 
 FAILED_CHECKS=0
+SKIPPED_CHECKS=0
 TOTAL_CHECKS=0
 
 # Helper function for check status
+# status: 0 = pass, 3 = skipped (tool missing — neither pass nor fail), else fail
 check_status() {
     local name="$1"
     local status=$2
@@ -67,6 +70,9 @@ check_status() {
 
     if [ $status -eq 0 ]; then
         echo -e "${GREEN}✅ PASS${NC} - $name"
+    elif [ $status -eq 3 ]; then
+        echo -e "${YELLOW}SKIP${NC} - $name (not enforced — see note below)"
+        SKIPPED_CHECKS=$((SKIPPED_CHECKS + 1))
     else
         echo -e "${RED}❌ FAIL${NC} - $name"
         FAILED_CHECKS=$((FAILED_CHECKS + 1))
@@ -84,46 +90,170 @@ echo -e "${GREEN}✅${NC} Found $(echo "$STAGED_FILES" | wc -l) staged files"
 
 # Check 2: Run full quality gate
 echo -e "\n${YELLOW}[2/9]${NC} Running quality_gate.sh (complexity, security, PEP 8)..."
-if bash scripts/pr/quality_gate.sh --staged --with-pyscn; then
-    check_status "Quality gate (complexity ≤8, no security issues)" 0
+set +e
+bash scripts/pr/quality_gate.sh --staged --with-pyscn
+QUALITY_GATE_EXIT=$?
+set -e
+if [ $QUALITY_GATE_EXIT -eq 0 ]; then
+    check_status "Quality gate (complexity, security, test coverage, breaking changes)" 0
+elif [ $QUALITY_GATE_EXIT -eq 3 ]; then
+    # Gemini CLI missing — the gate ran nothing. Reporting this as a pass made
+    # the whole check meaningless on machines without the CLI.
+    check_status "Quality gate (complexity, security, test coverage, breaking changes)" 3
+    echo -e "${YELLOW}   Complexity and security were not evaluated locally — CI still checks them${NC}"
 else
-    check_status "Quality gate (complexity ≤8, no security issues)" 1
-    echo -e "${RED}   Fix high-complexity functions or security issues before creating PR${NC}"
+    check_status "Quality gate (complexity, security, test coverage, breaking changes)" 1
+    echo -e "${RED}   See the FINDINGS list above - it names the check that failed${NC}"
 fi
+
+# True when every given file matches the push paths-ignore list in
+# .github/workflows/ci.yml, i.e. CI would not run the test matrix for this change
+# either. ci.yml's `changes` job evaluates this very function on pull requests. In `case`, `*` also matches `/`, so `.github/*.md` covers
+# `.github/**/*.md`; the `*/*` arm keeps `*.md` to the repository root, as in CI.
+# An empty list is not docs-only. tests/ci/test_pre_pr_check.sh pins this to ci.yml.
+is_docs_only() {
+    [ -n "$1" ] || return 1
+    local f
+    while IFS= read -r f; do
+        case "$f" in
+            docs/*|changelog.d/*|.github/*.md|LICENSE|NOTICE|.gitignore) ;;
+            */*) return 1 ;;
+            *.md) ;;
+            *) return 1 ;;
+        esac
+    done <<< "$1"
+}
+
+# Every file the PR changes against origin/main: committed on the branch, staged,
+# and unstaged. CI judges the whole PR diff and the suite runs on the working
+# tree, so the staged files alone are not enough. Prints nothing without a base,
+# which makes is_docs_only fail and the suite run.
+pr_changed_files() {
+    local base
+    base=$(git merge-base HEAD origin/main 2>/dev/null) || return 0
+    { git diff --name-only "$base"; git diff --cached --name-only "$base"; } | sort -u
+}
 
 # Check 3: Run test suite with coverage
 echo -e "\n${YELLOW}[3/9]${NC} Running test suite with coverage..."
 
-# Check if pytest-cov is installed
-if ! "$PYTHON_BIN" -c "import pytest_cov" 2>/dev/null; then
-    echo -e "${YELLOW}   Installing pytest-cov...${NC}"
-    "$PIP_BIN" install pytest-cov > /dev/null 2>&1
+if is_docs_only "$(pr_changed_files)"; then
+    # Same files CI skips; running the suite here would only re-test main.
+    check_status "Test suite" 3
+    check_status "Test coverage" 3
+    echo -e "${YELLOW}   Docs-only change (CI skips its tests too) - tests not run${NC}"
+else
+# Only the tests this change can reach (scripts/pr/lib/select_tests.py). The full
+# suite is CI's required `Tests + Coverage` job on the same PR, and repeating it
+# here took minutes. PRE_PR_FULL_SUITE=1 runs it locally anyway; so does a change
+# without a base to diff against, or one the selector maps to ALL.
+CHANGED_FILES=$(pr_changed_files)
+if [ -n "${PRE_PR_FULL_SUITE:-}" ] || [ -z "$CHANGED_FILES" ]; then
+    TEST_TARGETS=ALL
+else
+    TEST_TARGETS=$(echo "$CHANGED_FILES" | "$PYTHON_BIN" "$REPO_ROOT/scripts/pr/lib/select_tests.py" --repo "$REPO_ROOT")
+fi
+TEST_ARGS=()
+COV_ARGS=()
+if [ "$TEST_TARGETS" = ALL ]; then
+    TEST_ARGS=(tests/)
+    COV_ARGS=(--cov=src/mcp_memory_service --cov-report=term-missing)
+    echo -e "${YELLOW}   Full suite${NC}"
+    # Check if pytest-cov is installed
+    if ! "$PYTHON_BIN" -c "import pytest_cov" 2>/dev/null; then
+        echo -e "${YELLOW}   Installing pytest-cov...${NC}"
+        "$PIP_BIN" install pytest-cov > /dev/null 2>&1
+    fi
+elif [ -n "$TEST_TARGETS" ]; then
+    echo -e "${YELLOW}   Test targets reached by this change (PRE_PR_FULL_SUITE=1 for all):${NC}"
+    printf '%s\n' "$TEST_TARGETS" | sed 's/^/     /'
+    # tests/ci/*.sh harnesses run with bash, the rest with pytest. The full suite
+    # (ALL) stays pytest-only; CI's shell-tests job runs every harness.
+    SH_FAILED=""
+    SH_COUNT=0
+    while IFS= read -r t; do
+        case "$t" in
+            *.sh)
+                SH_COUNT=$((SH_COUNT + 1))
+                if ! SH_OUTPUT=$(bash "$t" 2>&1); then
+                    # Harnesses print "not ok - <name>" plus indented detail; keep
+                    # that, as the pytest branch keeps FAILED lines. A harness that
+                    # crashed before reporting gets its last lines instead.
+                    SH_DETAIL=$(echo "$SH_OUTPUT" | grep -A3 '^not ok' | head -20)
+                    [ -n "$SH_DETAIL" ] || SH_DETAIL=$(echo "$SH_OUTPUT" | tail -5)
+                    SH_FAILED="$SH_FAILED$t"$'\n'"$(echo "$SH_DETAIL" | sed 's/^/  /')"$'\n'
+                fi
+                ;;
+            *) TEST_ARGS+=("$t") ;;
+        esac
+    done <<< "$TEST_TARGETS"
+    if [ "$SH_COUNT" -gt 0 ]; then
+        if [ -z "$SH_FAILED" ]; then
+            check_status "Shell tests ($SH_COUNT selected)" 0
+        else
+            check_status "Shell tests ($SH_COUNT selected)" 1
+            echo -e "${RED}   Failed:${NC}"
+            printf '%s' "$SH_FAILED" | sed 's/^/     /'
+        fi
+    fi
 fi
 
-# Run tests with coverage
-COVERAGE_OUTPUT=$($PYTEST_BIN tests/ -q --tb=short \
-    --cov=src/mcp_memory_service \
-    --cov-report=term-missing 2>&1)
-
+if [ ${#TEST_ARGS[@]} -eq 0 ]; then
+    check_status "Test suite" 3
+    check_status "Test coverage" 3
+    echo -e "${YELLOW}   No Python test reached by this change - pytest not run (CI runs the full suite)${NC}"
+else
+# `set +e` around the assignment is load-bearing: under `set -e` a failing
+# pytest inside $(...) aborts this script immediately, so the TEST_EXIT_CODE
+# handling below never ran and a failing suite looked like the gate itself
+# crashing with no message.
+# The flags mirror .github/workflows/ci.yml (tests/ci/test_pre_pr_check.sh pins
+# the two together). Benchmarks stay out; test_cli_interfaces.py shells to `uv run`.
+set +e
+COVERAGE_OUTPUT=$("${PYTEST_CMD[@]}" "${TEST_ARGS[@]}" -q --tb=short \
+    --ignore=tests/benchmarks \
+    --ignore=tests/integration/test_cli_interfaces.py \
+    -m "not benchmark" \
+    --timeout=120 \
+    "${COV_ARGS[@]}" 2>&1)
 TEST_EXIT_CODE=$?
+set -e
 COVERAGE_PERCENT=$(echo "$COVERAGE_OUTPUT" | grep "TOTAL" | awk '{print $4}' | sed 's/%//')
+echo "$COVERAGE_OUTPUT" | tail -1 | sed 's/^/     /'
 
-if [ $TEST_EXIT_CODE -eq 0 ]; then
+if [ $TEST_EXIT_CODE -eq 0 ] || [ $TEST_EXIT_CODE -eq 5 ]; then
+    # 5: pytest collected nothing, e.g. a selected file holds only benchmarks.
     check_status "Test suite" 0
 else
     check_status "Test suite" 1
     echo -e "${RED}   Fix failing tests before creating PR${NC}"
+    # Show what actually failed — the output was captured, so without this the
+    # user is told to fix failing tests without being told which ones.
+    echo "$COVERAGE_OUTPUT" | grep -E "^(FAILED|ERROR)" | head -20 | sed 's/^/     /'
 fi
 
-# Coverage threshold check
-if [ -n "$COVERAGE_PERCENT" ] && [ "$COVERAGE_PERCENT" -ge 80 ]; then
-    check_status "Test coverage (≥80%)" 0
+# Coverage threshold check.
+#
+# Advisory, not blocking — same stance as .github/workflows/ci.yml, which runs
+# coverage without --cov-fail-under and says so: "coverage is report-only for
+# now, re-introduce a gate once the deterministic-subset baseline is known and
+# stable". The deterministic subset currently sits near 60%, so a hard 80% here
+# meant this gate could not be passed by anyone, on any branch.
+COVERAGE_TARGET=80
+if [ "$TEST_TARGETS" != ALL ]; then
+    # A selected run covers a slice of the package; its total says nothing.
+    check_status "Test coverage (target ${COVERAGE_TARGET}%)" 3
+    echo -e "${YELLOW}   Not measured for a selected run; CI reports it${NC}"
+elif [ -n "$COVERAGE_PERCENT" ] && [ "$COVERAGE_PERCENT" -ge "$COVERAGE_TARGET" ]; then
+    check_status "Test coverage (target ${COVERAGE_TARGET}%)" 0
     echo -e "${GREEN}   Current coverage: ${COVERAGE_PERCENT}%${NC}"
 else
-    check_status "Test coverage (≥80%)" 1
-    echo -e "${RED}   Current coverage: ${COVERAGE_PERCENT}% (minimum: 80%)${NC}"
-    echo -e "${YELLOW}   Add tests for untested code${NC}"
+    check_status "Test coverage (target ${COVERAGE_TARGET}%)" 3
+    echo -e "${YELLOW}   Current coverage: ${COVERAGE_PERCENT}% (target: ${COVERAGE_TARGET}%, advisory)${NC}"
+    echo -e "${YELLOW}   Add tests for the code this PR touches; the target is not enforced yet${NC}"
 fi
+fi  # no test targets
+fi  # is_docs_only (body left unindented: tests/ci/test_pre_pr_check.sh anchors on column 0)
 
 # Check 3.5: Handler coverage check
 echo -e "\n${YELLOW}[3.5/9]${NC} Checking handler test coverage..."
@@ -150,8 +280,11 @@ echo -e "\n${YELLOW}[5/9]${NC} Checking import ordering (PEP 8)..."
 IMPORT_ISSUES=0
 for file in $(echo "$STAGED_FILES" | grep '\.py$' | grep -v '^claude-hooks/' || true); do
     if [ -f "$file" ]; then
-        # Check for inline imports (not at top of file)
-        if grep -n "^    import\|^        import" "$file" | grep -v "# inline import" > /dev/null; then
+        # Check for inline imports (not at top of file). The trailing space is
+        # load-bearing: without it the pattern also matches any indented line
+        # starting with `importlib`, e.g. `    importlib.util.find_spec(...)`,
+        # and reports it as a misplaced import.
+        if grep -n "^    import \|^        import " "$file" | grep -v "# inline import" > /dev/null; then
             echo -e "${RED}   Found inline imports in $file (should be at top)${NC}"
             IMPORT_ISSUES=$((IMPORT_ISSUES + 1))
         fi
@@ -173,8 +306,17 @@ echo -e "\n${YELLOW}[6/9]${NC} Checking for debug code..."
 DEBUG_ISSUES=0
 for file in $(echo "$STAGED_FILES" | grep '\.py$' | grep -v '^claude-hooks/' || true); do
     if [ -f "$file" ]; then
-        # Check for common debug patterns
-        if grep -n "import pdb\|breakpoint()\|print(" "$file" | grep -v "logger.debug\|# debug\|\"print" > /dev/null 2>&1; then
+        # A debugger left behind is always wrong, wherever it sits.
+        DEBUG_PATTERN="import pdb\|breakpoint()"
+
+        # print() only counts as debug code in the library. CLI scripts and
+        # tests print as their normal output, so flagging it there made the
+        # gate unpassable for any change under scripts/ (#188).
+        case "$file" in
+            src/*) DEBUG_PATTERN="$DEBUG_PATTERN\|print(" ;;
+        esac
+
+        if grep -n "$DEBUG_PATTERN" "$file" | grep -v "logger.debug\|# debug\|\"print" > /dev/null 2>&1; then
             echo -e "${YELLOW}   Found potential debug code in $file${NC}"
             DEBUG_ISSUES=$((DEBUG_ISSUES + 1))
         fi
@@ -186,6 +328,83 @@ if [ $DEBUG_ISSUES -eq 0 ]; then
 else
     check_status "No debug code" 1
     echo -e "${YELLOW}   Review and remove debug statements (or add '# debug' comment if intentional)${NC}"
+fi
+
+# Check 6.5: Log injection guard
+echo -e "\n${YELLOW}[6.5/9]${NC} Checking for unsanitized log calls (log-injection guard)..."
+LOG_INJECT_ISSUES=0
+for file in $(echo "$STAGED_FILES" | grep '\.py$' | grep -v '^claude-hooks/' || true); do
+    if [ -f "$file" ]; then
+        # Flag f-string logger calls without _sanitize_log_value — potential log injection
+        HITS=$(grep -En 'logger\.(info|warning|error|debug|critical)\(f"' "$file" \
+               | grep -v '_sanitize_log_value' || true)
+        if [ -n "$HITS" ]; then
+            echo -e "${YELLOW}   Potential log injection in $file:${NC}"
+            echo "$HITS" | head -5 | sed 's/^/     /'
+            LOG_INJECT_ISSUES=$((LOG_INJECT_ISSUES + 1))
+        fi
+    fi
+done
+
+if [ $LOG_INJECT_ISSUES -eq 0 ]; then
+    check_status "Log injection guard (f-string logger calls sanitized)" 0
+else
+    check_status "Log injection guard (f-string logger calls sanitized)" 1
+    echo -e "${RED}   Wrap user-provided values with _sanitize_log_value() from compat.py${NC}"
+    echo -e "${YELLOW}   Example: logger.info(f\"Stored: {_sanitize_log_value(content)}\")${NC}"
+    echo -e "${YELLOW}   See: src/mcp_memory_service/compat.py for the utility function${NC}"
+fi
+
+# Check 6.6: Bundled hooks config carries no credentials
+echo -e "\n${YELLOW}[6.6/9]${NC} Checking bundled hooks config for credentials..."
+if bash scripts/ci/check_hooks_config_secrets.sh > /dev/null 2>&1; then
+    check_status "Bundled hooks config free of credentials/local paths" 0
+else
+    check_status "Bundled hooks config free of credentials/local paths" 1
+    echo -e "${RED}   claude-hooks/config.json ships to users - replace personal values:${NC}"
+    bash scripts/ci/check_hooks_config_secrets.sh || true
+fi
+
+# Check 6.7: Bundled hooks config and its template have not drifted apart
+echo -e "\n${YELLOW}[6.7/9]${NC} Checking bundled hooks config against its template..."
+if bash scripts/ci/check_hooks_config_drift.sh > /dev/null 2>&1; then
+    check_status "Hooks config and template share one key structure" 0
+else
+    check_status "Hooks config and template share one key structure" 1
+    echo -e "${RED}   Add the same keys to whichever file is missing them:${NC}"
+    bash scripts/ci/check_hooks_config_drift.sh || true
+fi
+
+# Check 6.8: Dead references in active docs
+# scripts/ci/check_dead_refs.sh existed since #702 but was invoked by nothing —
+# no CI workflow, no hook, not this gate — while CLAUDE.md told contributors
+# it ran in CI on docs changes. Running it here is the cheap half of the fix
+# (0.5s, whole-tree scan of docs/ and README.md); the CI trigger is the
+# shell-tests job in ci.yml, added in #1162.
+echo -e "\n${YELLOW}[6.8/9]${NC} Checking active docs for dead references..."
+if bash scripts/ci/check_dead_refs.sh > /dev/null 2>&1; then
+    check_status "No dead references in active docs" 0
+else
+    check_status "No dead references in active docs" 1
+    echo -e "${RED}   Removed features/ports/commands are still referenced in docs:${NC}"
+    bash scripts/ci/check_dead_refs.sh || true
+fi
+
+# Check 6.9: Internal Markdown links
+# Relative links and own-repo blob/tree links in every tracked .md file must
+# resolve. Whole-tree and offline, so it runs for docs-only changes too; CI runs
+# the same script in links.yml, which has no paths-ignore.
+echo -e "\n${YELLOW}[6.9/9]${NC} Checking internal Markdown links..."
+set +e
+LINK_OUTPUT=$("$PYTHON_BIN" scripts/ci/check_md_links.py 2>&1)
+LINK_EXIT=$?
+set -e
+if [ $LINK_EXIT -eq 0 ]; then
+    check_status "Internal Markdown links resolve" 0
+else
+    check_status "Internal Markdown links resolve" 1
+    # No BROKEN lines means the script itself failed; show its traceback instead.
+    { echo "$LINK_OUTPUT" | grep '^BROKEN' || echo "$LINK_OUTPUT" | tail -15; } | sed 's/^/     /'
 fi
 
 # Check 7: Docstring coverage
@@ -228,14 +447,17 @@ echo -e "${BLUE}╚════════════════════�
 echo ""
 
 if [ $FAILED_CHECKS -eq 0 ]; then
-    echo -e "${GREEN}✅ ALL CHECKS PASSED${NC} ($TOTAL_CHECKS/$TOTAL_CHECKS)"
+    PASSED_CHECKS=$((TOTAL_CHECKS - SKIPPED_CHECKS))
+    echo -e "${GREEN}✅ ALL CHECKS PASSED${NC} ($PASSED_CHECKS/$TOTAL_CHECKS)"
+    if [ $SKIPPED_CHECKS -gt 0 ]; then
+        echo -e "${YELLOW}   $SKIPPED_CHECKS check(s) skipped — see SKIP above; those were not evaluated${NC}"
+    fi
     echo ""
     echo -e "${GREEN}Safe to create PR!${NC}"
     echo ""
     echo -e "Next steps:"
     echo -e "  1. Run code-quality-guard agent for final review"
-    echo -e "  2. Create PR: ${BLUE}gh pr create --fill${NC}"
-    echo -e "  3. Request Gemini review: ${BLUE}gh pr comment <PR#> --body '/gemini review'${NC}"
+    echo -e "  2. Create PR: ${BLUE}gh pr create --title '<title>' --body '<body>'${NC}"
     echo ""
     exit 0
 else

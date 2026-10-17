@@ -104,6 +104,7 @@ The HTTP-to-MCP bridge supports:
 | `MCP_MEMORY_API_KEY` | Authentication token for client bridge (server uses `MCP_API_KEY`) | None | `abc123xyz789` |
 | `MCP_MEMORY_AUTO_DISCOVER` | Enable mDNS service discovery | `false` | `true` |
 | `MCP_MEMORY_PREFER_HTTPS` | Prefer HTTPS over HTTP when discovering | `true` | `false` |
+| `MCP_MEMORY_ALLOW_SELF_SIGNED_CERTS` | Disable TLS certificate verification. Leaves the connection open to MITM — local development with self-signed certs only. Accepts `true` or `1`; anything else keeps verification on | `false` | `true` |
 
 ### Troubleshooting Remote Connections
 

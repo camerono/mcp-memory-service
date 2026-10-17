@@ -24,8 +24,23 @@ set -euo pipefail
 
 echo "🔍 Validating handler imports..."
 
+# Resolve Python the same way scripts/pr/pre_pr_check.sh does: prefer the
+# project .venv (where the editable install lives), then $VIRTUAL_ENV, then
+# bare `python3`/`python`. A bare `python3` here silently falls back to
+# system Python whenever the venv isn't active in the caller's shell,
+# producing a false ModuleNotFoundError instead of validating anything.
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+if [ -x "$REPO_ROOT/.venv/bin/python" ]; then
+    PYTHON_BIN="$REPO_ROOT/.venv/bin/python"
+elif [ -n "${VIRTUAL_ENV:-}" ] && [ -x "$VIRTUAL_ENV/bin/python" ]; then
+    PYTHON_BIN="$VIRTUAL_ENV/bin/python"
+else
+    echo "❌ No suitable Python found. Activate a venv or set VIRTUAL_ENV." >&2
+    exit 1
+fi
+
 # Test all 17 memory handlers can be imported
-python3 -c "
+"$PYTHON_BIN" -c "
 import sys
 import traceback
 

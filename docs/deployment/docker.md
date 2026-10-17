@@ -137,20 +137,19 @@ docker-compose -f docker-compose.pythonpath.yml up -d
 docker build -t mcp-memory-service .
 
 # Create directories for persistent storage
-mkdir -p ./data/sqlite_data ./data/backups
+mkdir -p ./data/sqlite_db ./data/backups
 
 # Run in standard mode (for MCP clients)
 docker run -d --name memory-service \
-  -v $(pwd)/data/sqlite_data:/app/sqlite_data \
+  -v $(pwd)/data/sqlite_db:/app/sqlite_db \
   -v $(pwd)/data/backups:/app/backups \
   -e MCP_MEMORY_STORAGE_BACKEND=sqlite_vec \
-  -e MCP_MEMORY_SQLITE_PATH=/app/sqlite_data/memory.db \
   --stdin --tty \
   mcp-memory-service
 
 # Run in standalone/HTTP mode
 docker run -d -p 8000:8000 --name memory-service \
-  -v $(pwd)/data/sqlite_data:/app/sqlite_data \
+  -v $(pwd)/data/sqlite_db:/app/sqlite_db \
   -v $(pwd)/data/backups:/app/backups \
   -e MCP_STANDALONE_MODE=1 \
   -e MCP_HTTP_HOST=0.0.0.0 \
@@ -158,6 +157,13 @@ docker run -d -p 8000:8000 --name memory-service \
   --stdin --tty \
   mcp-memory-service
 ```
+
+The images declare `/app/sqlite_db` and `/app/backups` as volumes and default
+`MCP_MEMORY_SQLITE_PATH` to `/app/sqlite_db/memory.db`, so mounting those two
+paths is all persistence needs. Override the variable only to put the database
+somewhere else, and give it a **file** path — pointing it at a directory is
+rejected with an explanatory error rather than sqlite's "unable to open database
+file".
 
 ### Using Specific Docker Images
 
@@ -186,6 +192,7 @@ docker run -d -p 8000:8000 \
 | `MCP_MEMORY_STORAGE_BACKEND` | `sqlite_vec` | Storage backend (`sqlite_vec`, `cloudflare`, `hybrid`) |
 | `MCP_HTTP_HOST` | `0.0.0.0` | HTTP server bind address |
 | `MCP_HTTP_PORT` | `8000` | HTTP server port |
+| `MCP_HTTP_ROOT_PATH` | empty | External path prefix removed by a reverse proxy, such as `/memory` |
 | `MCP_STANDALONE_MODE` | `false` | Enable standalone HTTP mode |
 | `MCP_API_KEY` | `none` | API key for authentication |
 
@@ -349,16 +356,28 @@ docker run --rm \
   alpine tar czf /backup/mcp_memory_$(date +%Y%m%d).tar.gz /data
 ```
 
-### Database Migration
+### Maintenance and Migration Scripts
+
+The images ship `scripts/maintenance/` and `scripts/migration/`, so administrative
+tasks run in place instead of requiring a `docker cp` of the script first. Run
+them from `/app`, which is the working directory:
 
 ```bash
-# Export data from running container
-docker exec memory-service python scripts/backup_memories.py
+# List what is available
+docker exec memory-service ls scripts/maintenance scripts/migration
 
-# Import data to new container
-docker cp ./backup.json new-memory-service:/app/
-docker exec new-memory-service python scripts/restore_memories.py /app/backup.json
+# Re-embed everything after changing the embedding model. This rebuilds the
+# database from the memories table and carries graph edges and beliefs over.
+docker exec -it memory-service sh -c \
+    'python scripts/migration/migrate_sqlite_vec_embeddings.py "$MCP_MEMORY_SQLITE_PATH"'
+
+# Remove test memories and orphaned data (supports --dry-run)
+docker exec memory-service python scripts/maintenance/cleanup_memories.py --dry-run
 ```
+
+The migration writes a timestamped `.backup_*` file next to the database before
+it changes anything. Keep it until you have confirmed the result, and note that
+`docker exec` needs `-it` for the confirmation prompt.
 
 ## Monitoring and Logging
 

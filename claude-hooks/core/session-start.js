@@ -5,6 +5,7 @@
 
 const fs = require('fs').promises;
 const path = require('path');
+const { resolveConfigPath } = require('../utilities/config-loader');
 
 // Import utilities
 const { detectProjectContext } = require('../utilities/project-detector');
@@ -34,7 +35,7 @@ const { detectUserOverrides, logOverride } = require('../utilities/user-override
  */
 async function loadConfig() {
     try {
-        const configPath = path.join(__dirname, '../config.json');
+        const configPath = resolveConfigPath(__dirname);
         const configData = await fs.readFile(configPath, 'utf8');
         return JSON.parse(configData);
     } catch (error) {

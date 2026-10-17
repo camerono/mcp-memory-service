@@ -1,0 +1,67 @@
+language: en
+version: 1
+
+context_markers:
+  - system
+  - project
+  - service
+  - platform
+  - module
+  - tool
+  - library
+  - framework
+  - cluster
+  - database
+
+service_suffixes:
+  - Service
+  - Controller
+  - Repository
+  - Mapper
+  - Config
+  - Scheduler
+  - Handler
+  - Provider
+  - Manager
+  - Factory
+  - Client
+  - Adapter
+
+stop_entities:
+  - API
+  - URL
+  - SQL
+  - PDF
+  - JSON
+  - XML
+  - HTML
+  - CSS
+  - HTTP
+  - HTTPS
+  - PR
+  - MR
+  - CI
+  - CD
+  - UI
+  - UX
+  - OK
+  - ID
+  - IP
+  - SSH
+  - VPN
+  - DNS
+  - TCP
+  - UDP
+  - SSL
+  - TLS
+  - RAM
+  - CPU
+  - GPU
+  - SSD
+  - HDD
+  - WAL
+  - FTS
+
+known_acronyms: []
+
+min_acronym_length: 3

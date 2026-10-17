@@ -99,7 +99,10 @@ class TestOAuthStorageBackends:
         # Verify
         assert retrieved is not None
         assert retrieved.client_id == "test_client_1"
-        assert retrieved.client_secret == "secret_123"
+        # Secrets are hashed at rest — plaintext must NOT be recoverable.
+        assert retrieved.client_secret != "secret_123"
+        assert retrieved.client_secret.startswith("sha256$")
+        assert await storage.authenticate_client("test_client_1", "secret_123") is True
         assert retrieved.client_name == "Test Client"
         assert retrieved.redirect_uris == ["http://localhost/callback"]
         assert retrieved.grant_types == ["authorization_code"]
@@ -336,7 +339,10 @@ class TestOAuthStorageBackends:
         # Verify all fields preserved
         assert retrieved is not None
         assert retrieved.client_id == "complex_client"
-        assert retrieved.client_secret == "secret_xyz"
+        # Secrets are hashed at rest — plaintext must NOT be recoverable.
+        assert retrieved.client_secret != "secret_xyz"
+        assert retrieved.client_secret.startswith("sha256$")
+        assert await storage.authenticate_client("complex_client", "secret_xyz") is True
         assert retrieved.client_name == "Complex Test Client"
         assert len(retrieved.redirect_uris) == 2
         assert "http://localhost/callback" in retrieved.redirect_uris

@@ -29,23 +29,26 @@ if [ -z "$CANONICAL" ]; then
   exit 1
 fi
 
-# Default scan target: docs/index.html only (the project landing page).
+# Default scan target: site/index.html only (the mcpmemory.services landing
+# page, deployed to Cloudflare Pages via .github/workflows/deploy-site.yml).
+# docs/index.html is a plain redirect stub to mcpmemory.services and carries
+# no version strings anymore.
 #
 # Rationale: the landing page is the one surface where ANY older-than-canonical
 # version reference is unambiguously wrong (it's the "current state" page).
-# README.md and CLAUDE.md intentionally cite historical versions:
-#   - README has a "Latest Releases" section enumerating all recent versions
-#   - CLAUDE.md uses "introduced in vX" / "vX+" annotations throughout
+# CLAUDE.md intentionally cites historical versions ("introduced in vX" / "vX+"
+# annotations throughout). README.md carries no version string at all since the
+# "Latest Release" section was removed, so there is nothing there to scan.
 # Distinguishing intentional historical refs from real drift in those files
 # requires semantic context this regex-based script doesn't have.
 #
 # To widen the scan (e.g. to catch only specific version-claim phrases in
 # README/CLAUDE.md), override via:
-#   MCS_VERSION_SCAN_TARGETS="docs/index.html README.md" bash check_versions.sh
+#   MCS_VERSION_SCAN_TARGETS="site/index.html README.md" bash check_versions.sh
 if [ -n "${MCS_VERSION_SCAN_TARGETS:-}" ]; then
   read -ra SCAN_TARGETS <<< "$MCS_VERSION_SCAN_TARGETS"
 else
-  SCAN_TARGETS=("docs/index.html")
+  SCAN_TARGETS=("site/index.html")
 fi
 
 # Path-substring excludes applied even within scoped scan targets.
@@ -98,7 +101,9 @@ for target in "${SCAN_TARGETS[@]}"; do
       DRIFT_LINES+=("$line  →  expected v$CANONICAL (or excluded path)")
       FOUND=1
     fi
-  done < <(grep -rEn 'v?[0-9]+\.[0-9]+\.[0-9]+' "$target" --include='*.md' --include='*.html' 2>/dev/null || true)
+  # -H: GNU grep omits the filename when -r lands on a single file, so `file`
+  # became the line number on Linux and the path excludes never matched there.
+  done < <(grep -rHEn 'v?[0-9]+\.[0-9]+\.[0-9]+' "$target" --include='*.md' --include='*.html' 2>/dev/null || true)
 done
 
 if [ $FOUND -eq 0 ]; then

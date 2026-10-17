@@ -16,6 +16,12 @@ PRN
 # Aider files
 .aider.*
 
+# Graphify output (regenerable knowledge graph artifacts)
+graphify-out/
+
+# Claude Code runtime locks
+.claude/scheduled_tasks.lock
+
 # Private/sensitive documents
 docs/saas-monetization-strategy.md
 
@@ -29,13 +35,16 @@ __pycache__/
 *.so
 
 # Python environment & build artifacts
+# No trailing slashes on the venv names: a git worktree usually gets .venv as a
+# symlink to the main checkout's venv, and a symlink is not a directory, so
+# `.venv/` does not match it and `git add -A` stages the link.
 .Python
-env/
-.venv/
-venv/
-py310_venv/
-venv_py310/
-.uv/
+env
+.venv
+venv
+py310_venv
+venv_py310
+.uv
 build/
 develop-eggs/
 dist/
@@ -64,6 +73,8 @@ __pypackages__/
 .env.development
 .env.test
 .env.production
+# Timestamped .env backups (may contain real secrets/tokens)
+.env.bak*
 # But include template files
 !.env.example
 
@@ -161,6 +172,11 @@ YOUR_PERSONALIZED_SETUP_GUIDE.md
 CLAUDE_MEMORY.md
 *_reference_memories_*.json
 
+# Claude Code file-based memory. Normally lives in ~/.claude/projects/<project>/memory/,
+# outside the repo — this is a guard in case a memory file ever lands in the tree.
+MEMORY.md
+.claude/memory/
+
 # Claude Code local settings (personal configurations)
 .claude/settings.local.json*
 scripts/.claude/settings.local.json*
@@ -222,4 +238,37 @@ certs/key.pem
 
 # LoCoMo benchmark data (downloaded on demand)
 data/locomo/
-results/benchmarks/
+results/
+
+# Generated statistics (regenerate with docs/statistics/generate_charts.py)
+docs/statistics/charts/
+docs/statistics/data/
+docs/statistics/REPOSITORY_STATISTICS.md
+
+# OpenCode TUI plugin build artifact (regenerate with opencode/build-tui-plugin.mjs)
+opencode/memory-status-tui.js
+
+# OpenCode session exports
+session-ses_*.md
+scripts/demo/DEMO_CHEATSHEET.md
+scripts/demo/DEMO_ENVIRONMENT.md
+scripts/demo/RUNBOOK.md
+.env.prod-backup
+
+# wrangler artifacts (written to cwd when deploying site/ from repo root)
+node-compile-cache/
+update-check/
+.wrangler/
+
+# Local-only Claude Code agent definitions (not published)
+.claude/agents/
+
+# Local agent tooling written into the checkout by other assistants
+# (gitnexus skills, Codex hooks, gstack audit log) - machine-local, not published
+.agents/
+.codex/
+.gstack/
+.omo/
+
+# Personal demo notes (excluded like DEMO_CHEATSHEET/DEMO_ENVIRONMENT above)
+scripts/demo/SPEAKER_NOTES_EN.md

@@ -5,6 +5,8 @@
 
 const fs = require('fs').promises;
 const path = require('path');
+const { resolveConfigPath } = require('../utilities/config-loader');
+const { applySelfSignedCertsOption } = require('../utilities/tls-options');
 const https = require('https');
 
 // Import utilities
@@ -17,7 +19,7 @@ const { formatMemoriesForContext } = require('../utilities/context-formatter');
  */
 async function loadConfig() {
     try {
-        const configPath = path.join(__dirname, '../config.json');
+        const configPath = resolveConfigPath(__dirname);
         const configData = await fs.readFile(configPath, 'utf8');
         return JSON.parse(configData);
     } catch (error) {
@@ -35,9 +37,10 @@ async function loadConfig() {
 /**
  * Query memory service for relevant memories
  */
-async function queryMemoryService(endpoint, apiKey, query) {
+async function queryMemoryService(endpoint, apiKey, query, allowSelfSignedCerts = false) {
     return new Promise((resolve, reject) => {
         const url = new URL('/mcp', endpoint);
+        const isHttps = url.protocol === 'https:';
         const postData = JSON.stringify({
             jsonrpc: '2.0',
             id: 1,
@@ -53,16 +56,17 @@ async function queryMemoryService(endpoint, apiKey, query) {
 
         const options = {
             hostname: url.hostname,
-            port: url.port || 8443,
+            port: url.port ? Number(url.port) : (isHttps ? 443 : 80),
             path: url.pathname,
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
                 'Content-Length': Buffer.byteLength(postData),
                 'Authorization': `Bearer ${apiKey}`
-            },
-            rejectUnauthorized: false // For self-signed certificates
+            }
         };
+
+        applySelfSignedCertsOption(options, isHttps, allowSelfSignedCerts, '[Memory Retrieval]');
 
         const req = https.request(options, (res) => {
             let data = '';
@@ -146,7 +150,8 @@ async function retrieveMemories(context) {
         const memories = await queryMemoryService(
             config.memoryService.endpoint,
             config.memoryService.apiKey,
-            memoryQuery
+            memoryQuery,
+            config.memoryService.allowSelfSignedCerts === true
         );
         
         if (memories.length > 0) {
@@ -229,6 +234,10 @@ module.exports = {
         async: true,
         timeout: 10000,
         priority: 'normal'
+    },
+    // Exported for testing
+    _internal: {
+        queryMemoryService
     }
 };
 

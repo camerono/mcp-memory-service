@@ -406,24 +406,52 @@ export GROQ_API_KEY="your-groq-api-key"
 export MCP_QUALITY_AI_PROVIDER=groq  # or "auto" to try all tiers
 
 # Enable Gemini API (Google)
-export GOOGLE_API_KEY="your-gemini-api-key"
+export GEMINI_API_KEY="your-gemini-api-key"
 export MCP_QUALITY_AI_PROVIDER=gemini
 ```
 
-### 3. Configuration Options
+### 3. Homelab: score with your own LLM
+
+`MCP_QUALITY_AI_PROVIDER=openai-compatible` points scoring at any OpenAI-compatible
+`/v1` endpoint — Ollama, vLLM, or a LiteLLM proxy — instead of ONNX or a cloud API. No
+API key leaves the machine, no per-call cost.
+
+```bash
+export MCP_QUALITY_AI_PROVIDER=openai-compatible
+export MCP_QUALITY_AI_BASE_URL=http://localhost:11434/v1   # Ollama
+export MCP_QUALITY_AI_MODEL=qwen2.5:7b-instruct
+# export MCP_QUALITY_AI_API_KEY=ollama                     # optional
+```
+
+Both `MCP_QUALITY_AI_BASE_URL` and `MCP_QUALITY_AI_MODEL` are required with this
+provider; the service refuses to start without them. Recommended models:
+`qwen2.5:7b-instruct` (Ollama), `mlx-community/Qwen2.5-7B-Instruct-4bit` (MLX), or any
+instruct model behind a LiteLLM proxy. If the endpoint fails, scoring falls back to
+implicit signals automatically.
+
+### 4. Configuration Options
 
 ```bash
 # Quality System Core
 export MCP_QUALITY_SYSTEM_ENABLED=true         # Default: true
-export MCP_QUALITY_AI_PROVIDER=local           # local|groq|gemini|auto|none
+export MCP_QUALITY_AI_PROVIDER=local           # local|openai-compatible|groq|gemini|auto|none
 
 # Local SLM Configuration (Tier 1)
 export MCP_QUALITY_LOCAL_MODEL=ms-marco-MiniLM-L-6-v2  # Model name
 export MCP_QUALITY_LOCAL_DEVICE=auto           # auto|cpu|cuda|mps|directml
 
-# Quality-Boosted Search (Opt-In)
+# Quality-Boosted Search (Opt-In) — affects search ranking only
 export MCP_QUALITY_BOOST_ENABLED=false         # Default: false (opt-in)
 export MCP_QUALITY_BOOST_WEIGHT=0.3            # 0.0-1.0 (30% quality, 70% semantic)
+
+# Store-time blend of implicit signals into the saved score.
+# Both default to the MCP_QUALITY_BOOST_* values above when unset, which is how
+# this worked before it was split out. Note the direction is the opposite of the
+# search weight: a higher value means LESS weight on the classifier, and a fresh
+# memory has weak implicit signals by construction, so a high value caps the
+# score of newly stored memories regardless of content.
+export MCP_QUALITY_IMPLICIT_BLEND_ENABLED=false  # Default: follows BOOST_ENABLED
+export MCP_QUALITY_IMPLICIT_WEIGHT=0.3           # 0.0-1.0 implicit share of the stored score
 
 # Quality-Based Retention (Consolidation)
 export MCP_QUALITY_RETENTION_HIGH=365          # Days for quality ≥0.7
@@ -451,7 +479,7 @@ Override AI scores with manual ratings:
 
 ```bash
 # Rate a memory (MCP tool)
-rate_memory(
+memory_quality(
     content_hash="abc123...",
     rating=1,  # -1 (bad), 0 (neutral), 1 (good)
     feedback="This was very helpful!"
@@ -625,6 +653,11 @@ final_relevance = base_relevance × decay_multiplier
    # Should contain: model.onnx, tokenizer.json
    ```
 
+   If `MCP_QUALITY_ONNX_MODEL_DIR` is set, look there instead — it replaces the
+   `~/.cache/mcp_memory/onnx_models` parent and the loader appends the model
+   name. In a container that is normally the case; see
+   [`tools/docker/README.md`](../../tools/docker/README.md).
+
 3. Check logs for errors:
    ```bash
    tail -f logs/mcp_memory_service.log | grep quality
@@ -732,10 +765,10 @@ analyze_quality_distribution()
 Rate important memories manually:
 ```bash
 # After finding a very helpful memory
-rate_memory(content_hash="abc123...", rating=1, feedback="Critical info!")
+memory_quality(content_hash="abc123...", rating=1, feedback="Critical info!")
 
 # After finding unhelpful memory
-rate_memory(content_hash="def456...", rating=-1, feedback="Outdated")
+memory_quality(content_hash="def456...", rating=-1, feedback="Outdated")
 ```
 
 Manual ratings weighted 60%, AI scores 40%.

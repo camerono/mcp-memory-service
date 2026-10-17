@@ -3,18 +3,21 @@ Comprehensive unit tests for the quality scoring system.
 Tests ONNX ranker, implicit signals, AI evaluator, and composite scorer.
 """
 
+import tempfile
+import os
+import httpx
 import pytest
 import time
 import asyncio
 from unittest.mock import Mock, patch, AsyncMock
 from pathlib import Path
 
-from src.mcp_memory_service.quality.config import QualityConfig
-from src.mcp_memory_service.quality.onnx_ranker import ONNXRankerModel, get_onnx_ranker_model
-from src.mcp_memory_service.quality.implicit_signals import ImplicitSignalsEvaluator
-from src.mcp_memory_service.quality.ai_evaluator import QualityEvaluator
-from src.mcp_memory_service.quality.scorer import QualityScorer
-from src.mcp_memory_service.models.memory import Memory
+from mcp_memory_service.quality.config import QualityConfig
+from mcp_memory_service.quality.onnx_ranker import ONNXRankerModel, get_onnx_ranker_model
+from mcp_memory_service.quality.implicit_signals import ImplicitSignalsEvaluator
+from mcp_memory_service.quality.ai_evaluator import QualityEvaluator
+from mcp_memory_service.quality.scorer import QualityScorer
+from mcp_memory_service.models.memory import Memory
 
 
 class TestQualityConfig:
@@ -59,6 +62,75 @@ class TestQualityConfig:
         config = QualityConfig(boost_weight=1.5)
         with pytest.raises(ValueError, match="boost_weight must be between"):
             config.validate()
+
+        # Invalid implicit weight
+        config = QualityConfig(implicit_weight=1.5)
+        with pytest.raises(ValueError, match="implicit_weight must be between"):
+            config.validate()
+
+
+class TestStoreTimeBlendSeparation:
+    """Issue #179: the search knobs used to control the stored score as well.
+
+    MCP_QUALITY_BOOST_ENABLED/WEIGHT are documented as quality-boosted *search*,
+    but QualityScorer also read them to decide whether — and how strongly — to
+    mix implicit signals into the score written to the database. The two now
+    have separate variables, with the old ones as the fallback so existing
+    deployments keep their behaviour.
+    """
+
+    def test_blend_follows_boost_when_unset(self, monkeypatch):
+        monkeypatch.delenv('MCP_QUALITY_IMPLICIT_BLEND_ENABLED', raising=False)
+        monkeypatch.delenv('MCP_QUALITY_IMPLICIT_WEIGHT', raising=False)
+        monkeypatch.setenv('MCP_QUALITY_BOOST_ENABLED', 'true')
+        monkeypatch.setenv('MCP_QUALITY_BOOST_WEIGHT', '0.05')
+
+        config = QualityConfig.from_env()
+        assert config.implicit_blend_enabled is True
+        assert config.implicit_weight == 0.05
+
+    def test_blend_off_when_boost_off_and_unset(self, monkeypatch):
+        monkeypatch.delenv('MCP_QUALITY_IMPLICIT_BLEND_ENABLED', raising=False)
+        monkeypatch.delenv('MCP_QUALITY_IMPLICIT_WEIGHT', raising=False)
+        monkeypatch.setenv('MCP_QUALITY_BOOST_ENABLED', 'false')
+
+        config = QualityConfig.from_env()
+        assert config.implicit_blend_enabled is False
+
+    def test_explicit_blend_settings_win(self, monkeypatch):
+        monkeypatch.setenv('MCP_QUALITY_BOOST_ENABLED', 'true')
+        monkeypatch.setenv('MCP_QUALITY_BOOST_WEIGHT', '0.3')
+        monkeypatch.setenv('MCP_QUALITY_IMPLICIT_BLEND_ENABLED', 'false')
+        monkeypatch.setenv('MCP_QUALITY_IMPLICIT_WEIGHT', '0.05')
+
+        config = QualityConfig.from_env()
+        # Search reranking stays on, the stored score is no longer blended
+        assert config.boost_enabled is True
+        assert config.boost_weight == 0.3
+        assert config.implicit_blend_enabled is False
+        assert config.implicit_weight == 0.05
+
+    @pytest.mark.asyncio
+    async def test_scorer_uses_the_blend_knobs_not_the_search_knobs(self):
+        """Search settings alone must no longer change what gets stored."""
+        memory = Memory(content="Test content", content_hash="test_hash", metadata={})
+
+        # Search boost on, blend explicitly off -> stored score is the AI score
+        config = QualityConfig(boost_enabled=True, boost_weight=0.3,
+                               implicit_blend_enabled=False)
+        scorer = QualityScorer(config)
+        with patch.object(scorer._ai_evaluator, 'evaluate_quality', return_value=0.8), \
+             patch.object(scorer._implicit_evaluator, 'evaluate_quality', return_value=0.2):
+            score = await scorer.calculate_quality_score(memory, "q")
+        assert score == pytest.approx(0.8)
+
+        # Blend on at 0.25 -> 0.75 * ai + 0.25 * implicit
+        config = QualityConfig(implicit_blend_enabled=True, implicit_weight=0.25)
+        scorer = QualityScorer(config)
+        with patch.object(scorer._ai_evaluator, 'evaluate_quality', return_value=0.8), \
+             patch.object(scorer._implicit_evaluator, 'evaluate_quality', return_value=0.2):
+            score = await scorer.calculate_quality_score(memory, "q")
+        assert score == pytest.approx(0.75 * 0.8 + 0.25 * 0.2)
 
         # Groq provider without API key
         config = QualityConfig(ai_provider='groq')
@@ -270,7 +342,15 @@ class TestQualityEvaluator:
             }
         )
 
-        with patch('src.mcp_memory_service.quality.onnx_ranker.get_onnx_ranker_model', return_value=None):
+        # Patch the using module, not the defining one. ai_evaluator does
+        # `from .onnx_ranker import get_onnx_ranker_model`, so rebinding the
+        # name in onnx_ranker never reaches the evaluator's own reference.
+        # The target must also match this file's own imports (no `src.`
+        # prefix -- that resolved to a shadow copy nothing used, see #1120).
+        with patch(
+            'mcp_memory_service.quality.ai_evaluator.get_onnx_ranker_model',
+            return_value=None,
+        ):
             score = await evaluator.evaluate_quality("test query", memory)
 
             # Should fall back to implicit signals
@@ -299,8 +379,8 @@ class TestQualityScorer:
 
     @pytest.mark.asyncio
     async def test_calculate_quality_score_with_boost(self):
-        """Test composite scoring with boost enabled."""
-        config = QualityConfig(boost_enabled=True, boost_weight=0.3)
+        """Test composite scoring with the store-time blend enabled."""
+        config = QualityConfig(implicit_blend_enabled=True, implicit_weight=0.3)
         scorer = QualityScorer(config)
 
         memory = Memory(
@@ -479,11 +559,9 @@ class TestQualityAPILayer:
     @pytest.mark.asyncio
     async def test_rate_memory_mcp_tool(self):
         """Test rate_memory MCP tool."""
-        from src.mcp_memory_service.server import MemoryServer
-        from src.mcp_memory_service.models.memory import Memory
-        from src.mcp_memory_service.storage.sqlite_vec import SqliteVecMemoryStorage
-        import tempfile
-        import os
+        from mcp_memory_service.server import MemoryServer
+        from mcp_memory_service.models.memory import Memory
+        from mcp_memory_service.storage.sqlite_vec import SqliteVecMemoryStorage
 
         # Create temporary database
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -524,11 +602,9 @@ class TestQualityAPILayer:
     @pytest.mark.asyncio
     async def test_get_memory_quality_mcp_tool(self):
         """Test get_memory_quality MCP tool."""
-        from src.mcp_memory_service.server import MemoryServer
-        from src.mcp_memory_service.models.memory import Memory
-        from src.mcp_memory_service.storage.sqlite_vec import SqliteVecMemoryStorage
-        import tempfile
-        import os
+        from mcp_memory_service.server import MemoryServer
+        from mcp_memory_service.models.memory import Memory
+        from mcp_memory_service.storage.sqlite_vec import SqliteVecMemoryStorage
 
         # Create temporary database
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -568,11 +644,9 @@ class TestQualityAPILayer:
     @pytest.mark.asyncio
     async def test_analyze_quality_distribution_mcp_tool(self):
         """Test analyze_quality_distribution MCP tool."""
-        from src.mcp_memory_service.server import MemoryServer
-        from src.mcp_memory_service.models.memory import Memory
-        from src.mcp_memory_service.storage.sqlite_vec import SqliteVecMemoryStorage
-        import tempfile
-        import os
+        from mcp_memory_service.server import MemoryServer
+        from mcp_memory_service.models.memory import Memory
+        from mcp_memory_service.storage.sqlite_vec import SqliteVecMemoryStorage
 
         # Create temporary database
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -614,16 +688,13 @@ class TestQualityAPILayer:
     @pytest.mark.asyncio
     async def test_rate_memory_http_endpoint(self):
         """Test POST /api/quality/memories/{hash}/rate HTTP endpoint."""
-        import httpx
-        from src.mcp_memory_service.web.app import app
-        from src.mcp_memory_service.web.dependencies import get_storage
-        from src.mcp_memory_service.web.oauth.middleware import (
+        from mcp_memory_service.web.app import app
+        from mcp_memory_service.web.dependencies import get_storage
+        from mcp_memory_service.web.oauth.middleware import (
             require_write_access, require_read_access, AuthenticationResult
         )
-        from src.mcp_memory_service.storage.sqlite_vec import SqliteVecMemoryStorage
-        from src.mcp_memory_service.models.memory import Memory
-        import tempfile
-        import os
+        from mcp_memory_service.storage.sqlite_vec import SqliteVecMemoryStorage
+        from mcp_memory_service.models.memory import Memory
 
         # Create temporary database
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -672,16 +743,13 @@ class TestQualityAPILayer:
     @pytest.mark.asyncio
     async def test_get_quality_http_endpoint(self):
         """Test GET /api/quality/memories/{hash} HTTP endpoint."""
-        import httpx
-        from src.mcp_memory_service.web.app import app
-        from src.mcp_memory_service.web.dependencies import get_storage
-        from src.mcp_memory_service.web.oauth.middleware import (
+        from mcp_memory_service.web.app import app
+        from mcp_memory_service.web.dependencies import get_storage
+        from mcp_memory_service.web.oauth.middleware import (
             require_write_access, require_read_access, AuthenticationResult
         )
-        from src.mcp_memory_service.storage.sqlite_vec import SqliteVecMemoryStorage
-        from src.mcp_memory_service.models.memory import Memory
-        import tempfile
-        import os
+        from mcp_memory_service.storage.sqlite_vec import SqliteVecMemoryStorage
+        from mcp_memory_service.models.memory import Memory
 
         # Create temporary database
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -732,16 +800,13 @@ class TestQualityAPILayer:
     @pytest.mark.asyncio
     async def test_distribution_http_endpoint(self):
         """Test GET /api/quality/distribution HTTP endpoint."""
-        import httpx
-        from src.mcp_memory_service.web.app import app
-        from src.mcp_memory_service.web.dependencies import get_storage
-        from src.mcp_memory_service.web.oauth.middleware import (
+        from mcp_memory_service.web.app import app
+        from mcp_memory_service.web.dependencies import get_storage
+        from mcp_memory_service.web.oauth.middleware import (
             require_write_access, require_read_access, AuthenticationResult
         )
-        from src.mcp_memory_service.storage.sqlite_vec import SqliteVecMemoryStorage
-        from src.mcp_memory_service.models.memory import Memory
-        import tempfile
-        import os
+        from mcp_memory_service.storage.sqlite_vec import SqliteVecMemoryStorage
+        from mcp_memory_service.models.memory import Memory
 
         # Create temporary database
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -801,11 +866,28 @@ class TestQualityAPILayer:
     @pytest.mark.asyncio
     async def test_async_background_scoring(self):
         """Test async quality scoring doesn't block."""
-        from src.mcp_memory_service.quality.async_scorer import AsyncQualityScorer
-        from src.mcp_memory_service.models.memory import Memory
-        import time
+        from mcp_memory_service.quality.async_scorer import AsyncQualityScorer
+        from mcp_memory_service.models.memory import Memory
 
         scorer = AsyncQualityScorer()
+
+        # What is under test here is the queue: enqueue returns immediately, the
+        # worker runs, the counters add up. Scoring quality is not.
+        #
+        # The default evaluator scores for real, and with onnxscript installed
+        # that means the worker performs a torch.onnx.export of DeBERTa on its
+        # first item — minutes of synchronous work inside an async worker, which
+        # blocks the event loop, so stop()'s own 5s wait_for cannot even fire.
+        # In CI this test hit pytest's 120s timeout. A disabled evaluator returns
+        # a neutral score without loading anything (see ai_evaluator), which
+        # leaves every assertion below testing exactly what it did before.
+        #
+        # Only the evaluator needs replacing. The worker also holds a composite
+        # QualityScorer, but it hands that one the already-computed ai_score, and
+        # calculate_quality_score only consults its own evaluator when ai_score
+        # is None — so it is not a second path into a model load.
+        scorer.evaluator = QualityEvaluator(QualityConfig(enabled=False))
+
         await scorer.start()
 
         try:
@@ -833,6 +915,62 @@ class TestQualityAPILayer:
 
         finally:
             await scorer.stop()
+
+    @pytest.mark.asyncio
+    async def test_initialization_does_not_block_event_loop(self):
+        """Model initialization runs off the loop, so other tasks keep running.
+
+        The previous test disables the evaluator to keep the minutes-long
+        torch.onnx.export out of CI. This one keeps the evaluator ENABLED and
+        replaces only the leaf load (get_onnx_ranker_model) with a slow, blocking
+        stub, so the real async init path runs — the fix under test is that this
+        path no longer freezes the event loop.
+
+        A heartbeat task ticks every 10ms while a batch evaluation triggers first
+        init. If init ran synchronously on the loop (the bug) the heartbeat cannot
+        tick during the stub's sleep; running it in a thread lets the heartbeat
+        advance. This is red without the change: the stub blocks the loop and the
+        tick count is 0.
+        """
+        def slow_get_ranker(model_name=None, device="auto"):
+            time.sleep(0.5)  # stands in for the real torch.onnx.export of DeBERTa
+
+            class _Ranker:
+                def score_quality_batch(self, pairs):
+                    return [0.5] * len(pairs)
+
+                def score_quality(self, query, content):
+                    return 0.5
+
+            return _Ranker()
+
+        evaluator = QualityEvaluator(
+            QualityConfig(enabled=True, ai_provider='local', fallback_enabled=False)
+        )
+
+        ticks = 0
+
+        async def heartbeat():
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(0.01)
+                ticks += 1
+
+        heartbeat_task = asyncio.create_task(heartbeat())
+        try:
+            with patch(
+                'mcp_memory_service.quality.ai_evaluator.get_onnx_ranker_model',
+                slow_get_ranker,
+            ):
+                memories = [Memory(content="x", content_hash="h", metadata={})]
+                await evaluator.evaluate_quality_batch("query", memories)
+        finally:
+            heartbeat_task.cancel()
+
+        # The loop kept scheduling the heartbeat through the 0.5s init. 20 ticks
+        # is a wide margin below the ~50 a free loop manages, above the 0 a
+        # blocked loop allows.
+        assert ticks >= 20, f"event loop was blocked during init: {ticks} ticks"
 
 
 if __name__ == "__main__":

@@ -1,0 +1,120 @@
+language: pt-BR
+version: 1
+
+context_markers:
+  - sistema
+  - projeto
+  - serviço
+  - plataforma
+  - módulo
+  - programa
+  - portal
+  - ferramenta
+  - banco
+  - tabela
+  - cluster
+  - aplicação
+  - servidor
+
+service_suffixes:
+  - Service
+  - Controller
+  - Repository
+  - Mapper
+  - Config
+  - Scheduler
+  - Handler
+  - Provider
+  - Manager
+  - Factory
+  - Client
+  - Adapter
+
+stop_entities:
+  - API
+  - URL
+  - SQL
+  - PDF
+  - JSON
+  - XML
+  - HTML
+  - CSS
+  - HTTP
+  - HTTPS
+  - PR
+  - MR
+  - CI
+  - CD
+  - UI
+  - UX
+  - OK
+  - ID
+  - IP
+  - SSH
+  - VPN
+  - DNS
+  - TCP
+  - UDP
+  - SSL
+  - TLS
+  - RAM
+  - CPU
+  - GPU
+  - SSD
+  - HDD
+  - WAL
+  - FTS
+  - AWS
+  - GCP
+
+known_acronyms:
+  - SICAR
+  - SNCR
+  - SIGEF
+  - CAF
+  - INCRA
+  - IBAMA
+  - MDA
+  - MAPA
+  - EMBRAPA
+  - CONAB
+  - INPE
+  - PRODES
+  - DETER
+  - CNFP
+  - SNCI
+  - FUNAI
+  - ICMBio
+  - ANA
+  - INMET
+  - ZARC
+  - PRONAF
+  - DAP
+  - ITR
+  - CCIR
+  - NIRF
+  - CAFIR
+  - MTE
+  - TCU
+  - CGU
+  - INSS
+  - RFB
+  - SERPRO
+  - DATAPREV
+  - ANATEL
+  - ANVISA
+  - MCR
+  - BCB
+  - BNDES
+  - CEF
+  - FGTS
+  - HCSO
+  - SWR
+  - CCE
+  - ELK
+  - WSO2
+  - RITM
+  - CHG
+  - PTI
+
+min_acronym_length: 3

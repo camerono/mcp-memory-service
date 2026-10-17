@@ -70,7 +70,7 @@ class MemoryDashboard {
     };
 
     constructor() {
-        this.apiBase = '/api';
+        this.apiBase = 'api';
         this.eventSource = null;
         this.memories = [];
         this.currentView = 'dashboard';
@@ -111,6 +111,10 @@ class MemoryDashboard {
         this.selectedFiles = [];
         this.documentsListenersSetup = false;
         this.processingMode = 'batch'; // 'batch' or 'individual'
+
+        // Knowledge graph view state
+        this.graphLayout = 'force';
+        this.graphRingCenterId = null;
 
         // Bind methods
         this.handleSearch = this.handleSearch.bind(this);
@@ -229,7 +233,7 @@ class MemoryDashboard {
     async ensureFallbackTranslations() {
         if (Object.keys(this.fallbackTranslations).length > 0) return;
         try {
-            const response = await fetch('/static/i18n/en.json');
+            const response = await fetch('static/i18n/en.json');
             if (response.ok) {
                 this.fallbackTranslations = await response.json();
             }
@@ -244,7 +248,7 @@ class MemoryDashboard {
      */
     async detectAvailableLanguages() {
         try {
-            const response = await fetch('/api/languages');
+            const response = await fetch('api/languages');
             if (response.ok) {
                 const data = await response.json();
                 this.supportedLanguages = data.languages || ['en'];
@@ -261,7 +265,7 @@ class MemoryDashboard {
     async loadLanguageMetadata() {
         for (const lang of this.supportedLanguages) {
             try {
-                const response = await fetch(`/static/i18n/${lang}.json`);
+            const response = await fetch(`static/i18n/${lang}.json`);
                 if (response.ok) {
                     const data = await response.json();
                     this.languageMetadata[lang] = {
@@ -354,7 +358,7 @@ class MemoryDashboard {
      */
     async loadTranslations(lang) {
         try {
-            const response = await fetch(`/static/i18n/${lang}.json`);
+            const response = await fetch(`static/i18n/${lang}.json`);
             if (response.ok) {
                 this.translations = await response.json();
                 this.currentLang = lang;
@@ -389,8 +393,8 @@ class MemoryDashboard {
      */
     async applyTranslations() {
         // 统一遍历带 i18n 属性的元素，减少多次 DOM 遍历
-        document.querySelectorAll('[data-i18n], [data-i18n-html], [data-i18n-placeholder], [data-i18n-aria]').forEach(el => {
-            const { i18n, i18nHtml, i18nPlaceholder, i18nAria } = el.dataset;
+        document.querySelectorAll('[data-i18n], [data-i18n-html], [data-i18n-placeholder], [data-i18n-aria], [data-i18n-title]').forEach(el => {
+            const { i18n, i18nHtml, i18nPlaceholder, i18nAria, i18nTitle } = el.dataset;
 
             if (i18n) {
                 const text = this.t(i18n, el.textContent?.trim() || '');
@@ -410,6 +414,11 @@ class MemoryDashboard {
             if (i18nAria) {
                 const text = this.t(i18nAria, el.getAttribute('aria-label') || '');
                 el.setAttribute('aria-label', text);
+            }
+
+            if (i18nTitle) {
+                const text = this.t(i18nTitle, el.getAttribute('title') || '');
+                el.setAttribute('title', text);
             }
         });
 
@@ -476,6 +485,23 @@ class MemoryDashboard {
                         ? '▼ Show full content'
                         : '▲ Collapse';
                 }
+            }
+        });
+
+        // The memory detail content is rendered dynamically, so delegate metadata toggles.
+        document.getElementById('modalContent')?.addEventListener('click', (e) => {
+            const toggle = e.target.closest('.metadata-toggle');
+            if (toggle) {
+                toggle.parentElement.classList.toggle('expanded');
+            }
+        });
+
+        // The recent-memory empty state is rendered dynamically after startup.
+        document.getElementById('recentMemoriesList')?.addEventListener('click', (e) => {
+            const addMemoryLink = e.target.closest('[data-action="add-memory"]');
+            if (addMemoryLink) {
+                e.preventDefault();
+                this.handleAddMemory();
             }
         });
 
@@ -626,6 +652,18 @@ class MemoryDashboard {
             this.closeModal(document.getElementById('settingsModal'));
         });
 
+        document.getElementById('backupNowButton')?.addEventListener('click', () => {
+            this.createBackup();
+        });
+
+        document.getElementById('viewBackupsButton')?.addEventListener('click', () => {
+            this.openViewBackupsModal();
+        });
+
+        document.getElementById('viewBackupsCloseButton')?.addEventListener('click', () => {
+            this.closeModal(document.getElementById('viewBackupsModal'));
+        });
+
         // Initialize settings tabs
         this.initializeSettingsTabs();
         this.initCredentialsTab();
@@ -659,6 +697,15 @@ class MemoryDashboard {
         document.getElementById('refreshGraphBtn')?.addEventListener('click', this.handleGraphRefresh.bind(this));
         document.getElementById('graphLimitSelect')?.addEventListener('change', this.handleGraphRefresh.bind(this));
         document.getElementById('graphMinConnectionsSelect')?.addEventListener('change', this.handleGraphRefresh.bind(this));
+        document.getElementById('graphDegreeSlider')?.addEventListener('input', this.handleGraphDegreeChange.bind(this));
+        document.getElementById('graphDimensionBtn')?.addEventListener('click', this.toggleGraphDimension.bind(this));
+        document.querySelectorAll('[data-graph-layout]').forEach(button => {
+            button.addEventListener('click', () => this.setGraphLayout(button.dataset.graphLayout));
+        });
+        document.getElementById('graphRotateBtn')?.addEventListener('click', this.toggleGraphRotation.bind(this));
+        document.getElementById('graphFullscreenRotateBtn')?.addEventListener('click', this.toggleGraphRotation.bind(this));
+        document.getElementById('graphFullscreenLegendBtn')?.addEventListener('click', this.toggleGraphLegend.bind(this));
+        // Type-filter pills are generated dynamically from the data; see _renderTypeFilterPills()
         document.getElementById('graphFullscreenBtn')?.addEventListener('click', this.enterGraphFullscreen.bind(this));
         document.getElementById('graphExitFullscreenBtn')?.addEventListener('click', this.exitGraphFullscreen.bind(this));
 
@@ -695,7 +742,7 @@ class MemoryDashboard {
 
         try {
             // Build SSE URL with query parameter auth (EventSource API doesn't support custom headers)
-            const sseUrl = new URL(`${this.apiBase}/events`, window.location.origin);
+            const sseUrl = new URL(`${this.apiBase}/events`, document.baseURI);
             if (this.authState.apiKey) {
                 sseUrl.searchParams.set('api_key', this.authState.apiKey);
             } else if (this.authState.oauthToken) {
@@ -1197,9 +1244,6 @@ class MemoryDashboard {
 
         // Sync buttons event listeners are attached in checkSyncStatus()
         // after buttons are confirmed to be accessible in the DOM
-
-        // Backup buttons use inline onclick handlers in HTML
-        // (setupEventListeners runs before settings modal DOM is interactive)
 
         // Document search button
         const docSearchBtn = document.getElementById('docSearchBtn');
@@ -2064,12 +2108,17 @@ class MemoryDashboard {
     }
 
     /**
-     * Escape HTML to prevent XSS
+     * Escape HTML to prevent XSS. Safe in element text and in quoted attribute
+     * values: quotes are encoded too, since callers interpolate the result into
+     * data-tag="..." and similar attributes (GHSA-j664-v823-6p9f).
      */
     escapeHtml(text) {
-        const div = document.createElement('div');
-        div.textContent = text;
-        return div.innerHTML;
+        return String(text ?? '')
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
     }
 
     /**
@@ -2677,7 +2726,7 @@ class MemoryDashboard {
 
                 ${memory.metadata ? `
                     <div class="memory-metadata">
-                        <h4 class="metadata-toggle" onclick="this.parentElement.classList.toggle('expanded')" style="cursor: pointer; user-select: none;">
+                        <h4 class="metadata-toggle" style="cursor: pointer; user-select: none;">
                             <span class="toggle-icon">▶</span> Metadata
                         </h4>
                         <div class="metadata-content">
@@ -2914,7 +2963,7 @@ class MemoryDashboard {
     }
 
     if (!memories || memories.length === 0) {
-    container.innerHTML = '<p class="empty-state">No memories found. <a href="#" onclick="app.handleAddMemory()">Add your first memory</a></p>';
+    container.innerHTML = '<p class="empty-state">No memories found. <a href="#" data-action="add-memory">Add your first memory</a></p>';
     return;
     }
 
@@ -3686,7 +3735,7 @@ class MemoryDashboard {
         if (oauthBtn) {
             oauthBtn.addEventListener('click', () => {
                 // Redirect to OAuth authorization endpoint
-                window.location.href = '/oauth/authorize';
+                window.location.href = 'oauth/authorize';
             });
         }
     }
@@ -3917,7 +3966,7 @@ class MemoryDashboard {
                 }
             } catch (apiErr) {
                 // /server/status unavailable (server still down or auth-gated) — try /api/health as a liveness probe
-                const response = await fetch('/api/health');
+                const response = await fetch('api/health');
                 if (response.ok && preRestartPid == null && preRestartVersion == null) {
                     if (statusEl) { statusEl.textContent = 'Server is back online! Reloading...'; }
                     setTimeout(() => { window.location.reload(); }, 1500);
@@ -4925,7 +4974,7 @@ class MemoryDashboard {
 
         data.tags.forEach(tagStat => {
         html += '<tr>';
-        html += `<td class="tag-name">${tagStat.tag}</td>`;
+        html += `<td class="tag-name">${this.escapeHtml(tagStat.tag)}</td>`;
         html += `<td class="tag-count">${tagStat.count}</td>`;
         html += '<td class="tag-actions">';
         html += `<button class="tag-action-btn" data-action="rename-tag" data-tag="${this.escapeHtml(tagStat.tag)}">Rename</button>`;
@@ -5262,7 +5311,7 @@ class MemoryDashboard {
             html += `<div class="chart-row">
                 <div class="chart-bar" style="width: ${barWidthPx}px"></div>
                 <span class="chart-value">${tag.count} (${tag.percentage}%)</span>
-                <span class="chart-label">${tag.tag}</span>
+                <span class="chart-label">${this.escapeHtml(tag.tag)}</span>
             </div>`;
         });
 
@@ -5316,7 +5365,7 @@ class MemoryDashboard {
         // Render significant types
         significantTypes.forEach(type => {
             const barWidthPx = (type.percentage / 100) * 200; // Convert percentage to pixels (200px scale)
-            const typeName = type.memory_type || 'untyped';
+            const typeName = this.escapeHtml(type.memory_type || 'untyped');
             html += `<div class="chart-row">
                 <div class="chart-bar" style="width: ${barWidthPx}px"></div>
                 <span class="chart-value">${type.count} (${type.percentage.toFixed(1)}%)</span>
@@ -5374,12 +5423,12 @@ class MemoryDashboard {
             const growthText = tag.growth_rate !== null ? ` (${tag.growth_rate > 0 ? '+' : ''}${tag.growth_rate}%)` : '';
         html += `<li>
                 <div class="tag-header">
-                    <strong>${tag.tag}</strong>${trendIcon}
+                    <strong>${this.escapeHtml(tag.tag)}</strong>${trendIcon}
                     <span class="tag-count">${tag.count} memories (${tag.percentage}%)${growthText}</span>
                 </div>`;
             if (tag.co_occurring_tags && tag.co_occurring_tags.length > 0) {
                 html += '<div class="tag-cooccurrence">Often with: ';
-                html += tag.co_occurring_tags.slice(0, 3).map(co => `${co.tag} (${co.strength.toFixed(2)})`).join(', ');
+                html += tag.co_occurring_tags.slice(0, 3).map(co => `${this.escapeHtml(co.tag)} (${co.strength.toFixed(2)})`).join(', ');
                 html += '</div>';
             }
             html += '</li>';
@@ -5691,28 +5740,47 @@ class MemoryDashboard {
         const container = document.getElementById('graphVisualizationContainer');
         if (!container) return;
 
+        // Loads can overlap (Refresh clicked twice, or a select changed mid-load).
+        // Only the most recent one may touch the graph; a slower, older response
+        // must not render over it or clear its state.
+        const requestId = (this._graphLoadId = (this._graphLoadId || 0) + 1);
+
         try {
             const limit = document.getElementById('graphLimitSelect')?.value || 100;
             const minConnections = document.getElementById('graphMinConnectionsSelect')?.value || 1;
 
-            // Warn about performance for large graphs
-            if (limit >= 750) {
-                this.showToast(`Loading ${limit} nodes may impact performance. Consider using filters.`, 'warning', 5000);
+            // The 3D (WebGL) renderer handles large graphs comfortably; only the
+            // legacy 2D SVG fallback struggles, so warn just for that case.
+            if (!this.use3DGraph && Number(limit) >= 750) {
+                this.showToast(`2D mode with ${limit} nodes may be slow — switch to 3D for large graphs.`, 'warning', 5000);
             }
 
             const data = await this.apiCall(`/analytics/graph-visualization?limit=${limit}&min_connections=${minConnections}`);
+            if (requestId !== this._graphLoadId) return;
 
             if (!data || !data.nodes || data.nodes.length === 0) {
+                this._clearGraphData();
                 container.innerHTML = '<p>No connected memories found. Try lowering the minimum connections filter.</p>';
                 return;
             }
 
             // Store data for fullscreen use
             this.currentGraphData = data;
+            this.graphRingCenterId = null;
+
+            // A reload brings a new node set, so the degree filter starts over.
+            this.minGraphDegree = 1;
+
+            // Build the type->color map from the actual data and (re)render the
+            // filter pills so every present type is filterable (no orphan "other").
+            this._buildGraphTypeColors(data.nodes);
+            this._renderTypeFilterPills();
 
             this.renderGraphVisualization(container, data);
         } catch (error) {
             console.error('Failed to load graph visualization:', error);
+            if (requestId !== this._graphLoadId) return;
+            this._clearGraphData();
             container.innerHTML = '<p class="error">Failed to load graph visualization</p>';
         }
     }
@@ -5740,7 +5808,39 @@ class MemoryDashboard {
      * Render graph in a specific container with custom dimensions
      */
     renderGraphVisualizationInContainer(container, data, width, height, isFullscreen) {
+        this._disposeConcentricRingView(isFullscreen);
 
+        // PoC (Orrery-style): tear down any prior 3D instance bound to this slot
+        this._disposeGraph3D(isFullscreen);
+
+        // Likewise stop the previous 2D simulation for this slot: every re-render
+        // (type pill, degree slider) builds a new one, and the old one would keep
+        // ticking against detached nodes until it cooled on its own.
+        const previousSimulation = isFullscreen ? this.fullscreenSimulation : this.graphSimulation;
+        if (previousSimulation) previousSimulation.stop();
+        container.innerHTML = '';
+
+        // Default to 3D once the (ESM, deferred) 3d-force-graph module has set
+        // window.ForceGraph3D. Don't cache `false` — the module may still be
+        // loading on a very early render; leaving use3DGraph undefined lets the
+        // next render upgrade to 3D. An explicit user toggle (true/false) sticks.
+        if (this.use3DGraph === undefined && typeof window.ForceGraph3D !== 'undefined') {
+            this.use3DGraph = true;
+        }
+        if (this.graphLayout !== 'rings' && this.use3DGraph && typeof window.ForceGraph3D !== 'undefined') {
+            this.render3DGraph(container, data, width, height, isFullscreen);
+            return;
+        }
+
+        // Apply the same type filter + edge-dedup on fresh copies (D3 mutates
+        // node/link objects, so never run it on the shared currentGraphData).
+        data = this._filterGraphData(data);
+        if (this.graphLayout === 'rings') {
+            this.renderConcentricRingGraph(container, data, width, height, isFullscreen);
+            return;
+        }
+
+        // ----- Legacy 2D D3.js force-directed fallback -----
         // Create SVG
         const svg = d3.select(container)
             .append('svg')
@@ -5757,14 +5857,8 @@ class MemoryDashboard {
             });
         svg.call(zoom);
 
-        // Color mapping for memory types
-        const nodeColors = {
-            'observation': '#4A90E2',
-            'decision': '#E24A4A',
-            'learning': '#50C878',
-            'error': '#F39C12',
-            'untyped': '#9B59B6'
-        };
+        // Color mapping for memory types (dynamic, shared with pills/legend)
+        const nodeColors = this.graphTypeColors || { 'untyped': '#9B59B6' };
 
         // Color mapping for relationship types
         const edgeColors = {
@@ -5875,6 +5969,363 @@ class MemoryDashboard {
     }
 
     /**
+     * Render the filtered graph in BFS-distance rings around the selected node.
+     */
+    _concentricRingNodeRadius(item) {
+        return Math.min(20, 8 + Math.sqrt(item.connections || 1) * 2);
+    }
+
+    renderConcentricRingGraph(container, data, width, height, isFullscreen) {
+        const slot = isFullscreen ? '_fs' : '_main';
+        const svg = d3.select(container)
+            .append('svg')
+            .attr('width', width)
+            .attr('height', height)
+            .attr('viewBox', [0, 0, width, height])
+            .attr('class', 'graph-ring-canvas');
+
+        const g = svg.append('g');
+        const zoom = d3.zoom()
+            .scaleExtent([0.1, 4])
+            .on('zoom', event => g.attr('transform', event.transform));
+        svg.call(zoom);
+
+        const nodes = data.nodes.map(node => ({ ...node }));
+        const nodeById = new Map(nodes.map(node => [node.id, node]));
+        const idOf = value => (value && typeof value === 'object') ? value.id : value;
+        const edges = data.edges
+            .map(edge => ({ ...edge, source: idOf(edge.source), target: idOf(edge.target) }))
+            .filter(edge => nodeById.has(edge.source) && nodeById.has(edge.target));
+        const layout = this._calculateConcentricRingLayout(
+            nodes,
+            edges,
+            this.graphRingCenterId,
+            width,
+            height
+        );
+        this.graphRingCenterId = layout.centerId;
+
+        const ringLayer = g.append('g').attr('class', 'graph-ring-guides');
+        const link = g.append('g')
+            .selectAll('line')
+            .data(edges)
+            .join('line')
+            .attr('class', edge => `graph-link link-${edge.relationship_type || 'related'}`)
+            .attr('stroke-width', 1.5);
+        const nodeColors = this.graphTypeColors || { 'untyped': '#9B59B6' };
+        const node = g.append('g')
+            .selectAll('circle')
+            .data(nodes)
+            .join('circle')
+            .attr('class', 'graph-node')
+            .attr('r', item => this._concentricRingNodeRadius(item))
+            .attr('fill', item => nodeColors[item.type] || nodeColors.untyped)
+            .style('cursor', 'pointer');
+        const fontSize = nodes.length > 750 ? '8px' : nodes.length > 500 ? '10px' : '12px';
+        const label = g.append('g')
+            .selectAll('text')
+            .data(nodes)
+            .join('text')
+            .attr('class', 'graph-label')
+            .attr('font-size', fontSize)
+            .attr('fill', isFullscreen ? '#ffffff' : 'currentColor')
+            .attr('dy', -15)
+            .text(item => {
+                const content = item.content || '';
+                return content.length > 20 ? content.substring(0, 20) + '...' : content;
+            });
+        const tooltip = d3.select(container)
+            .append('div')
+            .attr('class', 'graph-tooltip')
+            .style('position', 'absolute')
+            .style('opacity', 0);
+
+        const view = {
+            clickTimer: null,
+            edges,
+            height,
+            isFullscreen,
+            label,
+            link,
+            node,
+            nodeById,
+            nodes,
+            ringLayer,
+            svg,
+            width,
+            zoom
+        };
+        this['ringGraph' + slot] = view;
+        this._applyConcentricRingLayout(view, layout, false);
+
+        node
+            .on('click', (event, item) => {
+                if (event.defaultPrevented) return;
+                event.stopPropagation();
+                if (view.clickTimer) window.clearTimeout(view.clickTimer);
+                view.clickTimer = window.setTimeout(() => {
+                    view.clickTimer = null;
+                    this.recenterConcentricRingGraph(item.id);
+                }, 250);
+            })
+            .on('dblclick', (event, item) => {
+                event.preventDefault();
+                event.stopPropagation();
+                if (view.clickTimer) {
+                    window.clearTimeout(view.clickTimer);
+                    view.clickTimer = null;
+                }
+                this.handleGraphNodeClick(event, item);
+            })
+            .on('mouseover', (event, item) => {
+                tooltip.transition().duration(200).style('opacity', 1);
+                tooltip
+                    .html(this.formatGraphTooltip(item, 'Click to center; double-click for details'))
+                    .style('left', (event.pageX + 10) + 'px')
+                    .style('top', (event.pageY - 28) + 'px');
+            })
+            .on('mouseout', () => tooltip.transition().duration(500).style('opacity', 0))
+            .call(this.concentricRingDragBehavior(view));
+    }
+
+    /**
+     * Calculate stable node coordinates by shortest-path distance from a center node.
+     */
+    _calculateConcentricRingLayout(nodes, edges, requestedCenterId, width, height) {
+        const adjacency = new Map(nodes.map(node => [node.id, new Set()]));
+        const nodeById = new Map(nodes.map(node => [node.id, node]));
+        edges.forEach(edge => {
+            adjacency.get(edge.source)?.add(edge.target);
+            adjacency.get(edge.target)?.add(edge.source);
+        });
+        const degree = node => adjacency.get(node.id)?.size || 0;
+        const byDegree = [...nodes].sort((a, b) => degree(b) - degree(a) || String(a.id).localeCompare(String(b.id)));
+        const center = nodes.find(node => node.id === requestedCenterId) || byDegree[0];
+        if (!center) return { centerId: null, outerRadius: 0, positions: new Map(), radii: [] };
+
+        const depths = new Map([[center.id, 0]]);
+        const queue = [center.id];
+        for (let cursor = 0; cursor < queue.length; cursor += 1) {
+            const current = queue[cursor];
+            const nextDepth = depths.get(current) + 1;
+            const neighbors = [...(adjacency.get(current) || [])]
+                .map(id => nodeById.get(id))
+                .filter(Boolean)
+                .sort((a, b) => degree(b) - degree(a) || String(a.id).localeCompare(String(b.id)));
+            neighbors.forEach(neighbor => {
+                if (depths.has(neighbor.id)) return;
+                depths.set(neighbor.id, nextDepth);
+                queue.push(neighbor.id);
+            });
+        }
+
+        let maxDepth = Math.max(0, ...depths.values());
+        const disconnected = byDegree.filter(node => !depths.has(node.id));
+        if (disconnected.length) {
+            maxDepth += 1;
+            disconnected.forEach(node => depths.set(node.id, maxDepth));
+        }
+
+        const rings = new Map();
+        nodes.forEach(node => {
+            const depth = depths.get(node.id);
+            if (!rings.has(depth)) rings.set(depth, []);
+            rings.get(depth).push(node);
+        });
+        rings.forEach(ring => ring.sort(
+            (a, b) => degree(b) - degree(a) || String(a.id).localeCompare(String(b.id))
+        ));
+
+        const cx = width / 2;
+        const cy = height / 2;
+        const nominalRadius = Math.max(0, Math.min(width, height) / 2 - 48);
+        const nominalStep = Math.max(72, nominalRadius / Math.max(1, maxDepth + 0.35));
+        const nodeRadius = node => this._concentricRingNodeRadius(node);
+        const positions = new Map([[center.id, { x: cx, y: cy, depth: 0 }]]);
+        const radii = [];
+        let outerRadius = nodeRadius(center);
+        let previousNodeRadius = nodeRadius(center);
+        let previousRadius = 0;
+        for (let depth = 1; depth <= maxDepth; depth += 1) {
+            const ring = rings.get(depth) || [];
+            const ringNodeRadius = Math.max(10, ...ring.map(nodeRadius));
+            const circumferenceRadius = ring.reduce(
+                (length, node) => length + nodeRadius(node) * 2 + 12,
+                0
+            ) / (2 * Math.PI);
+            const radialRadius = previousRadius + Math.max(
+                nominalStep,
+                previousNodeRadius + ringNodeRadius + 24
+            );
+            const radius = Math.max(circumferenceRadius, radialRadius);
+            radii.push(radius);
+            ring.forEach((node, index) => {
+                const angle = -Math.PI / 2 + (2 * Math.PI * index / Math.max(1, ring.length));
+                positions.set(node.id, {
+                    x: cx + radius * Math.cos(angle),
+                    y: cy + radius * Math.sin(angle),
+                    depth
+                });
+            });
+            previousNodeRadius = ringNodeRadius;
+            previousRadius = radius;
+            outerRadius = Math.max(outerRadius, radius + ringNodeRadius + 28);
+        }
+        return { centerId: center.id, outerRadius, positions, radii };
+    }
+
+    /**
+     * Move both rendered ring views to a new center without another API request.
+     */
+    recenterConcentricRingGraph(centerId) {
+        this.graphRingCenterId = centerId;
+        ['_main', '_fs'].forEach(slot => {
+            const view = this['ringGraph' + slot];
+            if (!view) return;
+            const layout = this._calculateConcentricRingLayout(
+                view.nodes,
+                view.edges,
+                centerId,
+                view.width,
+                view.height
+            );
+            this._applyConcentricRingLayout(view, layout, true);
+        });
+    }
+
+    _applyConcentricRingLayout(view, layout, animate) {
+        view.nodes.forEach(node => {
+            const position = layout.positions.get(node.id);
+            if (position) {
+                node.x = position.x;
+                node.y = position.y;
+                node.ringDepth = position.depth;
+            }
+        });
+        const transition = animate ? d3.transition().duration(650).ease(d3.easeCubicInOut) : null;
+        const move = selection => transition ? selection.transition(transition) : selection;
+
+        const guides = view.ringLayer
+            .selectAll('circle')
+            .data(layout.radii);
+        guides.exit().remove();
+        const mergedGuides = guides.enter()
+            .append('circle')
+            .attr('class', 'graph-ring-guide')
+            .attr('cx', view.width / 2)
+            .attr('cy', view.height / 2)
+            .attr('r', 0)
+            .merge(guides);
+        move(mergedGuides)
+            .attr('cx', view.width / 2)
+            .attr('cy', view.height / 2)
+            .attr('r', radius => radius);
+
+        view.node.classed('ring-center', node => node.id === layout.centerId);
+        move(view.node)
+            .attr('cx', node => node.x)
+            .attr('cy', node => node.y);
+        move(view.label)
+            .attr('x', node => node.x)
+            .attr('y', node => node.y);
+        move(view.link)
+            .attr('x1', edge => view.nodeById.get(edge.source).x)
+            .attr('y1', edge => view.nodeById.get(edge.source).y)
+            .attr('x2', edge => view.nodeById.get(edge.target).x)
+            .attr('y2', edge => view.nodeById.get(edge.target).y);
+
+        const availableDiameter = Math.max(1, Math.min(view.width, view.height) - 64);
+        const contentDiameter = Math.max(1, layout.outerRadius * 2);
+        const scale = Math.min(1, availableDiameter / contentDiameter);
+        view.zoom.scaleExtent([Math.min(0.1, scale), 4]);
+        const fitTransform = d3.zoomIdentity
+            .translate(view.width / 2, view.height / 2)
+            .scale(scale)
+            .translate(-view.width / 2, -view.height / 2);
+        const zoomTarget = transition ? view.svg.transition(transition) : view.svg;
+        zoomTarget.call(view.zoom.transform, fitTransform);
+    }
+
+    _disposeConcentricRingView(isFullscreen) {
+        const slot = isFullscreen ? '_fs' : '_main';
+        const view = this['ringGraph' + slot];
+        if (!view) return;
+        if (view.clickTimer) window.clearTimeout(view.clickTimer);
+        this._interruptConcentricRingTransitions(view);
+        this['ringGraph' + slot] = null;
+    }
+
+    _interruptConcentricRingTransitions(view) {
+        view.svg.interrupt();
+        view.ringLayer.selectAll('circle').interrupt();
+        view.node.interrupt().each(function (node) {
+            const circle = d3.select(this);
+            const x = Number(circle.attr('cx'));
+            const y = Number(circle.attr('cy'));
+            if (Number.isFinite(x)) node.x = x;
+            if (Number.isFinite(y)) node.y = y;
+        });
+        view.label.interrupt()
+            .attr('x', node => node.x)
+            .attr('y', node => node.y);
+        view.link.interrupt()
+            .attr('x1', edge => view.nodeById.get(edge.source).x)
+            .attr('y1', edge => view.nodeById.get(edge.source).y)
+            .attr('x2', edge => view.nodeById.get(edge.target).x)
+            .attr('y2', edge => view.nodeById.get(edge.target).y);
+    }
+
+    _resizeConcentricRingView(view, width, height) {
+        width = Math.max(1, Math.round(width));
+        height = Math.max(1, Math.round(height));
+        if (view.width === width && view.height === height) return;
+        this._interruptConcentricRingTransitions(view);
+        view.width = width;
+        view.height = height;
+        view.svg
+            .attr('width', width)
+            .attr('height', height)
+            .attr('viewBox', [0, 0, width, height]);
+        const layout = this._calculateConcentricRingLayout(
+            view.nodes,
+            view.edges,
+            this.graphRingCenterId,
+            width,
+            height
+        );
+        this._applyConcentricRingLayout(view, layout, false);
+    }
+
+    /**
+     * Keep node dragging available in ring mode. Re-centering restores the calculated positions.
+     */
+    concentricRingDragBehavior(view) {
+        const dashboard = this;
+        const update = () => {
+            view.node.attr('cx', node => node.x).attr('cy', node => node.y);
+            view.label.attr('x', node => node.x).attr('y', node => node.y);
+            view.link
+                .attr('x1', edge => view.nodeById.get(edge.source).x)
+                .attr('y1', edge => view.nodeById.get(edge.source).y)
+                .attr('x2', edge => view.nodeById.get(edge.target).x)
+                .attr('y2', edge => view.nodeById.get(edge.target).y);
+        };
+        return d3.drag()
+            .on('start', function () {
+                dashboard._interruptConcentricRingTransitions(view);
+                d3.select(this).classed('dragging', true);
+            })
+            .on('drag', (event, node) => {
+                node.x = event.x;
+                node.y = event.y;
+                update();
+            })
+            .on('end', function () {
+                d3.select(this).classed('dragging', false);
+            });
+    }
+
+    /**
      * Create drag behavior for graph nodes
      */
     dragBehavior(simulation) {
@@ -5902,6 +6353,605 @@ class MemoryDashboard {
     }
 
     /**
+     * Render graph as a cinematic 3D force-directed galaxy (Orrery-style PoC).
+     * Uses the global ForceGraph3D (3d-force-graph, bundles three.js).
+     * Same data contract as the 2D renderer: nodes + edges from
+     * /analytics/graph-visualization.
+     */
+    render3DGraph(container, data, width, height, isFullscreen) {
+        const slot = isFullscreen ? '_fs' : '_main';
+
+        // Reset container (removes loading spinner / previous canvas)
+        container.innerHTML = '';
+
+        // Color maps mirror the 2D renderer for visual consistency.
+        // nodeColors is built dynamically from the data (see _buildGraphTypeColors)
+        // so every memory type present gets a distinct, filterable color.
+        const nodeColors = this.graphTypeColors || { 'untyped': '#9B59B6' };
+        const edgeColors = {
+            'causes': '#E74C3C',
+            'fixes': '#27AE60',
+            'contradicts': '#E67E22',
+            'supports': '#3498DB',
+            'follows': '#9B59B6',
+            'related': '#95A5A6'
+        };
+
+        // Apply the active type filter, then make fresh copies — 3d-force-graph
+        // mutates node + link objects (positions, source/target refs), so the
+        // main view, fullscreen, and the source currentGraphData must not share
+        // object identity.
+        const filtered = this._filterGraphData(data);
+        const nodes = filtered.nodes.map(n => ({ ...n }));
+        const links = filtered.edges.map(e => ({
+            source: e.source,
+            target: e.target,
+            relationship_type: e.relationship_type || 'related'
+        }));
+
+        // Neighbor map for hover highlighting
+        const neighbors = new Map();
+        nodes.forEach(n => neighbors.set(n.id, new Set([n.id])));
+        links.forEach(l => {
+            neighbors.get(l.source)?.add(l.target);
+            neighbors.get(l.target)?.add(l.source);
+        });
+        let highlightNode = null;
+        const linkEndId = (end) => (end && end.id !== undefined) ? end.id : end;
+
+        const Graph = window.ForceGraph3D()(container)
+            .width(width)
+            .height(height)
+            .backgroundColor('#01010a')
+            .showNavInfo(false)
+            .graphData({ nodes, links })
+            .nodeLabel(d => this.formatGraphTooltip(d))
+            // Soft glowing sprites (not hard spheres) for smooth Orrery-style
+            // halos; bloom amplifies the additive falloff.
+            .nodeThreeObjectExtend(false)
+            .nodeThreeObject(node => {
+                const THREE = window.THREE;
+                if (!THREE) return null; // fall back to default sphere
+                const baseHex = nodeColors[node.type || 'untyped'] || '#9B59B6';
+                const mat = new THREE.SpriteMaterial({
+                    map: this._getNodeGlowTexture(THREE),
+                    color: new THREE.Color(baseHex),
+                    blending: THREE.AdditiveBlending,
+                    transparent: true,
+                    depthWrite: false,
+                    opacity: 0.75
+                });
+                const sprite = new THREE.Sprite(mat);
+                const s = 4 + Math.sqrt(node.connections || 1) * 2.5;
+                sprite.scale.set(s, s, 1);
+                node.__mat = mat;
+                node.__baseColor = baseHex;
+                return sprite;
+            })
+            .linkColor(d => edgeColors[d.relationship_type] || edgeColors['related'])
+            .linkOpacity(0.32)
+            .linkCurvature(0.25)
+            .linkWidth(d => {
+                if (!highlightNode) return 0.4;
+                const hit = linkEndId(d.source) === highlightNode || linkEndId(d.target) === highlightNode;
+                return hit ? 1.5 : 0.15;
+            })
+            .linkDirectionalParticles(d => {
+                if (!highlightNode) return 0;
+                const hit = linkEndId(d.source) === highlightNode || linkEndId(d.target) === highlightNode;
+                return hit ? 3 : 0;
+            })
+            .linkDirectionalParticleSpeed(0.01)
+            .onNodeHover(node => {
+                highlightNode = node ? node.id : null;
+                container.style.cursor = node ? 'pointer' : '';
+                // Dim non-neighbor sprites; relight neighbors
+                nodes.forEach(n => {
+                    if (!n.__mat) return;
+                    const near = !highlightNode || neighbors.get(highlightNode)?.has(n.id);
+                    n.__mat.opacity = near ? 0.75 : 0.1;
+                    n.__mat.color.set(near ? n.__baseColor : '#223047');
+                });
+                Graph.linkWidth(Graph.linkWidth())
+                    .linkDirectionalParticles(Graph.linkDirectionalParticles());
+            })
+            .onNodeClick(node => this.handleGraph3DNodeClick(node));
+
+        this['graph3d' + slot] = Graph;
+
+        // Starfield + nebula + bloom glow (best-effort; never blocks the graph)
+        try {
+            this._addGraphCosmos(Graph, width, height);
+        } catch (e) {
+            console.warn('Graph cosmos/bloom skipped:', e);
+        }
+
+        // Orrery-style auto-rotation. The rAF loop stays alive; `active` gates
+        // whether it advances, so the Pause/Play button and user drag can
+        // toggle rotation without restarting the loop. The angle is re-derived
+        // from the live camera each frame, so resuming after a manual drag
+        // never snaps the view.
+        const distance = isFullscreen ? 600 : 420;
+        Graph.cameraPosition({ z: distance });
+        const rotateState = { alive: true, active: !this.graphRotationPaused, angle: 0 };
+        this['graph3dRotate' + slot] = rotateState;
+        const rotate = () => {
+            if (!rotateState.alive) return;
+            if (rotateState.active) {
+                const cam = Graph.cameraPosition();
+                const r = Math.hypot(cam.x, cam.z) || distance;
+                rotateState.angle = Math.atan2(cam.x, cam.z) + 0.0016;
+                Graph.cameraPosition({ x: r * Math.sin(rotateState.angle), z: r * Math.cos(rotateState.angle) });
+            }
+            requestAnimationFrame(rotate);
+        };
+        requestAnimationFrame(rotate);
+        // Grabbing the graph pauses rotation and syncs the Pause/Play label
+        const userPause = () => {
+            rotateState.active = false;
+            this.graphRotationPaused = true;
+            this._updateRotateButton();
+        };
+        container.addEventListener('pointerdown', userPause, { once: true });
+        container.addEventListener('wheel', userPause, { once: true });
+    }
+
+    /**
+     * Filter the raw graph data ({nodes, edges}) by the active type filter.
+     * Returns a new wrapper with references to the original objects (callers
+     * that mutate — e.g. the 3D renderer — must copy before use).
+     */
+    _filterGraphData(data) {
+        if (!data || !data.nodes) return { nodes: [], edges: [] };
+        const hidden = this.hiddenGraphTypes || new Set();
+        // d3-force / 3d-force-graph rewrite link source/target into node objects
+        // in place. Normalize back to a string id so a 2D->3D toggle (or any
+        // re-render) still matches the node set, and return fresh copies so no
+        // renderer mutates the shared currentGraphData.
+        const idOf = (x) => (x && typeof x === 'object' && x.id !== undefined) ? x.id : x;
+
+        const nodes = data.nodes
+            .filter(n => !hidden.has(n.type || 'untyped'))
+            .map(n => {
+                const { x, y, z, vx, vy, vz, fx, fy, fz, ...clean } = n;
+                return clean; // drop any layout state a previous render wrote
+            });
+        const ids = new Set(nodes.map(n => n.id));
+
+        // Symmetric relationships are stored as two directed rows (A->B and
+        // B->A); collapse each unordered pair to a single edge so we draw one
+        // curve, not two mirrored ones. Also drop self-loops.
+        const seen = new Set();
+        const edges = [];
+        for (const e of (data.edges || [])) {
+            const s = idOf(e.source), t = idOf(e.target);
+            if (!ids.has(s) || !ids.has(t) || s === t) continue;
+            const key = s < t ? `${s}|${t}` : `${t}|${s}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            edges.push({
+                source: s,
+                target: t,
+                relationship_type: e.relationship_type || 'related',
+                similarity: e.similarity,
+                connection_types: e.connection_types
+            });
+        }
+
+        // Degree = number of distinct neighbours, counted on the collapsed,
+        // type-filtered edges so it describes the graph that is actually drawn
+        // (a mutual A<->B pair counts once; hidden types do not count).
+        const neighbours = new Map();
+        for (const e of edges) {
+            if (!neighbours.has(e.source)) neighbours.set(e.source, new Set());
+            if (!neighbours.has(e.target)) neighbours.set(e.target, new Set());
+            neighbours.get(e.source).add(e.target);
+            neighbours.get(e.target).add(e.source);
+        }
+        let maxDegree = 1;
+        neighbours.forEach(s => { if (s.size > maxDegree) maxDegree = s.size; });
+
+        // Clamp to the current range (e.g. a type was hidden and the top degree
+        // dropped); the slider shows the value that is actually applied.
+        const minDegree = Math.min(this.minGraphDegree || 1, maxDegree);
+        this._syncDegreeSlider(maxDegree, minDegree);
+
+        // At 1 the filter is off, so nodes whose only neighbours were hidden by
+        // a type pill still show up exactly as before this slider existed.
+        if (minDegree <= 1) return { nodes, edges };
+
+        const degreeOf = (id) => neighbours.has(id) ? neighbours.get(id).size : 0;
+        const keptNodes = nodes.filter(n => degreeOf(n.id) >= minDegree);
+        const keptIds = new Set(keptNodes.map(n => n.id));
+        return {
+            nodes: keptNodes,
+            edges: edges.filter(e => keptIds.has(e.source) && keptIds.has(e.target))
+        };
+    }
+
+    /**
+     * Reflect the degree filter's range and value in the slider. Setting
+     * .value/.max from script does not fire 'input', so this cannot re-enter
+     * the render path.
+     */
+    _syncDegreeSlider(maxDegree, value) {
+        const slider = document.getElementById('graphDegreeSlider');
+        if (!slider) return;
+        slider.max = String(maxDegree);
+        slider.value = String(value);
+        slider.disabled = maxDegree <= 1;
+        const label = document.getElementById('graphDegreeValue');
+        if (label) label.textContent = String(value);
+    }
+
+    /**
+     * Slider handler: set the minimum degree and re-render client-side, the
+     * same way the type pills do (no API call).
+     */
+    handleGraphDegreeChange(event) {
+        this.minGraphDegree = Number(event.target.value) || 1;
+        const label = document.getElementById('graphDegreeValue');
+        if (label) label.textContent = String(this.minGraphDegree);
+        this.applyGraphTypeFilter();
+    }
+
+    /**
+     * Drop the loaded graph and put the degree filter back to idle. Used when a
+     * reload returns nothing or fails, so the slider and the type pills cannot
+     * redraw the previous graph over the empty-result or error message.
+     */
+    _clearGraphData() {
+        this._disposeConcentricRingView(false);
+        if (this._graphFullscreenOpen) {
+            this.exitGraphFullscreen();
+        } else {
+            this._disposeConcentricRingView(true);
+        }
+        this.currentGraphData = null;
+        this.minGraphDegree = 1;
+        this.graphRingCenterId = null;
+        this._syncDegreeSlider(1, 1);
+    }
+
+    /**
+     * Re-apply the type filter to whatever is currently rendered.
+     * 3D instances update in place (camera + rotation preserved); the 2D
+     * renderer is re-run with the filtered subset.
+     */
+    applyGraphTypeFilter() {
+        if (!this.currentGraphData) return;
+        if (this.use3DGraph) {
+            const f = this._filterGraphData(this.currentGraphData);
+            const graphData = {
+                nodes: f.nodes.map(n => ({ ...n })),
+                links: f.edges.map(e => ({ source: e.source, target: e.target, relationship_type: e.relationship_type || 'related' }))
+            };
+            ['_main', '_fs'].forEach(slot => {
+                const g = this['graph3d' + slot];
+                if (g) g.graphData(graphData);
+            });
+        } else {
+            this._renderCurrentGraphViews();
+        }
+    }
+
+    /**
+     * Toggle visibility of a memory type (filter bar button).
+     */
+    toggleGraphTypeFilter(type) {
+        if (!this.hiddenGraphTypes) this.hiddenGraphTypes = new Set();
+        if (this.hiddenGraphTypes.has(type)) this.hiddenGraphTypes.delete(type);
+        else this.hiddenGraphTypes.add(type);
+        this._syncTypeFilterButtons();
+        this.applyGraphTypeFilter();
+    }
+
+    /**
+     * Build a stable type -> color map from the data. The five canonical types
+     * keep their fixed colors; any other type present (note, configuration,
+     * reference, ...) gets a distinct color from a fallback palette so it is
+     * both visible and filterable. Ordered by frequency for nicer pills.
+     */
+    _buildGraphTypeColors(nodes) {
+        const canonical = {
+            observation: '#4A90E2', decision: '#E24A4A', learning: '#50C878',
+            error: '#F39C12', untyped: '#9B59B6'
+        };
+        const palette = [
+            '#16A085', '#E84393', '#0984E3', '#00B894', '#E17055', '#6C5CE7',
+            '#D63031', '#00CEC9', '#FDCB6E', '#636E72', '#A29BFE', '#55EFC4'
+        ];
+        const counts = new Map();
+        (nodes || []).forEach(n => {
+            const t = n.type || 'untyped';
+            counts.set(t, (counts.get(t) || 0) + 1);
+        });
+        const ordered = [...counts.entries()].sort((a, b) => b[1] - a[1]).map(e => e[0]);
+        const map = {};
+        let p = 0;
+        ordered.forEach(t => { map[t] = canonical[t] || palette[p++ % palette.length]; });
+        if (!map['untyped']) map['untyped'] = canonical.untyped;
+        this.graphTypeColors = map;
+        this.graphTypeCounts = counts; // node count per type, shown on pill hover
+    }
+
+    /**
+     * (Re)render the type filter pills into the main + fullscreen bars from the
+     * current type->color map. Pills reflect the active hidden set.
+     */
+    _renderTypeFilterPills() {
+        const types = Object.keys(this.graphTypeColors || {});
+        if (!this.hiddenGraphTypes) this.hiddenGraphTypes = new Set();
+        const build = (container) => {
+            if (!container) return;
+            container.innerHTML = '';
+            types.forEach(t => {
+                const btn = document.createElement('button');
+                btn.className = 'graph-type-filter' + (this.hiddenGraphTypes.has(t) ? '' : ' active');
+                btn.dataset.type = t;
+                const count = this.graphTypeCounts ? (this.graphTypeCounts.get(t) || 0) : 0;
+                btn.dataset.count = `${count} node${count === 1 ? '' : 's'}`;
+                const dot = document.createElement('span');
+                dot.className = 'legend-color';
+                dot.style.background = this.graphTypeColors[t];
+                btn.appendChild(dot);
+                btn.appendChild(document.createTextNode(' ' + t));
+                btn.addEventListener('click', () => this.toggleGraphTypeFilter(t));
+                btn.addEventListener('mouseenter', () => this._showPillTip(btn));
+                btn.addEventListener('mouseleave', () => this._hidePillTip());
+                container.appendChild(btn);
+            });
+        };
+        build(document.getElementById('graphTypeFilterBar'));
+        build(document.getElementById('graphFullscreenFilterBar'));
+    }
+
+    /**
+     * Keep every pill's active state in sync with the hidden set (both bars).
+     */
+    _syncTypeFilterButtons() {
+        document.querySelectorAll('#graphTypeFilterBar .graph-type-filter, #graphFullscreenFilterBar .graph-type-filter')
+            .forEach(b => b.classList.toggle('active', !this.hiddenGraphTypes.has(b.dataset.type)));
+    }
+
+    /**
+     * Instant, always-on-top count tooltip for a filter pill. Uses a single
+     * position:fixed element reparented into the active fullscreen element (or
+     * body) so it escapes the filter bar's stacking context and is visible in
+     * both normal and OS-fullscreen views.
+     */
+    _showPillTip(btn) {
+        if (!this._pillTip) {
+            this._pillTip = document.createElement('div');
+            this._pillTip.className = 'pill-tip';
+            document.body.appendChild(this._pillTip);
+        }
+        const tip = this._pillTip;
+        tip.textContent = btn.dataset.count || '';
+        const host = document.fullscreenElement || document.body;
+        if (tip.parentNode !== host) host.appendChild(tip);
+        const r = btn.getBoundingClientRect();
+        tip.style.left = `${r.left + r.width / 2}px`;
+        tip.style.top = `${r.bottom + 6}px`;
+        tip.style.display = 'block';
+    }
+
+    _hidePillTip() {
+        if (this._pillTip) this._pillTip.style.display = 'none';
+    }
+
+    /**
+     * Show / hide the fullscreen legend overlay.
+     */
+    toggleGraphLegend() {
+        const legend = document.getElementById('graphFullscreenLegend');
+        if (legend) legend.classList.toggle('hidden');
+    }
+
+    /**
+     * Pause / resume the 3D auto-rotation (button handler).
+     */
+    toggleGraphRotation() {
+        this.graphRotationPaused = !this.graphRotationPaused;
+        ['_main', '_fs'].forEach(slot => {
+            const rs = this['graph3dRotate' + slot];
+            if (rs) rs.active = !this.graphRotationPaused;
+        });
+        this._updateRotateButton();
+    }
+
+    _updateRotateButton() {
+        const text = this.graphRotationPaused ? 'Play' : 'Pause';
+        ['graphRotateLabel', 'graphFullscreenRotateLabel'].forEach(id => {
+            const el = document.getElementById(id);
+            if (el) el.textContent = text;
+        });
+        const enabled = Boolean(this.use3DGraph) && this.graphLayout !== 'rings';
+        ['graphRotateBtn', 'graphFullscreenRotateBtn'].forEach(id => {
+            const button = document.getElementById(id);
+            if (button) button.disabled = !enabled;
+        });
+    }
+
+    /**
+     * Add the cinematic backdrop to a 3D graph scene: a starfield, soft additive
+     * nebula clouds, and an UnrealBloomPass glow (Orrery-style). Uses the shared
+     * three instance + bloom pass exposed on window by the ESM module loader.
+     * Each render builds a fresh ForceGraph3D (own scene), so there is nothing to
+     * clean up across renders. No-op if three / bloom are unavailable.
+     */
+    _addGraphCosmos(Graph, width, height) {
+        const THREE = window.THREE;
+        if (!THREE || typeof Graph.scene !== 'function') return;
+        const scene = Graph.scene();
+        if (!scene) return;
+
+        // Starfield — points scattered in a large sphere around the graph
+        const starCount = 1500;
+        const positions = new Float32Array(starCount * 3);
+        for (let i = 0; i < positions.length; i++) positions[i] = (Math.random() - 0.5) * 4000;
+        const starGeo = new THREE.BufferGeometry();
+        starGeo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        scene.add(new THREE.Points(starGeo, new THREE.PointsMaterial({
+            color: 0xffffff, size: 1.4, sizeAttenuation: true, transparent: true, opacity: 0.85
+        })));
+
+        // Nebula clouds — large additive sprites with a soft radial-gradient texture
+        const tex = this._getNebulaTexture(THREE);
+        const palette = [0x3a1f6e, 0x1f3a6e, 0x6e1f4f, 0x244a6e];
+        for (let i = 0; i < 6; i++) {
+            const sprite = new THREE.Sprite(new THREE.SpriteMaterial({
+                map: tex, color: palette[i % palette.length],
+                blending: THREE.AdditiveBlending, transparent: true, opacity: 0.16, depthWrite: false
+            }));
+            sprite.position.set((Math.random() - 0.5) * 1600, (Math.random() - 0.5) * 1600, (Math.random() - 0.5) * 1600);
+            const s = 700 + Math.random() * 700;
+            sprite.scale.set(s, s, 1);
+            scene.add(sprite);
+        }
+
+        // Bloom glow via the post-processing composer (same three instance)
+        const Bloom = window.__UnrealBloomPass;
+        const composer = typeof Graph.postProcessingComposer === 'function' ? Graph.postProcessingComposer() : null;
+        if (Bloom && composer) {
+            // Gentle bloom — enough to make nodes glow without washing the
+            // scene into big white halos.
+            const bloom = new Bloom(new THREE.Vector2(width, height), 0.65, 0.8, 0.05);
+            composer.addPass(bloom);
+        }
+    }
+
+    /**
+     * Lazily build + cache the soft radial-gradient texture used for node glow
+     * sprites. A smooth white core fading to transparent gives the fluid Orrery
+     * halo once tinted per type and amplified by bloom.
+     */
+    _getNodeGlowTexture(THREE) {
+        if (this._nodeGlowTexture) return this._nodeGlowTexture;
+        const canvas = document.createElement('canvas');
+        canvas.width = canvas.height = 128;
+        const ctx = canvas.getContext('2d');
+        const grad = ctx.createRadialGradient(64, 64, 0, 64, 64, 64);
+        grad.addColorStop(0.0, 'rgba(255,255,255,1)');
+        grad.addColorStop(0.18, 'rgba(255,255,255,0.9)');
+        grad.addColorStop(0.45, 'rgba(255,255,255,0.32)');
+        grad.addColorStop(1.0, 'rgba(255,255,255,0)');
+        ctx.fillStyle = grad;
+        ctx.fillRect(0, 0, 128, 128);
+        this._nodeGlowTexture = new THREE.CanvasTexture(canvas);
+        return this._nodeGlowTexture;
+    }
+
+    /**
+     * Lazily build + cache a soft circular gradient texture used for nebula sprites.
+     */
+    _getNebulaTexture(THREE) {
+        if (this._nebulaTexture) return this._nebulaTexture;
+        const canvas = document.createElement('canvas');
+        canvas.width = canvas.height = 256;
+        const ctx = canvas.getContext('2d');
+        const grad = ctx.createRadialGradient(128, 128, 0, 128, 128, 128);
+        grad.addColorStop(0, 'rgba(255,255,255,0.9)');
+        grad.addColorStop(0.3, 'rgba(255,255,255,0.35)');
+        grad.addColorStop(1, 'rgba(255,255,255,0)');
+        ctx.fillStyle = grad;
+        ctx.fillRect(0, 0, 256, 256);
+        this._nebulaTexture = new THREE.CanvasTexture(canvas);
+        return this._nebulaTexture;
+    }
+
+    /**
+     * Tear down the 3D graph instance for a given slot (main / fullscreen),
+     * stopping its render loop and our auto-rotation rAF.
+     */
+    _disposeGraph3D(isFullscreen) {
+        const slot = isFullscreen ? '_fs' : '_main';
+        if (this['graph3dRotate' + slot]) {
+            this['graph3dRotate' + slot].alive = false;
+            this['graph3dRotate' + slot].active = false;
+            this['graph3dRotate' + slot] = null;
+        }
+        const g = this['graph3d' + slot];
+        if (g) {
+            try { g.pauseAnimation(); } catch (e) { /* noop */ }
+            try { if (g._destructor) g._destructor(); } catch (e) { /* noop */ }
+            this['graph3d' + slot] = null;
+        }
+    }
+
+    /**
+     * Open the memory detail modal for a clicked 3D node.
+     */
+    async handleGraph3DNodeClick(node) {
+        if (!node) return;
+        try {
+            this.showToast('Loading memory details...', 'info');
+            const memory = await this.apiCall(`/memories/${node.id}`);
+            this.showMemoryDetails(memory);
+        } catch (error) {
+            console.error('Failed to load memory:', error);
+            this.showToast('Failed to load memory details', 'error');
+        }
+    }
+
+    /**
+     * Toggle between the 3D (Orrery-style) and 2D D3 renderers, then re-render.
+     */
+    toggleGraphDimension() {
+        this.use3DGraph = !this.use3DGraph;
+        if (this.use3DGraph) {
+            this.graphLayout = 'force';
+            this._updateGraphLayoutButtons();
+        }
+        const label = document.getElementById('graphDimensionLabel');
+        if (label) label.textContent = this.use3DGraph ? '3D' : '2D';
+        this._updateRotateButton();
+        this._renderCurrentGraphViews();
+    }
+
+    /**
+     * Switch between the force-directed and concentric-ring 2D layouts.
+     */
+    setGraphLayout(layout) {
+        if (layout !== 'force' && layout !== 'rings') return;
+        this.graphLayout = layout;
+        if (layout === 'rings') {
+            this.use3DGraph = false;
+            const dimensionLabel = document.getElementById('graphDimensionLabel');
+            if (dimensionLabel) dimensionLabel.textContent = '2D';
+        }
+        this._updateGraphLayoutButtons();
+        this._updateRotateButton();
+        this._renderCurrentGraphViews();
+    }
+
+    _updateGraphLayoutButtons() {
+        document.querySelectorAll('[data-graph-layout]').forEach(button => {
+            const active = button.dataset.graphLayout === this.graphLayout;
+            button.classList.toggle('active', active);
+            button.setAttribute('aria-pressed', String(active));
+        });
+    }
+
+    _renderCurrentGraphViews() {
+        if (!this.currentGraphData) return;
+        const container = document.getElementById('graphVisualizationContainer');
+        if (container) this.renderGraphVisualization(container, this.currentGraphData);
+        if (this._graphFullscreenOpen) {
+            const fullscreen = document.getElementById('graphFullscreenContainer');
+            if (fullscreen) {
+                this.renderGraphVisualizationInContainer(
+                    fullscreen,
+                    this.currentGraphData,
+                    fullscreen.clientWidth || window.innerWidth,
+                    fullscreen.clientHeight || Math.max(200, window.innerHeight - 64),
+                    true
+                );
+            }
+        }
+    }
+
+    /**
      * Handle graph refresh button click
      */
     async handleGraphRefresh() {
@@ -5911,7 +6961,7 @@ class MemoryDashboard {
     /**
      * Format enhanced tooltip with quality score, timestamps, and metadata
      */
-    formatGraphTooltip(d) {
+    formatGraphTooltip(d, interactionHint = 'Click node to view full memory') {
         const qualityClass = d.quality_score >= 0.7 ? 'high' : d.quality_score >= 0.4 ? 'medium' : 'low';
         const qualityColor = qualityClass === 'high' ? '#50C878' : qualityClass === 'medium' ? '#F39C12' : '#E24A4A';
 
@@ -5959,7 +7009,7 @@ class MemoryDashboard {
                     <span class="tooltip-icon">🔑</span>
                     <span title="${d.id}">${d.id.substring(0, 12)}...</span>
                 </div>
-                <div class="tooltip-hint">💡 Click node to view full memory</div>
+                <div class="tooltip-hint">💡 ${this.escapeHtml(interactionHint)}</div>
             </div>
         `;
     }
@@ -6002,33 +7052,84 @@ class MemoryDashboard {
         // Clone legend from main graph
         const originalLegend = document.getElementById('graphLegend');
         legend.innerHTML = originalLegend.innerHTML;
+        legend.classList.remove('hidden');
 
-        // Show modal
+        // Show modal + populate the fullscreen filter pills
         modal.style.display = 'flex';
+        this._graphFullscreenOpen = true;
+        this._renderTypeFilterPills();
+        this._updateRotateButton();
 
-        // Get window dimensions for fullscreen
-        const width = window.innerWidth - 80;
-        const height = window.innerHeight - 180;
-
-        // Show node count
-        if (this.currentGraphData) {
-            nodeCount.textContent = `${this.currentGraphData.nodes.length} nodes, ${this.currentGraphData.edges.length} edges`;
+        // Request real OS-level fullscreen (falls back to the overlay if denied)
+        if (modal.requestFullscreen) {
+            modal.requestFullscreen().catch(() => {});
         }
 
-        // Re-render graph in fullscreen with larger dimensions
-        if (this.currentGraphData) {
-            this.renderGraphVisualizationInContainer(
-                container,
-                this.currentGraphData,
-                width,
-                height,
-                true // isFullscreen flag
-            );
+        // In OS fullscreen the browser only paints the fullscreen element's
+        // subtree, so a node click would open the memory-detail modal off-screen.
+        // Relocate #memoryModal inside the fullscreen element while open; it is
+        // restored to its original parent in exitGraphFullscreen().
+        const memModal = document.getElementById('memoryModal');
+        if (memModal) {
+            this._memoryModalHome = memModal.parentNode;
+            modal.appendChild(memModal);
         }
 
-        // Add escape key listener
+        // Size the canvas to the container (fills the screen below the header)
+        const dims = () => {
+            const c = document.getElementById('graphFullscreenContainer');
+            return {
+                w: (c && c.clientWidth) || window.innerWidth,
+                h: (c && c.clientHeight) || Math.max(200, window.innerHeight - 64)
+            };
+        };
+        const { w, h } = dims();
+
+        // Show node count (deduped, matching what is actually drawn)
+        if (this.currentGraphData) {
+            const shown = this._filterGraphData(this.currentGraphData);
+            nodeCount.textContent = `${shown.nodes.length} nodes, ${shown.edges.length} edges`;
+            this.renderGraphVisualizationInContainer(container, this.currentGraphData, w, h, true);
+        }
+
+        // Resize the live 3D instance as fullscreen settles / the window resizes
+        this._fsResizeHandler = () => {
+            const d = dims();
+            const g = this.graph3d_fs;
+            if (g) { g.width(d.w); g.height(d.h); }
+            if (this.ringGraph_fs) {
+                this._resizeConcentricRingView(this.ringGraph_fs, d.w, d.h);
+            }
+        };
+        if (typeof ResizeObserver !== 'undefined') {
+            this._fsResizeObserver = new ResizeObserver(entries => {
+                const entry = entries[0];
+                if (!entry || !this.ringGraph_fs) return;
+                this._resizeConcentricRingView(
+                    this.ringGraph_fs,
+                    entry.contentRect.width,
+                    entry.contentRect.height
+                );
+            });
+            this._fsResizeObserver.observe(container);
+        }
+        this._fsChangeHandler = () => {
+            this._fsResizeHandler();
+            // User left OS fullscreen (Esc / gesture) -> close the overlay too
+            if (!document.fullscreenElement && this._graphFullscreenOpen) {
+                this.exitGraphFullscreen();
+            }
+        };
+        window.addEventListener('resize', this._fsResizeHandler);
+        document.addEventListener('fullscreenchange', this._fsChangeHandler);
+
+        // Escape key (for the non-OS-fullscreen fallback path)
         this.fullscreenEscapeHandler = (e) => {
             if (e.key === 'Escape') this.exitGraphFullscreen();
+            if (e.key === 'l') {
+                e.preventDefault();
+                this.toggleGraphLegend();
+            }
         };
         document.addEventListener('keydown', this.fullscreenEscapeHandler);
     }
@@ -6037,11 +7138,39 @@ class MemoryDashboard {
      * Exit fullscreen mode
      */
     exitGraphFullscreen() {
+        this._graphFullscreenOpen = false;
         const modal = document.getElementById('graphFullscreenModal');
         modal.style.display = 'none';
 
+        // Leave OS fullscreen if we're still in it
+        if (document.fullscreenElement) {
+            document.exitFullscreen().catch(() => {});
+        }
+
+        // Restore the memory-detail modal to its original parent
+        const memModal = document.getElementById('memoryModal');
+        if (memModal && this._memoryModalHome) {
+            this._memoryModalHome.appendChild(memModal);
+            this._memoryModalHome = null;
+        }
+
         // Clear container
+        this._disposeConcentricRingView(true);
         document.getElementById('graphFullscreenContainer').innerHTML = '';
+
+        // Remove resize / fullscreenchange handlers
+        if (this._fsResizeHandler) {
+            window.removeEventListener('resize', this._fsResizeHandler);
+            this._fsResizeHandler = null;
+        }
+        if (this._fsChangeHandler) {
+            document.removeEventListener('fullscreenchange', this._fsChangeHandler);
+            this._fsChangeHandler = null;
+        }
+        if (this._fsResizeObserver) {
+            this._fsResizeObserver.disconnect();
+            this._fsResizeObserver = null;
+        }
 
         // Remove escape listener
         if (this.fullscreenEscapeHandler) {
@@ -6054,6 +7183,9 @@ class MemoryDashboard {
             this.fullscreenSimulation.stop();
             this.fullscreenSimulation = null;
         }
+
+        // Tear down the fullscreen 3D instance, if any (Orrery-style PoC)
+        this._disposeGraph3D(true);
     }
 
     // ===== QUALITY ANALYTICS METHODS =====

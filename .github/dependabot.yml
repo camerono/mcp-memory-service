@@ -5,18 +5,44 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5
+    # setuptools is held below 82 on purpose: milvus-lite imports pkg_resources
+    # without declaring setuptools, and 82.0.0 removed that API. The bound and
+    # its full reasoning live in pyproject.toml (the "milvus" extra). Without
+    # this entry Dependabot re-proposes the bump every week and drags the whole
+    # group PR down with it -- closing such a PR does not suppress the version,
+    # because the group is built from a `*` pattern (GitHub PR #1065).
+    # Drop this together with the pyproject bound once milvus-lite declares
+    # setuptools itself.
+    ignore:
+      - dependency-name: "setuptools"
+        versions: [">=82"]
+      # The upper bound on mcp is load-bearing, not stale hygiene, and a group
+      # bump rewrites the constraint in pyproject.toml rather than respecting
+      # it. mcp 2.x drops `mcp.shared.session`, which breaks import of
+      # tests/unit/test_lm_studio_compat.py outright. Lift this entry only
+      # together with its pyproject bound.
+      - dependency-name: "mcp"
+        update-types: ["version-update:semver-major"]
+      # pymilvus is capped at the newest major the milvus-tests job gates
+      # (<4.0.0). Lift this entry only together with the pyproject bound and a
+      # gating CI leg for the new major (#1112).
+      - dependency-name: "pymilvus"
+        update-types: ["version-update:semver-major"]
     groups:
       uv:
         patterns:
           - "*"
-    ignore:
-      # transformers 5.x is a major bump — defer until stable release and
-      # sentence-transformers compatibility is verified
-      - dependency-name: "transformers"
-        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 3
+    # codeql-action's init and analyze steps must move in the same commit.
+    # Bumped separately, analyze aborts with "Loaded a configuration file for
+    # version 'X', but running version 'Y'" -- which is how #1080 and #1081
+    # deadlocked each other. Grouping them makes that impossible.
+    groups:
+      actions:
+        patterns:
+          - "*"

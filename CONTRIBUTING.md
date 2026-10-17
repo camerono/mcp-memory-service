@@ -4,6 +4,20 @@ Thank you for your interest in contributing to MCP Memory Service! 🎉
 
 This project provides semantic memory and persistent storage for AI assistants through the Model Context Protocol. We welcome contributions of all kinds - from bug fixes and features to documentation and testing.
 
+## Where development happens
+
+All development happens on **GitHub**: https://github.com/doobidoo/mcp-memory-service
+
+That is where issues, pull requests, CI, and releases live. Open your issue or PR there.
+
+From June to September 2026 the project was hosted on Codeberg. That repository at
+https://codeberg.org/doobidoo/mcp-memory-service stays readable so older links, issue
+numbers, and pull request references still resolve, but it is an archive: it receives
+no further pushes and runs no CI.
+
+Vulnerabilities are the one thing that does not belong in a public issue - see
+[Handling a security vulnerability](#handling-a-security-vulnerability).
+
 ## Table of Contents
 
 - [Code of Conduct](#code-of-conduct)
@@ -14,6 +28,8 @@ This project provides semantic memory and persistent storage for AI assistants t
 - [Testing Requirements](#testing-requirements)
 - [Documentation](#documentation)
 - [Submitting Changes](#submitting-changes)
+- [Security-Sensitive Changes](#security-sensitive-changes)
+- [Autonomous Agents & AI-Generated PRs](#autonomous-agents--ai-generated-prs)
 - [Reporting Issues](#reporting-issues)
 - [Community & Support](#community--support)
 - [Recognition](#recognition)
@@ -49,7 +65,7 @@ Fix bugs, implement features, or improve performance.
 Help make the project accessible to more users (future goal).
 
 ### 💬 Community Support
-Answer questions in Issues, Discussions, or help other users.
+Answer questions in Issues or help other users.
 
 ## Getting Started
 
@@ -85,12 +101,16 @@ Answer questions in Issues, Discussions, or help other users.
 
 5. **Run the service**:
    ```bash
-   uv run memory server
+   # HTTP server (background, dashboard + REST API, recommended)
+   memory launch
+
+   # OR MCP stdio server (for Claude Desktop integration)
+   memory server
    ```
 
-6. **Test with MCP Inspector** (optional):
+6. **Test with MCP Inspector** (optional, stdio child process):
    ```bash
-   npx @modelcontextprotocol/inspector uv run memory server
+   npx @modelcontextprotocol/inspector memory server
    ```
 
 ### Alternative: Docker Setup
@@ -102,6 +122,29 @@ docker-compose -f docker-compose.http.yml up -d  # For HTTP API mode
 ```
 
 ## Development Process
+
+### Before You Start: Claim the Issue
+
+Check for existing work before you write any code. It is your job to make sure you are
+not duplicating someone else's effort:
+
+- Search open **and** closed issues and PRs for the same problem. A fix may already be
+  in review, merged, or rejected with a reason.
+- If you want to work on an existing issue, leave a comment on it saying you are taking
+  it on, and wait for a maintainer to confirm before you start. Issues that already
+  have someone working on them, per a comment or an open PR, are taken.
+- If there is no issue yet for a non-trivial change, open one first so the approach
+  can be agreed before you invest time in it.
+- If you stop working on an issue you claimed, say so on the issue so someone else can
+  pick it up.
+
+A PR for an issue someone else has already claimed, or one that duplicates an open
+PR, will usually be closed.
+
+CI checks the claim. When a pull request closes an issue (`Fixes #N`) that its author
+neither commented on before opening the PR nor is assigned to, the `Claim Check`
+workflow labels it `unclaimed` and links back here. Comment on the issue; once a
+maintainer assigns you, the check runs again on its own and passes.
 
 ### 1. Create a Feature Branch
 
@@ -125,6 +168,28 @@ Use descriptive branch names:
 - Add/update tests as needed
 - Update documentation if applicable
 - Keep commits focused and atomic
+- Add a changelog fragment if you changed anything under `src/`
+
+#### Changelog fragments
+
+A change under `src/` needs a one-line entry in a file of its own:
+
+```
+changelog.d/<number>.<category>.md
+```
+
+`<number>` is your PR or issue number, `<category>` is `added`, `fixed`, `removed` or
+`internal` — pick the exact word from the list, common abbreviations such as `fix`
+or `feat` are rejected by CI. As a rule of thumb: bugs → `fixed`, new behaviour →
+`added`, deletions → `removed`, everything without user-visible effect (CI,
+tooling, docs, dependency bumps, performance/refactor) → `internal`. The file holds
+a single markdown list item describing the change — the symptom and what it does
+now, not the patch. `changelog.d/README.md` has the format and an example, and the
+`Changelog fragment for src/ changes` CI job checks it.
+
+It is a separate file per pull request on purpose: entries used to go straight into
+`CHANGELOG.md`, where every open branch edited the same lines and conflicted. Yours will
+never conflict with anyone else's. They are merged into `CHANGELOG.md` at release time.
 
 ### 3. Test Your Changes
 
@@ -228,32 +293,57 @@ except StorageError as e:
 
 ### Writing Tests
 
-- Place tests in `tests/` directory
-- Name test files with `test_` prefix
-- Use descriptive test names
-- Include both positive and negative test cases
-- Mock external dependencies
+- Place tests in `tests/` directory (it mirrors `src/`), name the file `test_*.py`
+- A change under `src/` comes with a test that is **red without the change**. CI
+  checks this (`tests-prove-fix` runs your added or changed tests against the base
+  branch's `src/` and fails if they pass there). Run both sides yourself and paste
+  them into the PR:
+  ```bash
+  git stash -- src/ && .venv/bin/pytest tests/<your file> -q; git stash pop   # must fail
+  .venv/bin/pytest tests/<your file> -q                                        # must pass
+  ```
+- Drive the real code path. Use the sqlite-vec storage through the `temp_db_path`
+  fixture, the real tool registry, the real handler. Mock only network and
+  external services (Cloudflare, Groq, Gemini). A mock of the function under test
+  proves nothing about it, and a mock that mirrors the bug is green on both sides.
+- Pure removals need no test; the check recognises a deletion-only diff.
+- Include both positive and negative cases, and the error path
 
-Example test:
+Example test, run against the real storage (the fixtures come from `tests/conftest.py`):
 ```python
 import pytest
-from mcp_memory_service.storage import SqliteVecStorage
+
+from mcp_memory_service.models.memory import Memory
+from mcp_memory_service.storage.sqlite_vec import SqliteVecMemoryStorage
+from mcp_memory_service.utils.hashing import generate_content_hash
+
 
 @pytest.mark.asyncio
-async def test_store_memory_success():
-    """Test successful memory storage."""
-    storage = SqliteVecStorage(":memory:")
-    result = await storage.store("test content", tags=["test"])
-    assert result is not None
-    assert "hash" in result
+async def test_store_then_retrieve(temp_db_path, unique_content):
+    storage = SqliteVecMemoryStorage(f"{temp_db_path}/test.db")
+    await storage.initialize()
+    try:
+        content = unique_content("memory about authentication")
+        memory = Memory(
+            content=content,
+            content_hash=generate_content_hash(content),
+            tags=["auth"],
+        )
+        success, message = await storage.store(memory)
+        assert success, message
+
+        results = await storage.retrieve("authentication", n_results=1)
+        assert results[0].memory.content == content
+    finally:
+        await storage.close()
 ```
 
 ### Test Coverage
 
-- Aim for >80% code coverage
-- Focus on critical paths and edge cases
+- Focus on the behavior the change adds or fixes, then its edge cases
 - Test error handling scenarios
-- Include integration tests where appropriate
+- `tests/integration` starts the HTTP app; `tests/consolidation` runs the
+  maintenance pipeline. Both run in CI, so a test there is not optional coverage
 
 ## Documentation
 
@@ -312,18 +402,96 @@ When adding features or making significant changes:
    ```
 
 3. **PR Checklist**:
-   - [ ] Tests pass locally
+   - [ ] Tests pass locally (`bash scripts/pr/pre_pr_check.sh`)
    - [ ] Code follows style guidelines
    - [ ] Documentation updated
-   - [ ] CHANGELOG.md updated
+   - [ ] Changelog fragment added under `changelog.d/` if `src/` changed
    - [ ] No sensitive data exposed
+   - [ ] I checked that no other open PR covers this change and, if there is a related issue, commented on it before starting (see [Before You Start](#before-you-start-claim-the-issue))
+   - [ ] All review threads (including Greptile's) are answered and resolved
+   - [ ] **If adding/modifying MCP tools**: tool is added to `valid_actions` in `server/handlers/graph.py` (if applicable) and write-scope enforcement is correct (see [Security-Sensitive Changes](#security-sensitive-changes))
+   - [ ] **I am a human contributor**, or I have disclosed that this PR was generated by an automated agent (see [Autonomous Agents & AI-Generated PRs](#autonomous-agents--ai-generated-prs))
 
 ### Review Process
 
 - PRs require at least one review
+- Every PR is reviewed automatically by [Greptile](https://www.greptile.com/). Its
+  findings arrive as inline review comments, not as a failing check, so a PR can
+  show green checks and still be blocked.
+- **All review threads must be resolved before a PR can be merged.** The branch
+  protection on `main` enforces this. For each thread, Greptile's or a maintainer's,
+  either push a fix or reply explaining why no change is needed, then resolve it.
+  Do not resolve a thread silently without a fix or a reply. Replies to false
+  positives also help Greptile learn the repository's conventions.
+- If you work with a coding agent, Greptile's
+  [greploop skill](https://github.com/greptileai/skills/blob/main/greploop/SKILL.md)
+  automates the review-fix-resolve cycle. Two deviations apply here: reply to every
+  thread before resolving it, false positives included (the skill resolves those
+  silently), and stop once all threads are resolved and the checks are green. A 5/5
+  confidence score is not required. Commits still follow the conventional format
+  above; do not stage with `git add -A`.
 - Address review feedback promptly
 - Keep discussions focused and constructive
 - Be patient - reviews may take a few days
+
+## Security-Sensitive Changes
+
+The following areas require extra care. PRs touching them receive additional scrutiny and may require a second maintainer review.
+
+### Protected paths
+
+| Path | Risk |
+|------|------|
+| `src/mcp_memory_service/web/api/mcp.py` | HTTP MCP transport, OAuth scope enforcement |
+| `src/mcp_memory_service/server_impl.py` | MCP tool registration, write-scope gate |
+| `src/mcp_memory_service/web/oauth/` | OAuth 2.1 implementation |
+| `src/mcp_memory_service/storage/` | Data integrity, production database |
+| `.github/workflows/` | CI/CD pipeline, supply-chain security |
+
+### Required for any PR that adds or modifies an MCP tool
+
+1. **Scope enforcement**: State explicitly whether the new tool is read-only or write. Read-only tools must set `readOnlyHint=True` in annotations. Write tools must be reachable only with a write-scoped token.
+2. **`valid_actions` registration**: If the tool is routed through `handle_memory_graph()`, it must be added to the `valid_actions` list at the top of that function — otherwise the new branches are dead code.
+3. **Security section in PR description**: Add a `## Security` section explaining (a) what data the tool reads/writes, (b) how scope is enforced, and (c) any edge cases (None inputs, malformed arguments, concurrent access).
+
+### Handling a security vulnerability
+
+Do **not** open a public issue. Report it through GitHub's private [Security Advisories](https://github.com/doobidoo/mcp-memory-service/security/advisories/new).
+
+Issues and pull requests are public from the moment you open them, which is fine for
+everything except an unfixed vulnerability. Security Advisories are the confidential
+channel for that: the report stays private until a fix ships, and you are credited in
+the advisory. See [SECURITY.md](SECURITY.md) for what to include.
+
+## Autonomous Agents & AI-Generated PRs
+
+We welcome contributions from AI coding assistants and autonomous agents. However, transparency is required.
+
+For the project's own position — authorship, copyright, and the safeguards every
+change passes before it reaches `main` — see [AUTHORSHIP.md](AUTHORSHIP.md).
+
+### Disclosure requirement
+
+If a PR was generated, drafted, or submitted by an automated agent (an AI system acting without direct human review of each change), the PR description **must** include:
+
+```
+## Agent Disclosure
+This PR was generated by [agent name/system]. The submitting account is operated by [human name / organization].
+Human review of this PR: [yes — describe what was reviewed / no — fully automated]
+```
+
+PRs that appear to be automated but carry no disclosure may be closed pending clarification.
+
+### Why this matters
+
+- Automated agents can miss context-specific security constraints (scope gates, invariants, production safeguards) that are not visible from the code alone.
+- Disclosure lets maintainers calibrate review depth accordingly.
+- It is not a barrier to contribution — filhocf's fully automated RFC #732 series is a model example of high-quality agent contributions. Disclosure + quality work = fast merge.
+
+### What happens without disclosure
+
+1. Maintainer asks for clarification in a comment.
+2. If no response within 7 days, PR is closed. Re-opening with disclosure is welcome.
 
 ## Reporting Issues
 
@@ -372,15 +540,15 @@ For feature requests, describe:
 ### Getting Help
 
 - **Documentation**: Check the [Wiki](https://github.com/doobidoo/mcp-memory-service/wiki) first
-- **Issues**: Search existing [issues](https://github.com/doobidoo/mcp-memory-service/issues) before creating new ones
-- **Discussions**: Use [GitHub Discussions](https://github.com/doobidoo/mcp-memory-service/discussions) for questions
+- **Issues**: Search existing [issues](https://github.com/doobidoo/mcp-memory-service/issues?q=is%3Aissue) before creating new ones
+- **Questions**: [Discussions](https://github.com/doobidoo/mcp-memory-service/discussions) for open-ended questions, [issues](https://github.com/doobidoo/mcp-memory-service/issues) for anything with a reproduction
 - **Response Time**: Maintainers typically respond within 2-3 days
 
 ### Communication Channels
 
-- **GitHub Issues**: Bug reports and feature requests
-- **GitHub Discussions**: General questions and community discussion
-- **Pull Requests**: Code contributions and reviews
+- **GitHub Issues**: Bug reports, feature requests, and general questions
+- **GitHub Pull Requests**: Code contributions and reviews
+- **GitHub Security Advisories**: Confidential vulnerability reports only
 
 ### For AI Agents
 
@@ -411,4 +579,4 @@ We value all contributions! Contributors are:
 
 Thank you for contributing to MCP Memory Service! Your efforts help make AI assistants more capable and useful for everyone. 🚀
 
-If you have questions not covered here, please open a [Discussion](https://github.com/doobidoo/mcp-memory-service/discussions) or check our [Wiki](https://github.com/doobidoo/mcp-memory-service/wiki).
+If you have questions not covered here, please open an [issue on GitHub](https://github.com/doobidoo/mcp-memory-service/issues) or check our [Wiki](https://github.com/doobidoo/mcp-memory-service/wiki).

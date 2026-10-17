@@ -1,0 +1,14 @@
+language: pt-BR
+version: 1
+
+negation_pairs:
+  - ['\bdesativad[oa]?\b', '\bativad[oa]?\b']
+  - ['\bremovid[oa]?\b', '\badicionad[oa]?\b']
+  - ['\bnunca\b', '\bsempre\b']
+  - ['\bparad[oa]?\b', '\brodando\b']
+  - ['\bfals[oa]\b', '\bverdadeir[oa]\b']
+  - ['\bobsolet[oa]\b', '\bativ[oa]\b']
+  - ['\bnão\b', null]
+
+version_patterns:
+  - '(\w[\w.-]*)\s+(?:versão\s+(?:é\s+)?|é\s+v?|=\s*v?)(\d+[\d.]+)'

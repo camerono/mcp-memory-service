@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>In-Browser Semantic Memory — sqlite-vec WASM + transformers.js</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background: #0d1117; color: #c9d1d9; max-width: 720px; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.15rem; color: #58a6ff; }
+  .tag { display: inline-block; font-size: .7rem; padding: .15rem .5rem; border: 1px solid #30363d; border-radius: 999px; margin-right: .4rem; color: #8b949e; }
+  #status { color: #d29922; margin: 1rem 0; }
+  #status.ready { color: #3fb950; }
+  input { width: 100%; box-sizing: border-box; background: #161b22; border: 1px solid #30363d; color: #c9d1d9; padding: .6rem .8rem; border-radius: 6px; font: inherit; margin: .3rem 0; }
+  button { background: #238636; color: #fff; border: 0; padding: .5rem 1rem; border-radius: 6px; font: inherit; cursor: pointer; margin: .3rem 0; }
+  button:disabled { opacity: .4; cursor: default; }
+  .result { border: 1px solid #30363d; border-radius: 6px; padding: .5rem .8rem; margin: .4rem 0; }
+  .result .score { color: #58a6ff; font-size: .8rem; }
+  #log { font-size: .75rem; color: #8b949e; white-space: pre-wrap; margin-top: 1.5rem; border-top: 1px solid #30363d; padding-top: .8rem; }
+</style>
+</head>
+<body>
+<h1>In-Browser Semantic Memory</h1>
+<div>
+  <span class="tag">sqlite-vec WASM</span>
+  <span class="tag">all-MiniLM-L6-v2 (q8 ONNX)</span>
+  <span class="tag">memories never leave the browser</span>
+</div>
+<div id="status">Loading model + sqlite-vec WASM…</div>
+
+<input id="memInput" placeholder="Type a memory and press Enter to store it" disabled>
+<input id="queryInput" placeholder="Semantic search query" disabled>
+<button id="searchBtn" disabled>Search</button>
+<div id="results"></div>
+<div id="log"></div>
+
+<script type="module">
+const log = (...a) => {
+  console.log(...a);
+  document.getElementById('log').textContent += a.join(' ') + '\n';
+};
+const status = (msg, ready) => {
+  const el = document.getElementById('status');
+  el.textContent = msg;
+  el.className = ready ? 'ready' : '';
+};
+
+try {
+  // ---- 1. Load transformers.js (self-hosted, no CDN) ----
+  const { env, pipeline } = await import('./node_modules/@huggingface/transformers/dist/transformers.min.js');
+  env.localModelPath = './models/';          // self-hosted model files
+  env.allowLocalModels = true;               // browser builds default this to false
+  env.allowRemoteModels = false;             // NOTHING loads from huggingface.co
+  env.backends.onnx.wasm.wasmPaths = new URL('./node_modules/onnxruntime-web/dist/', location.href).href; // self-hosted ort wasm (absolute URL required)
+
+  const t0 = performance.now();
+  const embedPipe = await pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2', { dtype: 'q8', device: 'wasm' });
+  log(`[embed] pipeline ready in ${(performance.now() - t0).toFixed(0)} ms`);
+
+  const embed = async (texts) =>
+    (await embedPipe(texts, { pooling: 'mean', normalize: true })).tolist();
+
+  // ---- 2. Load sqlite-vec WASM (official sqlite-vec-wasm-demo bundle) ----
+  const sqlite3InitModule = (await import('./node_modules/sqlite-vec-wasm-demo/sqlite3.mjs')).default;
+  // --- COMPAT SHIM for sqlite-vec-wasm-demo 0.1.9 in modern browsers ---
+  // The bundled sqlite3 WASM is an assertions build whose post-js runs after Emscripten
+  // runtime init, hitting (a) the Module.postRun abort trap and (b) abort-on-access traps
+  // for unexported heap views. Fix: (1) pre-seed postRun with an immediate-invoke push
+  // (internal Module === moduleArg in modern MODULARIZE builds), (2) capture wasm memory
+  // via the supported instantiateWasm hook and pre-seed lazy heap-view getters.
+  const cfg = {};
+  cfg.postRun = Object.assign([], { push(fn) { fn(cfg); } });
+  let mem;
+  cfg.instantiateWasm = (imports, cb) => {
+    WebAssembly.instantiateStreaming(
+      fetch('./node_modules/sqlite-vec-wasm-demo/sqlite3.wasm'), imports
+    ).then(({ instance, module }) => {
+      mem = instance.exports.memory || imports.env?.memory;
+      cb(instance, module);
+    });
+    return {};
+  };
+  const views = { HEAP8: Int8Array, HEAPU8: Uint8Array, HEAP16: Int16Array, HEAPU16: Uint16Array,
+    HEAP32: Int32Array, HEAPU32: Uint32Array, HEAPF32: Float32Array, HEAPF64: Float64Array,
+    HEAP64: BigInt64Array, HEAPU64: BigUint64Array };
+  for (const [name, T] of Object.entries(views))
+    Object.defineProperty(cfg, name, { configurable: true, get: () => new T(mem.buffer) });
+  // --- end shim ---
+  const sqlite3 = await sqlite3InitModule(cfg);
+  const db = new sqlite3.oo1.DB(':memory:');
+  log(`[sqlite] sqlite ${sqlite3.version.libVersion}, vec_version ${db.selectValue('select vec_version()')}`);
+  db.exec('create virtual table memories using vec0(embedding float[384], content text)');
+
+  let rowid = 0;
+  const store = async (content) => {
+    const [vec] = await embed([content]);
+    db.exec({
+      sql: 'insert into memories(rowid, embedding, content) values (?, ?, ?)',
+      bind: [++rowid, JSON.stringify(vec), content],
+    });
+  };
+
+  const search = async (query, k = 3) => {
+    const [qv] = await embed([query]);
+    return db.selectArrays(
+      'select content, distance from memories where embedding match ? order by distance limit ?',
+      [JSON.stringify(qv), k],
+    );
+  };
+
+  // ---- 3. Seed 3 hardcoded memories, run a search (self-test) ----
+  const seeds = [
+    'The database migration failed because of a missing WAL pragma',
+    'I love hiking in the Swiss Alps every summer',
+    'OAuth tokens must be rotated every 90 days per security policy',
+  ];
+  const t1 = performance.now();
+  for (const s of seeds) await store(s);
+  log(`[seed] stored ${seeds.length} memories in ${(performance.now() - t1).toFixed(0)} ms`);
+
+  const q = 'security credentials expiring';
+  const hits = await search(q);
+  log(`[search] "${q}"`);
+  hits.forEach(([c, d]) => log(`  dist=${d.toFixed(4)}  ${c}`));
+  const pass = hits[0][0].includes('OAuth');
+  log(pass ? 'SELFTEST-PASS' : 'SELFTEST-FAIL');
+
+  // ---- 4. Wire UI ----
+  const render = (rows) => {
+    document.getElementById('results').innerHTML = rows.map(([c, d]) =>
+      `<div class="result"><div class="score">distance ${d.toFixed(4)}</div>${c.replace(/</g, '&lt;')}</div>`).join('');
+  };
+  render(hits);
+  const memInput = document.getElementById('memInput');
+  const queryInput = document.getElementById('queryInput');
+  const searchBtn = document.getElementById('searchBtn');
+  memInput.disabled = queryInput.disabled = searchBtn.disabled = false;
+  memInput.addEventListener('keydown', async (e) => {
+    if (e.key === 'Enter' && memInput.value.trim()) {
+      await store(memInput.value.trim());
+      status(`${rowid} memories stored — all local`, true);
+      memInput.value = '';
+    }
+  });
+  const doSearch = async () => { if (queryInput.value.trim()) render(await search(queryInput.value.trim())); };
+  searchBtn.addEventListener('click', doSearch);
+  queryInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') doSearch(); });
+  status(`Ready — ${rowid} memories stored, nothing left this browser`, true);
+} catch (err) {
+  status('Error: ' + err.message);
+  log('FATAL', err.stack || err.message);
+}
+</script>
+</body>
+</html>

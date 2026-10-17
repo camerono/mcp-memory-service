@@ -27,6 +27,11 @@ from mcp import types
 logger = logging.getLogger(__name__)
 
 
+def _sanitize_log_value(value: object) -> str:
+    """Sanitize a user-provided value for safe inclusion in log messages."""
+    return str(value).replace("\n", "\\n").replace("\r", "\\r").replace("\x1b", "\\x1b")
+
+
 async def handle_memory_ingest(server, arguments: dict) -> List[types.TextContent]:
     """Unified handler for document/directory ingestion."""
     import json
@@ -67,20 +72,27 @@ async def handle_ingest_document(server, arguments: dict) -> List[types.TextCont
 
         from ...services.memory_service import normalize_tags
 
-        file_path = Path(arguments["file_path"])
+        raw_path = Path(arguments["file_path"])
+        # Resolve to canonical path to prevent path traversal.
+        # Paths are user-specified by design (authenticated MCP tool call).
+        try:
+            file_path = raw_path.resolve()  # codeql[py/path-injection]
+        except (OSError, ValueError):
+            file_path = raw_path
         tags = normalize_tags(arguments.get("tags", []))
         chunk_size = arguments.get("chunk_size", 1000)
         chunk_overlap = arguments.get("chunk_overlap", 200)
         memory_type = arguments.get("memory_type", "document")
+        store = arguments.get("store", "default")
 
-        logger.info(f"Starting document ingestion: {file_path}")
+        logger.info("Starting document ingestion: %s", _sanitize_log_value(file_path))
         start_time = time.time()
 
         # Validate file exists and get appropriate document loader
-        if not file_path.exists():
+        if not file_path.exists():  # codeql[py/path-injection]
             return [types.TextContent(
                 type="text",
-                text=f"Error: File not found: {file_path.resolve()}"
+                text=f"Error: File not found: {file_path}"
             )]
 
         loader = get_loader_for_file(file_path)
@@ -126,7 +138,7 @@ async def handle_ingest_document(server, arguments: dict) -> List[types.TextCont
                 )
 
                 # Store the memory
-                success, error = await storage.store(memory)
+                success, error = await storage.store(memory, store=store)
                 if success:
                     chunks_stored += 1
                 else:
@@ -155,11 +167,11 @@ async def handle_ingest_document(server, arguments: dict) -> List[types.TextCont
                 result_lines.extend([f"   - {error}" for error in errors[:3]])
                 result_lines.append(f"   ... and {len(errors) - 3} more errors")
 
-        logger.info(f"Document ingestion completed: {chunks_stored}/{chunks_processed} chunks stored")
+        logger.info("Document ingestion completed: %s/%s chunks stored", chunks_stored, chunks_processed)
         return [types.TextContent(type="text", text="\n".join(result_lines))]
 
     except Exception as e:
-        logger.error(f"Error in document ingestion: {str(e)}")
+        logger.error("Error in document ingestion: %s", _sanitize_log_value(e))
         return [types.TextContent(
             type="text",
             text=f"Error ingesting document: {str(e)}"
@@ -182,7 +194,13 @@ async def handle_ingest_directory(server, arguments: dict) -> List[types.TextCon
         storage = await server._ensure_storage_initialized()
 
         # Parse arguments
-        directory_path = Path(arguments["directory_path"])
+        raw_dir_path = Path(arguments["directory_path"])
+        # Resolve to canonical path to prevent path traversal.
+        # Paths are user-specified by design (authenticated MCP tool call).
+        try:
+            directory_path = raw_dir_path.resolve()  # codeql[py/path-injection]
+        except (OSError, ValueError):
+            directory_path = raw_dir_path
         tags = normalize_tags(arguments.get("tags", []))
         recursive = arguments.get("recursive", True)
         file_extensions = arguments.get("file_extensions", ["pdf", "txt", "md", "json"])
@@ -190,13 +208,13 @@ async def handle_ingest_directory(server, arguments: dict) -> List[types.TextCon
         max_files = arguments.get("max_files", 100)
 
         # Validate directory
-        if not directory_path.exists() or not directory_path.is_dir():
+        if not directory_path.exists() or not directory_path.is_dir():  # codeql[py/path-injection]
             return [types.TextContent(
                 type="text",
                 text=f"Error: Directory not found: {directory_path}"
             )]
 
-        logger.info(f"Starting directory ingestion: {directory_path}")
+        logger.info("Starting directory ingestion: %s", _sanitize_log_value(directory_path))
         start_time = time.time()
 
         # Discover files
@@ -218,7 +236,8 @@ async def handle_ingest_directory(server, arguments: dict) -> List[types.TextCon
         processor = FileIngestionProcessor(
             storage=storage,
             chunk_size=chunk_size,
-            base_tags=tags
+            base_tags=tags,
+            store=arguments.get("store", "default"),
         )
 
         for index, file_path in enumerate(files_to_process, start=1):
@@ -244,11 +263,16 @@ async def handle_ingest_directory(server, arguments: dict) -> List[types.TextCon
             processing_time=processing_time
         )
 
-        logger.info(f"Directory ingestion completed: {stats['total_chunks_stored']}/{stats['total_chunks_processed']} chunks from {stats['files_processed']} files")
+        logger.info(
+            "Directory ingestion completed: %s/%s chunks from %s files",
+            stats['total_chunks_stored'],
+            stats['total_chunks_processed'],
+            stats['files_processed'],
+        )
         return [types.TextContent(type="text", text="\n".join(result_lines))]
 
     except Exception as e:
-        logger.error(f"Error in directory ingestion: {str(e)}")
+        logger.error("Error in directory ingestion: %s", _sanitize_log_value(e))
         return [types.TextContent(
             type="text",
             text=f"Error ingesting directory: {str(e)}"

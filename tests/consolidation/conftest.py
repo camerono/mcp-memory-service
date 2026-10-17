@@ -44,7 +44,7 @@ def consolidation_config(temp_archive_path):
         
         # Association settings
         associations_enabled=True,
-        min_similarity=0.3,
+        min_similarity=0.45,
         max_similarity=0.7,
         max_pairs_per_run=50,  # Smaller for tests
         
@@ -55,7 +55,7 @@ def consolidation_config(temp_archive_path):
         
         # Compression settings
         compression_enabled=True,
-        max_summary_length=200,  # Shorter for tests
+        max_summary_length=500,  # Production default; 200 left no room for a source sentence
         preserve_originals=True,
         
         # Forgetting settings

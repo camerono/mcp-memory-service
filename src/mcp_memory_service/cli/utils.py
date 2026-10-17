@@ -16,18 +16,25 @@
 CLI utilities for MCP Memory Service.
 """
 
+import logging
 import os
 from typing import Optional
 
 from ..storage.base import MemoryStorage
 
+logger = logging.getLogger(__name__)
 
-async def get_storage(backend: Optional[str] = None) -> MemoryStorage:
+
+async def get_storage(backend: Optional[str] = None, strict_dimension_check: bool = True) -> MemoryStorage:
     """
     Get storage backend for CLI operations.
 
     Args:
         backend: Storage backend name ('sqlite_vec', 'cloudflare', 'hybrid', or 'milvus')
+        strict_dimension_check: Passed to the sqlite_vec backend's initialize().
+            When False, an existing-database embedding-dimension mismatch is logged
+            as a warning instead of raising, so read-only diagnostics (`memory status`)
+            can open and report on a mismatched database (#143).
 
     Returns:
         Initialized storage backend
@@ -40,9 +47,12 @@ async def get_storage(backend: Optional[str] = None) -> MemoryStorage:
 
     if backend in ('sqlite_vec', 'sqlite-vec'):
         from ..storage.sqlite_vec import SqliteVecMemoryStorage
-        from ..config import SQLITE_VEC_PATH
-        storage = SqliteVecMemoryStorage(SQLITE_VEC_PATH)
-        await storage.initialize()
+        from ..config import EMBEDDING_MODEL_NAME, SQLITE_VEC_PATH
+        storage = SqliteVecMemoryStorage(
+            SQLITE_VEC_PATH,
+            embedding_model=EMBEDDING_MODEL_NAME,
+        )
+        await storage.initialize(strict_dimension_check=strict_dimension_check)
         return storage
     elif backend == 'cloudflare':
         from ..storage.cloudflare import CloudflareStorage
@@ -66,6 +76,8 @@ async def get_storage(backend: Optional[str] = None) -> MemoryStorage:
         )
         await storage.initialize()
         return storage
+    elif backend == 'hybrid':
+        return await _build_hybrid_storage()
     elif backend == 'milvus':
         from ..storage.milvus import MilvusMemoryStorage
         from ..config import (
@@ -81,3 +93,74 @@ async def get_storage(backend: Optional[str] = None) -> MemoryStorage:
         return storage
     else:
         raise ValueError(f"Unsupported storage backend: {backend}")
+
+
+def _hybrid_cloudflare_config() -> Optional[dict]:
+    """Assemble the Cloudflare half of the hybrid config, or None.
+
+    None means SQLite-only mode, and that is a supported outcome rather than a
+    failure: CLAUDE.md tells hybrid deployments to set
+    MCP_HYBRID_SYNC_OWNER=http, so the CLI side deliberately has no Cloudflare
+    credentials. Demanding them would leave the command broken for exactly the
+    setup being recommended.
+    """
+    from ..config import (
+        CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID,
+        CLOUDFLARE_VECTORIZE_INDEX, CLOUDFLARE_D1_DATABASE_ID,
+        CLOUDFLARE_R2_BUCKET, CLOUDFLARE_EMBEDDING_MODEL,
+        CLOUDFLARE_LARGE_CONTENT_THRESHOLD, CLOUDFLARE_MAX_RETRIES,
+        CLOUDFLARE_BASE_DELAY
+    )
+
+    if not all([CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID,
+                CLOUDFLARE_VECTORIZE_INDEX, CLOUDFLARE_D1_DATABASE_ID]):
+        logger.warning(
+            "Incomplete Cloudflare configuration; hybrid storage will run "
+            "in SQLite-only mode."
+        )
+        return None
+
+    return {
+        'api_token': CLOUDFLARE_API_TOKEN,
+        'account_id': CLOUDFLARE_ACCOUNT_ID,
+        'vectorize_index': CLOUDFLARE_VECTORIZE_INDEX,
+        'd1_database_id': CLOUDFLARE_D1_DATABASE_ID,
+        'r2_bucket': CLOUDFLARE_R2_BUCKET,
+        'embedding_model': CLOUDFLARE_EMBEDDING_MODEL,
+        'large_content_threshold': CLOUDFLARE_LARGE_CONTENT_THRESHOLD,
+        'max_retries': CLOUDFLARE_MAX_RETRIES,
+        'base_delay': CLOUDFLARE_BASE_DELAY
+    }
+
+
+async def _build_hybrid_storage() -> MemoryStorage:
+    """Build the hybrid backend the way server_impl.py's eager-init path does.
+
+    Kept identical to that path on purpose: a CLI that assembled hybrid
+    differently would report on a different store than the one running. This is
+    now the third copy of this construction (server_impl twice, here once); a
+    shared factory belongs with the launcher consolidation in #281.
+
+    HybridMemoryStorage.initialize() takes no arguments, so
+    get_storage()'s strict_dimension_check does not reach the wrapped
+    SQLite-vec store on this path.
+    """
+    from ..storage.hybrid import HybridMemoryStorage
+    from ..config import (
+        SQLITE_VEC_PATH, EMBEDDING_MODEL_NAME,
+        HYBRID_SYNC_INTERVAL, HYBRID_BATCH_SIZE
+    )
+
+    # HYBRID_SYNC_INTERVAL and HYBRID_BATCH_SIZE are only populated when hybrid
+    # is the *configured* backend, so they are None whenever it is named on the
+    # command line against a different environment. Same fallbacks as
+    # server_impl.py uses for that case.
+    storage = HybridMemoryStorage(
+        sqlite_db_path=SQLITE_VEC_PATH,
+        embedding_model=EMBEDDING_MODEL_NAME,
+        cloudflare_config=_hybrid_cloudflare_config(),
+        sync_interval=HYBRID_SYNC_INTERVAL or 300,
+        batch_size=HYBRID_BATCH_SIZE or 50
+    )
+    await storage.initialize()
+    return storage

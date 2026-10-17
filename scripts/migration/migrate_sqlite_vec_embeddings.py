@@ -8,6 +8,7 @@ This script:
 3. Creates a new database with proper schema
 4. Re-generates embeddings for all memories
 5. Restores all memories with correct embeddings
+6. Carries over the tables the rebuild cannot regenerate (graph edges, beliefs)
 """
 
 import asyncio
@@ -20,12 +21,18 @@ import logging
 from datetime import datetime
 from typing import List, Dict, Any, Tuple
 
-# Add parent directory to path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Run from a source checkout as well as from an installed package (the Docker
+# image ships the scripts alongside an installed mcp_memory_service).
+_SRC_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "src"
+)
+if os.path.isdir(_SRC_DIR):
+    sys.path.insert(0, _SRC_DIR)
 
-from src.mcp_memory_service.storage.sqlite_vec import SqliteVecMemoryStorage
-from src.mcp_memory_service.models.memory import Memory
-from src.mcp_memory_service.utils.hashing import generate_content_hash
+from mcp_memory_service.compat import _sanitize_log_value
+from mcp_memory_service.storage.sqlite_vec import SqliteVecMemoryStorage
+from mcp_memory_service.models.memory import Memory
+from mcp_memory_service.utils.hashing import generate_content_hash
 
 # Configure logging
 logging.basicConfig(
@@ -33,6 +40,99 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Tables holding data the rebuild cannot regenerate from the memories table.
+# Both key on content hashes, and a content hash does not change when a memory
+# is re-embedded, so the rows carry over verbatim (#189).
+#
+# Deliberately not copied:
+# - metadata, migration_registry: they describe the schema of the database they
+#   live in, and the new database wrote its own during initialize()
+# - memories, memory_tags, tags, memory_content_fts, memory_embeddings: rebuilt
+#   by store() while the memories are restored
+PRESERVED_TABLES = ("memory_graph", "beliefs")
+
+# Columns whose value must still name a live memory for the row to mean
+# anything. An edge to a memory that failed to restore is dangling.
+_MEMORY_HASH_COLUMNS = {"memory_graph": ("source_hash", "target_hash")}
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
+    ).fetchone()
+    return row is not None
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> List[str]:
+    return [row[1] for row in conn.execute(f"PRAGMA table_info({table})")]
+
+
+def _shared_columns(source: sqlite3.Connection, target: sqlite3.Connection, table: str) -> List[str]:
+    """Columns present in both schemas, so a schema-version gap still migrates."""
+    target_columns = set(_table_columns(target, table))
+    return [column for column in _table_columns(source, table) if column in target_columns]
+
+
+def _live_rows(
+    rows: List[Tuple], columns: List[str], hash_columns: Tuple[str, ...], surviving: set
+) -> Tuple[List[Tuple], int]:
+    """Split rows into those whose referenced memories survived, and a count of the rest."""
+    if not hash_columns:
+        return rows, 0
+
+    indexes = [columns.index(column) for column in hash_columns]
+    kept = [row for row in rows if all(row[i] in surviving for i in indexes)]
+    return kept, len(rows) - len(kept)
+
+
+def _copy_table(
+    source: sqlite3.Connection, target: sqlite3.Connection, table: str, surviving: set
+) -> Dict[str, int]:
+    columns = _shared_columns(source, target, table)
+    if not columns:
+        logger.warning("Skipping %s: old and new schema share no columns", table)
+        return {"copied": 0, "skipped": 0}
+
+    column_list = ", ".join(columns)
+    rows = source.execute(f"SELECT {column_list} FROM {table}").fetchall()
+    hash_columns = tuple(c for c in _MEMORY_HASH_COLUMNS.get(table, ()) if c in columns)
+    kept, skipped = _live_rows(rows, columns, hash_columns, surviving)
+
+    before = target.total_changes
+    target.executemany(
+        f"INSERT OR IGNORE INTO {table} ({column_list}) VALUES ({', '.join('?' * len(columns))})",
+        kept,
+    )
+    target.commit()
+    return {"copied": target.total_changes - before, "skipped": skipped}
+
+
+def copy_auxiliary_tables(source_path: str, target_path: str) -> Dict[str, Dict[str, int]]:
+    """Copy PRESERVED_TABLES from the old database into the rebuilt one.
+
+    Returns per-table counts of copied and skipped rows. Tables missing on
+    either side are omitted from the result rather than treated as an error: an
+    older database may predate the table, and a newer one may have dropped it.
+    """
+    results: Dict[str, Dict[str, int]] = {}
+    source = sqlite3.connect(source_path)
+    target = sqlite3.connect(target_path)
+
+    try:
+        surviving = {row[0] for row in target.execute("SELECT content_hash FROM memories")}
+        for table in PRESERVED_TABLES:
+            if not _table_exists(source, table):
+                continue
+            if not _table_exists(target, table):
+                logger.warning("Skipping %s: not present in the new schema", table)
+                continue
+            results[table] = _copy_table(source, target, table, surviving)
+    finally:
+        source.close()
+        target.close()
+
+    return results
 
 
 class SqliteVecMigration:
@@ -62,8 +162,11 @@ class SqliteVecMigration:
             
             # Step 4: Restore memories with regenerated embeddings
             await self.restore_memories()
-            
-            # Step 5: Replace old database with new one
+
+            # Step 5: Carry over what the rebuild cannot regenerate
+            self.preserve_auxiliary_tables()
+
+            # Step 6: Replace old database with new one
             self.finalize_migration()
             
             print("\n✅ Migration completed successfully!")
@@ -143,7 +246,7 @@ class SqliteVecMigration:
                     self.memories_recovered.append(memory)
                     
                 except Exception as e:
-                    logger.warning(f"Failed to parse memory: {e}")
+                    logger.warning("Failed to parse memory: %s", e)
                     # Try to at least save the content
                     if row[1]:  # content
                         try:
@@ -155,7 +258,7 @@ class SqliteVecMigration:
                             )
                             self.memories_recovered.append(memory)
                         except:
-                            logger.error(f"Could not recover memory with content: {row[1][:50]}...")
+                            logger.error("Could not recover memory with content: %s...", _sanitize_log_value(row[1][:50]))
                             
         finally:
             conn.close()
@@ -208,7 +311,7 @@ class SqliteVecMigration:
                         successful += 1
                     else:
                         failed += 1
-                        logger.warning(f"Failed to store memory: {message}")
+                        logger.warning("Failed to store memory: %s", _sanitize_log_value(message))
                         
                 # Show progress every 10%
                 if (i + 1) % max(1, total // 10) == 0:
@@ -216,20 +319,46 @@ class SqliteVecMigration:
                     
             except Exception as e:
                 failed += 1
-                logger.error(f"Error storing memory {memory.content_hash}: {e}")
+                logger.error("Error storing memory %s: %s", memory.content_hash, e)
                 
         print(f"   ✓ Restored {successful} memories successfully")
         if failed > 0:
             print(f"   ⚠ Failed to restore {failed} memories")
             
+    def preserve_auxiliary_tables(self):
+        """Carry graph edges and beliefs over into the rebuilt database."""
+        print("\nStep 5: Preserving graph edges and beliefs...")
+
+        # The copy uses its own connections, so release the storage handle on
+        # the new database first.
+        self.close_new_storage()
+
+        results = copy_auxiliary_tables(self.original_db_path, self.temp_db_path)
+
+        if not results:
+            print("   - Nothing to preserve (no graph or belief tables in the old database)")
+            return
+
+        for table, counts in results.items():
+            print(f"   ✓ {table}: {counts['copied']} rows preserved")
+            if counts["skipped"]:
+                print(
+                    f"   ⚠ {table}: {counts['skipped']} rows dropped, "
+                    "they referenced a memory that did not survive the migration"
+                )
+
+    def close_new_storage(self):
+        """Close the connection to the rebuilt database, if it is still open."""
+        if getattr(self, 'new_storage', None) and self.new_storage.conn:
+            self.new_storage.conn.close()
+
     def finalize_migration(self):
         """Replace old database with new one."""
-        print("\nStep 5: Finalizing migration...")
-        
-        # Close connections
-        if hasattr(self, 'new_storage') and self.new_storage.conn:
-            self.new_storage.conn.close()
-            
+        print("\nStep 6: Finalizing migration...")
+
+        self.close_new_storage()
+
+
         # Move original to .old (just in case)
         old_path = f"{self.original_db_path}.old"
         if os.path.exists(old_path):

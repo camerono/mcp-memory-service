@@ -1,8 +1,8 @@
 # Version Management - Release Workflow
 
-## ⚠️ CRITICAL: Always Use github-release-manager Agent
+## Always use the documented release workflow
 
-**NEVER do manual releases** (major, minor, patch, or hotfixes). Manual workflows miss steps and are error-prone.
+**Never do manual releases** (major, minor, patch, or hotfixes). Manual workflows miss steps and are error-prone.
 
 ## Release Branch Workflow (Adopted 2026-01-27)
 
@@ -21,10 +21,86 @@ feature-branches → main (development)
 1. **Development**: All feature/fix branches merge to `main`
 2. **Release Preparation**: Create `release/vX.Y.Z` branch from `main`
 3. **Version Bump**: Update version files on release branch
-4. **PR & Merge**: Create PR, merge with `--admin --squash`
-5. **Tag**: Create annotated tag `vX.Y.Z`
-6. **GitHub Release**: Create release from tag
-7. **Sync**: Release branch auto-deleted, main stays current
+4. **PR & Merge**: Create PR, wait for CI, merge it
+5. **Tag**: Create the annotated tag locally and push it **with git**:
+   ```bash
+   git tag -a vX.Y.Z -m "<summary>" <merge-sha>
+   git push origin refs/tags/vX.Y.Z     # explicit refspec, never --tags
+   ```
+   The **push** is what triggers `.github/workflows/release.yml` (PyPI main + lite,
+   Docker Hub). Never create the tag through the forge API or the web UI — see the
+   rule below.
+6. **Verify the artifacts**, not just the run (see below)
+7. **Release notes**: Publish a release object from the tag
+8. **Sync**: Release branch deleted, main stays current
+
+### The tag must be pushed with git
+
+`release.yml` triggers on `push: tags: 'v*.*.*'`. A tag created inside the forge — via
+the release API, or by filling in the tag field on the release form — is **not a push
+event**, so nothing fires and the release publishes nothing at all.
+
+This is not hypothetical. **v11.8.1 was tagged that way on 2026-08-22 and never
+published.** Paging back through the workflow run history shows the full
+Test → PyPI → Docker chain for v11.8.0 and v11.7.0 and no run whatsoever for v11.8.1.
+PyPI stayed on 11.8.0 and `docker 11.8.1` returned 404 for a full day, with eight
+fixes in it. It hid because a release object with notes looks exactly like a finished
+release, and nothing anywhere says "no artifacts were built" — the green CI you
+remember is the release PR's `ci.yml`, not `release.yml`.
+
+### Verify the artifact, not the run
+
+A release is done when it is installable, not when the tag exists. After the tag push,
+check the publish endpoints directly:
+
+```bash
+bash scripts/release/verify_artifacts.sh X.Y.Z
+```
+
+It verifies both PyPI distributions by `.info.version`, all four image tags
+(`X.Y.Z`, `X.Y.Z-slim`, `X.Y`, `X.Y-slim`) by tag name, and that `X.Y`, `X.Y-slim` and
+`latest` resolve to the same **digests** as the exact version tags. Nothing in it treats
+an HTTP status code as evidence. It is read-only, so re-running it is free and is the
+intended way to confirm a `gh run rerun --failed` actually recovered the release.
+
+Pending checks are polled until a deadline (`--timeout`, default 600s) because PyPI's
+JSON endpoint lags the upload by a minute or two — a stale version there right after a
+green publish job is cache, not failure. Docker Hub also rate-limits anonymous callers,
+and a throttled response looks exactly like a missing tag, which is the other reason the
+checks retry instead of concluding on a single probe.
+
+Exit 0 means every artifact is present and consistent. Exit 1 prints each unmet check
+with what was actually observed — do not create the release object until it is 0.
+
+### A release can publish half of itself
+
+v11.11.0 on 2026-09-05: `Test` and `Publish to PyPI (main + lite)` green, `Publish
+Docker images` red at `docker login` with `unauthorized: incorrect username or
+password`. Both secrets were set (masked as `***` in the log, so neither was empty);
+the values were wrong. `DOCKER_PASSWORD` has to be a Docker Hub **access token**, not
+the account password.
+
+This looks nothing like the v11.8.1 failure above — there is a run, and two of three
+jobs are green — but for Docker users the effect is the same, and worse in one respect:
+`latest` kept pointing at the previous build, so the most-used tag served a version with
+three open critical advisories and nothing about the tag said so.
+
+Recover with a job re-run, never a dispatch:
+
+```bash
+gh run rerun <run-id> --failed
+```
+
+That repeats only the failed job and keeps `github.ref_name` at the tag, so the image
+tags still derive correctly. A `workflow_dispatch` from `main` would push junk `main`
+tags and clobber `latest`.
+
+**Create the release object last**, after the artifacts are verified. A release with
+notes looks finished, which is exactly what hid v11.8.1 for a day.
+
+`release.yml` has a `workflow_dispatch` fallback, but it is **PyPI catch-up only**: the
+Docker job derives its image tags from `github.ref_name`, so a manual dispatch from
+`main` pushes junk `main` tags and clobbers `latest`.
 
 ### Benefits:
 - `main` = active development (current work)
@@ -32,57 +108,159 @@ feature-branches → main (development)
 - No permanent `develop` branch to maintain
 - Clear separation of release preparation
 
-## Five-File Version Bump Procedure
+## Version Bump Procedure
 
-1. Update `src/mcp_memory_service/_version.py` (`__version__ = "X.Y.Z"`)
-2. Update `pyproject.toml` (line ~7: `version = "X.Y.Z"`)
-3. Update `README.md` (Latest Release section)
-4. Update `CHANGELOG.md` (convert [Unreleased] to [X.Y.Z] with date)
-5. Run `uv lock` to update dependency lock file
-6. Commit all files together
+First, collect the changelog fragments:
+
+```bash
+python3 scripts/release/collect_changelog.py    # --dry-run to preview
+```
+
+Every PR that touched `src/` left one in `changelog.d/` (enforced by the
+`changelog-entry` CI job, #1273). The script merges them into `[Unreleased]` under the
+right section and deletes them. Skipping it means shipping a release whose changelog is
+missing everything since the last one — the state that made v11.13.0's changelog a
+reconstruction job.
+
+Then the version files, always bumped together, in one commit:
+
+1. `src/mcp_memory_service/_version.py` (`__version__ = "X.Y.Z"`) — this is the canonical source
+2. `pyproject.toml` (line ~7: `version = "X.Y.Z"`)
+3. `CHANGELOG.md` — retitle `[Unreleased]` to `[X.Y.Z]` with the date, and leave a new
+   empty `## [Unreleased]` heading above it. The entries move under the version; the
+   heading stays, because the next PR adds its entry there.
+4. `uv lock` to update the dependency lock file
+
+`README.md` is no longer on this list. It carried a "Latest Release" section and an
+inline v11 changelog that had to be hand-edited on every release; both were removed when
+the README was cut down, and it now links CHANGELOG.md instead. Do not reintroduce a
+version string there.
+
+Of those four, **only `_version.py` and `pyproject.toml` are covered by a CI gate.**
+
+`CLAUDE.md` used to carry a "Current Version" line and was the one that actually got
+forgotten: v11.8.2 shipped without it, nothing failed, and main announced the previous
+version until someone noticed by eye. That line was removed on 2026-09-05 in favour of a
+pointer to CHANGELOG.md, which is the real fix. Do not reintroduce it.
+
+Conditional, and each one is enforced by a CI gate:
+
+- `site/index.html` version strings — required whenever MAJOR.MINOR changes, exempt for
+  PATCH (`version-drift-check`, `scripts/ci/check_versions.sh`)
+- `claude-hooks/.claude-plugin/plugin.json` — required when anything under
+  `claude-hooks/` changed since the last commit that moved the manifest version
+  (`plugin-version-check`, `scripts/ci/check_plugin_version.sh`)
+
+Do **not** hand-bump `pyproject-lite.toml`: the publish workflow force-syncs it from
+`_version.py`, and a manual value there is what left the lite distribution stuck on an
+old version once.
 
 ## Release Commands
 
 ```bash
-# Check release status
-gh release list --limit 5
+# Last release, and what has accumulated since
+git tag --list 'v*' --sort=-version:refname | head -1
 git log <last-tag>..HEAD --oneline
-
-# Use the agent for releases
-# The agent handles: version bump, CHANGELOG, PR, merge, tag, release
-
-# Admin merge (branch protection bypass)
-gh pr merge <PR-NUMBER> --admin --squash --delete-branch
 ```
 
-## Branch Protection Setup
+`git describe --tags --abbrev=0` is the wrong tool here — it picks up the non-version
+tag `archive/github-workflows-pre-codeberg`.
 
-Branch protection configured to allow admin bypass:
-- `enforce_admins: false` - Admin can use `--admin` flag
-- Required reviews: 1 (for non-admins)
-- CodeQL scanning enabled
+PR creation, review-comment retrieval, squash-merge, and the release object all run
+against the GitHub REST API via `gh`.
+
+## Merge Discipline
+
+`main` carries a ruleset named `ProtectMain` (id 5097493) that requires changes to arrive
+through a pull request. Read its live state rather than trusting this paragraph:
+
+```bash
+gh api repos/doobidoo/mcp-memory-service/rulesets/5097493 --jq '.rules[]|"\(.type): \(.parameters|tostring)"'
+```
+
+As of 2026-09-15 it carries two rules:
+
+- `pull_request` with `required_approving_review_count: 1`. This paragraph previously
+  said the count had been dropped to zero on 2026-09-05; it never was. The author
+  cannot approve their own pull request. Greptile sometimes supplies the approval:
+  #1249 (maintainer, no findings) was approved by the bot and went to `CLEAN`,
+  mergeable without `--admin`; #1246 and #1248 (maintainer, findings) got inline
+  comments and no approval; #1243 (contributor, no findings) got no review object at
+  all and stayed `BLOCKED` until it was approved by hand. Three observations, not a
+  rule — do not infer from `BLOCKED` what the reviewer did or did not say. Open the
+  comments and look:
+
+  ```bash
+  gh api repos/doobidoo/mcp-memory-service/pulls/<N>/comments
+  ```
+
+  `--admin` merges past whatever is there unread. That is how five valid findings
+  went in on the v11.12.0 PRs.
+- `required_status_checks` with `strict_required_status_checks_policy: true` and one
+  required context, `Analyze Python Code`. Strict means a branch has to be up to date
+  with `main` before it can merge. Added on 2026-09-15 after three regressions in one
+  week reached `main` through merges whose result CI had never run on: #1184 reverted
+  the ownership guard from #1224 while refactoring on an older base, #1224's own
+  commits were cherry-picked onto `main` carrying two already-red tests because
+  `_run_background()` never passed the port to `_write_pid()`, and #1232 restored the
+  `src.` imports #1238 had just removed. Until then the ruleset required no status
+  check at all.
+
+`Analyze Python Code` (`codeql.yml`) was for a long time the only required context,
+because it was the only job that ran on every pull request. `ci.yml` sat behind
+`paths-ignore`, so on a documentation-only PR it never started, and a required check
+that never reports blocks the PR permanently. Auto-merge consequently waited for CodeQL
+alone: #1416 merged while `Tests with ML Extras` was still running.
+
+`ci.yml` now starts on every pull request. Its `changes` job runs `is_docs_only()` from
+`scripts/pr/pre_pr_check.sh`, read from the base commit so a PR cannot redefine it, over the PR diff, and the test jobs skip when it reports
+docs-only. A job skipped through `if:` reports success to a required check, so
+`Tests + Coverage` and `Tests with ML Extras (transformers paths)` can be required. The
+milvus matrix cannot: skipped, it reports under its unexpanded name
+(`Tests with the milvus extra (${{ matrix.leg }})`), so `(pinned)` never arrives on a
+docs-only PR. Push keeps `paths-ignore`.
+
+Strict also has a documented precondition: it takes effect only while at least one
+status check is required. Setting the flag with an empty check list changes nothing.
+
+The rest of the discipline:
+
+- Never commit straight to `main`; branch first.
+- Merge through a PR, squash.
+- Verify CI is green on the PR before merging, and check `gh run list --branch main`
+  after it lands — a PR that was green on its own base can still break `main`.
+- Read the review comments before merging, not just the check buckets. `Greptile
+  Review: pass` in `gh pr checks` means the reviewer ran, not that it found nothing;
+  its findings arrive as inline review comments and are invisible to that status.
+  `gh api repos/doobidoo/mcp-memory-service/pulls/<N>/comments` lists them. All five
+  findings it left on the v11.12.0 release PRs were valid and were merged over,
+  including a stale `og:description` and a dropped `[Unreleased]` heading. `BLOCKED`
+  on a green board is worth a look for the same reason, but it is not itself evidence
+  of anything — see the ruleset section above.
+- Keep an empty `## [Unreleased]` heading above the new version when cutting a release
+  (see the version-bump procedure above). v11.11.0 and every release before it kept
+  one; v11.12.0 dropped it, which Greptile caught and the merge ignored.
+- If several sessions share one checkout, isolate into a worktree first.
 
 ## Hotfix Workflow (Critical Bugs)
 
 - **Speed target**: 8-10 minutes from bug report to release
-- **Process**: Fix → Test → Five-file bump → Commit → github-release-manager agent
+- **Process**: Fix, test, version bump, commit, then the documented release workflow
 - **Branch**: Can go directly to release branch if urgent
 - **Issue management**: Post detailed root cause analysis
 
-## Why Agent-First?
+## Why Not By Hand
 
-**Manual releases** (❌):
-- Forgot README.md update
-- Incomplete GitHub Release
-- Missed workflow verification
+What manual releases have actually cost:
+
+- Forgotten `README.md` update (the README no longer carries a version — this class of
+  failure is gone, not fixed by discipline)
+- Incomplete release notes
+- Publish pipeline never verified after the tag push
 - Version mismatch between files
-- **Real incident (v10.8.0, Feb 8, 2026)**: Forgot to update `_version.py`, dashboard showed wrong version
+- **Real incident (v10.8.0, Feb 8, 2026)**: `_version.py` not updated, so the dashboard
+  reported the wrong version
 
-**With agent** (✅):
-- All files updated consistently (pyproject.toml, _version.py, README.md, CHANGELOG.md)
-- Proper release created
-- Complete documentation
-- CHANGELOG properly formatted
-- Dashboard version correct
-
-**Lesson**: Always use github-release-manager agent, even for "simple" hotfixes. The five-file version bump is error-prone when done manually.
+The workflow keeps every version file, the CHANGELOG, and the release notes in step,
+which is exactly what goes wrong when the bump is done by hand. That holds for "simple"
+hotfixes too.

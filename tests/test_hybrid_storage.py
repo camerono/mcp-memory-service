@@ -11,6 +11,10 @@ Tests cover:
 """
 
 import asyncio
+import datetime
+import shutil
+import time
+from datetime import timedelta
 import pytest
 import pytest_asyncio
 import tempfile
@@ -26,7 +30,12 @@ current_dir = Path(__file__).parent
 src_dir = current_dir.parent / "src"
 sys.path.insert(0, str(src_dir))
 
-from mcp_memory_service.storage.hybrid import HybridMemoryStorage, BackgroundSyncService, SyncOperation
+from mcp_memory_service.storage.hybrid import (
+    HybridMemoryStorage,
+    BackgroundSyncService,
+    SyncOperation,
+)
+from mcp_memory_service.storage import hybrid as hybrid_module
 from mcp_memory_service.storage.sqlite_vec import SqliteVecMemoryStorage
 from mcp_memory_service.models.memory import Memory, MemoryQueryResult
 from mcp_memory_service.utils.hashing import generate_content_hash
@@ -43,6 +52,16 @@ class MockCloudflareStorage:
         self.stored_memories = {}
         self.fail_operations = False
         self.fail_initialization = False
+
+    @property
+    def supports_capacity_monitoring(self) -> bool:
+        """Mock Cloudflare storage supports capacity monitoring."""
+        return True
+
+    @property
+    def requires_metadata_normalization(self) -> bool:
+        """Mock Cloudflare storage requires metadata normalization."""
+        return True
 
     async def initialize(self):
         if self.fail_initialization:
@@ -99,6 +118,103 @@ class MockCloudflareStorage:
         pass
 
 
+class SlowMockCloudflareStorage(MockCloudflareStorage):
+    """A secondary that takes a long, well-known time to answer.
+
+    Exists so the performance tests can assert the property they were always
+    about -- that a hybrid write reaches local storage without waiting on a
+    cloud round trip -- rather than a bare wall-clock number. Against this
+    secondary a correct implementation is unaffected and a regression that
+    awaited the sync would take at least SECONDARY_LATENCY.
+    """
+
+    SECONDARY_LATENCY = 1.5
+
+    async def store(self, memory: Memory):
+        await asyncio.sleep(self.SECONDARY_LATENCY)
+        return await super().store(memory)
+
+    async def delete(self, content_hash: str):
+        await asyncio.sleep(self.SECONDARY_LATENCY)
+        return await super().delete(content_hash)
+
+
+class TombstoneD1MockCloudflareStorage(MockCloudflareStorage):
+    """Cloudflare-like secondary that exposes live rows and D1 tombstones."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.base_url = "https://mock"
+        self.d1_database_id = "mock-db"
+        self.remote_tombstones = {}
+        self.store_call_count = 0
+        self.fail_d1_reads = False
+        self.fail_store = False
+        self.d1_read_count = 0
+        self.fail_d1_after = None
+
+    def _live_memories(self):
+        return [
+            memory for content_hash, memory in self.stored_memories.items()
+            if content_hash not in self.remote_tombstones
+        ]
+
+    async def _retry_request(self, method, url, **kwargs):
+        self.d1_read_count += 1
+        if self.fail_d1_reads or self.d1_read_count == self.fail_d1_after:
+            raise RuntimeError("mock D1 read failure")
+
+        request = kwargs.get("json", {})
+        sql = request.get("sql", "").lower()
+        params = request.get("params", [])
+        last_id = params[0] if params else 0
+        limit = params[1] if len(params) > 1 else 1000
+
+        records = []
+        for row_id, memory in enumerate(self.stored_memories.values(), start=1):
+            content_hash = memory.content_hash
+            deleted_at = self.remote_tombstones.get(content_hash)
+            records.append({
+                "id": row_id,
+                "content_hash": content_hash,
+                "deleted_at": deleted_at,
+            })
+
+        if "deleted_at is null" in sql:
+            records = [row for row in records if row["deleted_at"] is None]
+        elif "deleted_at is not null" in sql:
+            records = [row for row in records if row["deleted_at"] is not None]
+
+        rows = [row for row in records if row["id"] > last_id][:limit]
+        response = Mock()
+        response.json = Mock(
+            return_value={"success": True, "result": [{"results": rows}]}
+        )
+        return response
+
+    async def get_stats(self):
+        stats = await super().get_stats()
+        stats["total_memories"] = len(self._live_memories())
+        stats["vector_count"] = len(self._live_memories())
+        stats["total_vectors"] = len(self._live_memories())
+        return stats
+
+    async def get_by_hash(self, content_hash: str):
+        if content_hash in self.remote_tombstones:
+            return None
+        return self.stored_memories.get(content_hash)
+
+    async def get_all_memories_cursor(self, limit=100, cursor=None):
+        return self._live_memories() if cursor is None else []
+
+    async def store(self, memory: Memory):
+        self.store_call_count += 1
+        if self.fail_store:
+            return False, "mock store failure"
+        self.remote_tombstones.pop(memory.content_hash, None)
+        return await super().store(memory)
+
+
 @pytest_asyncio.fixture
 async def temp_sqlite_db():
     """Create a temporary SQLite database for testing."""
@@ -132,6 +248,22 @@ async def hybrid_storage(temp_sqlite_db, mock_cloudflare_config):
             embedding_model="all-MiniLM-L6-v2",
             cloudflare_config=mock_cloudflare_config,
             sync_interval=1,  # Short interval for testing
+            batch_size=5
+        )
+        await storage.initialize()
+        yield storage
+        await storage.close()
+
+
+@pytest_asyncio.fixture
+async def hybrid_storage_slow_secondary(temp_sqlite_db, mock_cloudflare_config):
+    """A hybrid store whose secondary is deliberately slow (see the class)."""
+    with patch('mcp_memory_service.storage.hybrid.CloudflareStorage', SlowMockCloudflareStorage):
+        storage = HybridMemoryStorage(
+            sqlite_db_path=temp_sqlite_db,
+            embedding_model="all-MiniLM-L6-v2",
+            cloudflare_config=mock_cloudflare_config,
+            sync_interval=1,
             batch_size=5
         )
         await storage.initialize()
@@ -283,6 +415,46 @@ class TestHybridMemoryStorage:
         assert "sync_status" in stats
 
     @pytest.mark.asyncio
+    async def test_get_stats_reports_http_secondary(self, temp_sqlite_db):
+        """A hybrid built on an HTTP secondary must not be labelled Cloudflare (#1482)."""
+        with patch('mcp_memory_service.storage.hybrid.RemoteHTTPStorage', MockCloudflareStorage):
+            storage = HybridMemoryStorage(
+                sqlite_db_path=temp_sqlite_db,
+                secondary_backend='http',
+                secondary_url='https://hub.example.test',
+                secondary_api_key='test-key',
+                sync_interval=1,
+                batch_size=5
+            )
+            await storage.initialize()
+            try:
+                assert storage.secondary_backend_type == 'http'
+                stats = await storage.get_stats()
+                assert stats["storage_backend"] == "Hybrid (SQLite-vec + HTTP)"
+                assert stats["secondary_backend"] == "HTTP"
+            finally:
+                await storage.close()
+
+    @pytest.mark.asyncio
+    async def test_get_stats_without_secondary(self, temp_sqlite_db):
+        """Without any secondary get_stats must not name one (#1482).
+
+        `secondary_backend` is passed explicitly: left at None it falls back to
+        MCP_HYBRID_SECONDARY_BACKEND, so a developer's own hub settings would turn
+        this into an HTTP secondary (or a missing-URL error). 'cloudflare' with no
+        cloudflare_config is the SQLite-only path.
+        """
+        storage = HybridMemoryStorage(sqlite_db_path=temp_sqlite_db, secondary_backend='cloudflare')
+        await storage.initialize()
+        try:
+            assert storage.secondary_backend_type is None
+            stats = await storage.get_stats()
+            assert stats["storage_backend"] == "Hybrid (SQLite-vec, no secondary)"
+            assert stats["secondary_backend"] == "None"
+        finally:
+            await storage.close()
+
+    @pytest.mark.asyncio
     async def test_force_sync(self, hybrid_storage, sample_memory):
         """Test forcing immediate synchronization."""
         # Store some memories
@@ -357,6 +529,7 @@ class TestBackgroundSyncService:
         """Test enqueuing sync operations."""
         primary, secondary, sync_service = sync_service_components
 
+        assert (await primary.store(sample_memory))[0]
         await sync_service.start()
 
         # Enqueue a store operation
@@ -390,6 +563,7 @@ class TestBackgroundSyncService:
             tags=["test"],
             memory_type="test"
         )
+        assert (await primary.store(memory))[0]
 
         # Enqueue operation
         operation = SyncOperation(operation='store', memory=memory)
@@ -455,6 +629,114 @@ class TestBackgroundSyncService:
         assert 'cloudflare_available' in status
 
         await sync_service.stop()
+
+    @pytest.mark.asyncio
+    async def test_queued_store_does_not_resurrect_a_remote_tombstone(
+        self, sync_service_components
+    ):
+        """A delayed store/retry must not undo a tombstone applied during pull."""
+        primary, secondary, sync_service = sync_service_components
+        deleted_at = time.time()
+        content = "delayed store must not undo remote delete"
+        memory = Memory(
+            content=content,
+            content_hash=generate_content_hash(content),
+            created_at=deleted_at - 20,
+            updated_at=deleted_at - 20,
+        )
+        assert (await primary.store(memory))[0]
+        assert await primary.delete_if_not_updated_after(
+            memory.content_hash, deleted_at
+        ) == "applied"
+
+        operation = SyncOperation(operation="store", memory=memory, retries=2)
+        await sync_service._process_single_operation(operation)
+
+        assert memory.content_hash not in secondary.stored_memories
+
+    @pytest.mark.asyncio
+    async def test_queued_store_uploads_newer_primary_metadata_snapshot(
+        self, sync_service_components
+    ):
+        """An old queued create must not be dropped when a later tag edit precedes it."""
+        primary, secondary, sync_service = sync_service_components
+        old_timestamp = time.time() - 60
+        content = "queued create must include later metadata edits"
+        memory = Memory(
+            content=content,
+            content_hash=generate_content_hash(content),
+            tags=["before-edit"],
+            created_at=old_timestamp,
+            updated_at=old_timestamp,
+        )
+        assert (await primary.store(memory))[0]
+
+        # This models a create already waiting in the queue while a client edits
+        # the tags. The follow-up update cannot create a missing remote row.
+        assert (await primary.update_memory_metadata(
+            memory.content_hash, {"tags": ["after-edit"]}
+        ))[0]
+
+        await sync_service._process_single_operation(
+            SyncOperation(operation="store", memory=memory)
+        )
+
+        assert memory.content_hash in secondary.stored_memories
+        assert secondary.stored_memories[memory.content_hash].tags == ["after-edit"]
+
+    @pytest.mark.asyncio
+    async def test_queued_store_waits_for_remote_tombstone_reconciliation(
+        self, sync_service_components, monkeypatch
+    ):
+        """A queued store cannot slip between remote tombstone discovery and apply."""
+        primary, secondary, sync_service = sync_service_components
+        deleted_at = time.time()
+        content = "queued store must wait for remote tombstone reconciliation"
+        memory = Memory(
+            content=content,
+            content_hash=generate_content_hash(content),
+            created_at=deleted_at - 20,
+            updated_at=deleted_at - 20,
+        )
+        assert (await primary.store(memory))[0]
+
+        remote_tombstone_seen = asyncio.Event()
+        apply_remote_tombstone = asyncio.Event()
+        local_tombstone_applied = asyncio.Event()
+        finish_reconciliation = asyncio.Event()
+
+        async def reconcile_snapshot():
+            remote_tombstone_seen.set()
+            await apply_remote_tombstone.wait()
+            outcome = await primary.delete_if_not_updated_after(
+                memory.content_hash, deleted_at
+            )
+            assert outcome == "applied"
+            local_tombstone_applied.set()
+            await finish_reconciliation.wait()
+            return {"status": "completed"}
+
+        monkeypatch.setattr(sync_service, "_force_sync_locked", reconcile_snapshot)
+        force_sync_task = asyncio.create_task(sync_service.force_sync())
+        await asyncio.wait_for(remote_tombstone_seen.wait(), timeout=2)
+
+        queued_store_task = asyncio.create_task(
+            sync_service._process_single_operation(
+                SyncOperation(operation="store", memory=memory)
+            )
+        )
+        await asyncio.sleep(0)
+        assert memory.content_hash not in secondary.stored_memories
+
+        apply_remote_tombstone.set()
+        await asyncio.wait_for(local_tombstone_applied.wait(), timeout=2)
+        await asyncio.sleep(0)
+        assert memory.content_hash not in secondary.stored_memories
+
+        finish_reconciliation.set()
+        await asyncio.wait_for(force_sync_task, timeout=2)
+        await asyncio.wait_for(queued_store_task, timeout=2)
+        assert memory.content_hash not in secondary.stored_memories
 
     @pytest.mark.asyncio
     async def test_force_sync_dedupes_against_secondary(self, temp_sqlite_db):
@@ -530,6 +812,303 @@ class TestBackgroundSyncService:
         assert result.get('skipped_already_present') == 2
 
     @pytest.mark.asyncio
+    async def test_force_sync_applies_remote_tombstone_before_push(
+        self, temp_sqlite_db
+    ):
+        """A remote delete must not be undone by force-sync's push phase (#1502)."""
+        primary = SqliteVecMemoryStorage(temp_sqlite_db)
+        await primary.initialize()
+        secondary = TombstoneD1MockCloudflareStorage()
+        await secondary.initialize()
+        old = time.time() - 100
+        memory = Memory(
+            content="deleted remotely",
+            content_hash=generate_content_hash("deleted remotely"),
+            tags=["sync"],
+            created_at=old,
+            updated_at=old,
+        )
+        await primary.store(memory)
+        secondary.stored_memories[memory.content_hash] = memory
+        secondary.remote_tombstones[memory.content_hash] = old + 10
+
+        sync_service = BackgroundSyncService(
+            primary, secondary, sync_interval=1, batch_size=5
+        )
+        try:
+            result = await sync_service.force_sync()
+
+            assert result["status"] == "completed"
+            assert result["tombstones_applied"] == 1
+            assert result["tombstone_conflicts"] == 0
+            assert await primary.is_deleted(memory.content_hash)
+            deleted_at = await primary._execute_with_retry(
+                lambda: primary.conn.execute(
+                    "SELECT deleted_at FROM memories WHERE content_hash = ?",
+                    (memory.content_hash,),
+                ).fetchone()[0]
+            )
+            assert deleted_at == old + 10
+            assert secondary.store_call_count == 0
+        finally:
+            await primary.close()
+            await secondary.close()
+
+    @pytest.mark.asyncio
+    async def test_force_sync_preserves_newer_local_memory_on_tombstone_conflict(
+        self, temp_sqlite_db
+    ):
+        """A newer local edit conflicts with, rather than loses to, a remote delete."""
+        primary = SqliteVecMemoryStorage(temp_sqlite_db)
+        await primary.initialize()
+        secondary = TombstoneD1MockCloudflareStorage()
+        await secondary.initialize()
+        now = time.time()
+        memory = Memory(
+            content="edited after remote delete",
+            content_hash=generate_content_hash("edited after remote delete"),
+            tags=["sync"],
+            updated_at=now,
+        )
+        await primary.store(memory)
+        secondary.stored_memories[memory.content_hash] = memory
+        secondary.remote_tombstones[memory.content_hash] = now - 10
+
+        sync_service = BackgroundSyncService(
+            primary, secondary, sync_interval=1, batch_size=5
+        )
+        try:
+            result = await sync_service.force_sync()
+
+            assert result["tombstone_conflicts"] == 1
+            assert result["tombstones_applied"] == 0
+            assert not await primary.is_deleted(memory.content_hash)
+            assert await primary.get_by_hash(memory.content_hash) is not None
+            assert secondary.store_call_count == 0
+        finally:
+            await primary.close()
+            await secondary.close()
+
+    @pytest.mark.asyncio
+    async def test_force_sync_fails_closed_when_remote_tombstones_cannot_be_read(
+        self, temp_sqlite_db
+    ):
+        """An unreadable D1 snapshot must not push and resurrect local data."""
+        primary = SqliteVecMemoryStorage(temp_sqlite_db)
+        await primary.initialize()
+        secondary = TombstoneD1MockCloudflareStorage()
+        await secondary.initialize()
+        memory = Memory(
+            content="must not be pushed without tombstone state",
+            content_hash=generate_content_hash("must not push without tombstone state"),
+            tags=["sync"],
+        )
+        await primary.store(memory)
+        secondary.fail_d1_reads = True
+
+        sync_service = BackgroundSyncService(
+            primary, secondary, sync_interval=1, batch_size=5
+        )
+        try:
+            result = await sync_service.force_sync()
+
+            assert result["status"] == "partial"
+            assert result["primary_memories"] == 1
+            assert result["synced_to_secondary"] == 0
+            assert secondary.store_call_count == 0
+        finally:
+            await primary.close()
+            await secondary.close()
+
+    @pytest.mark.asyncio
+    async def test_force_sync_reports_failed_push_operations_as_partial(
+        self, temp_sqlite_db
+    ):
+        primary = SqliteVecMemoryStorage(temp_sqlite_db)
+        await primary.initialize()
+        secondary = TombstoneD1MockCloudflareStorage()
+        await secondary.initialize()
+        memory = Memory(
+            content="push failure must not be reported as complete",
+            content_hash=generate_content_hash(
+                "push failure must not be reported as complete"
+            ),
+            tags=["sync"],
+        )
+        await primary.store(memory)
+        secondary.fail_store = True
+
+        sync_service = BackgroundSyncService(
+            primary, secondary, sync_interval=1, batch_size=5
+        )
+        try:
+            result = await sync_service.force_sync()
+
+            assert result["status"] == "partial"
+            assert result["failed_operations"] == 1
+            assert result["synced_to_secondary"] == 0
+        finally:
+            await primary.close()
+            await secondary.close()
+
+    @pytest.mark.asyncio
+    async def test_d1_sync_state_reads_all_pages(self):
+        secondary = TombstoneD1MockCloudflareStorage()
+        secondary.stored_memories = {
+            f"hash-{index}": Mock(content_hash=f"hash-{index}")
+            for index in range(1001)
+        }
+
+        sync_state = await hybrid_module._fetch_secondary_sync_state(secondary)
+
+        assert sync_state is not None
+        assert len(sync_state["live_hashes"]) == 1001
+        assert secondary.d1_read_count == 2
+
+    @pytest.mark.asyncio
+    async def test_pull_sync_uses_latest_state_for_hashes_seen_on_later_d1_pages(
+        self, temp_sqlite_db, mock_cloudflare_config
+    ):
+        """A later restore or delete must replace stale state from an earlier page."""
+
+        class ChangingD1StateStorage(TombstoneD1MockCloudflareStorage):
+            async def _retry_request(self, method, url, **kwargs):
+                self.d1_read_count += 1
+                params = kwargs.get("json", {}).get("params", [])
+                last_id = params[0] if params else 0
+                if last_id == 0:
+                    rows = [
+                        {
+                            "id": 1,
+                            "content_hash": self.hashes[0],
+                            "deleted_at": self.deleted_at,
+                        },
+                        {
+                            "id": 2,
+                            "content_hash": self.hashes[1],
+                            "deleted_at": None,
+                        },
+                    ] + [
+                        {
+                            "id": row_id,
+                            "content_hash": f"filler-{row_id}",
+                            "deleted_at": None,
+                        }
+                        for row_id in range(3, 1001)
+                    ]
+                else:
+                    assert last_id == 1000
+                    # Cloudflare removes a tombstone before inserting its restore,
+                    # and a later delete marks the restored row in place. The
+                    # resulting states arrive in id order across separate pages.
+                    self.remote_tombstones.pop(self.hashes[0], None)
+                    self.remote_tombstones[self.hashes[1]] = self.deleted_at
+                    rows = [
+                        {
+                            "id": 1001,
+                            "content_hash": self.hashes[0],
+                            "deleted_at": None,
+                        },
+                        {
+                            "id": 1002,
+                            "content_hash": self.hashes[1],
+                            "deleted_at": self.deleted_at,
+                        },
+                    ]
+
+                response = Mock()
+                response.json = Mock(
+                    return_value={"success": True, "result": [{"results": rows}]}
+                )
+                return response
+
+        with patch(
+            "mcp_memory_service.storage.hybrid.CloudflareStorage",
+            ChangingD1StateStorage,
+        ):
+            storage = HybridMemoryStorage(
+                sqlite_db_path=temp_sqlite_db,
+                embedding_model="all-MiniLM-L6-v2",
+                cloudflare_config=mock_cloudflare_config,
+                sync_interval=1,
+                batch_size=5,
+            )
+            await storage.initialize()
+            try:
+                old = time.time() - 100
+                restored = Memory(
+                    content="restored during paginated sync scan",
+                    content_hash=generate_content_hash(
+                        "restored during paginated sync scan"
+                    ),
+                    tags=["sync"],
+                    created_at=old,
+                    updated_at=old,
+                )
+                deleted = Memory(
+                    content="deleted during paginated sync scan",
+                    content_hash=generate_content_hash(
+                        "deleted during paginated sync scan"
+                    ),
+                    tags=["sync"],
+                    created_at=old,
+                    updated_at=old,
+                )
+                await storage.primary.store(restored)
+                await storage.primary.store(deleted)
+                storage.secondary.hashes = [
+                    restored.content_hash,
+                    deleted.content_hash,
+                ]
+                storage.secondary.deleted_at = old + 10
+                storage.secondary.stored_memories[restored.content_hash] = restored
+                storage.secondary.stored_memories[deleted.content_hash] = deleted
+                storage.secondary.remote_tombstones[restored.content_hash] = old + 10
+
+                # The filler rows force pagination; this focused sync test treats
+                # them as already present locally so only the two changing hashes
+                # matter.
+                filler_hashes = {
+                    f"filler-{row_id}" for row_id in range(3, 1001)
+                }
+
+                async def local_hashes_after_tombstone_reconciliation():
+                    hashes = set(filler_hashes)
+                    for memory in (restored, deleted):
+                        if not await storage.primary.is_deleted(memory.content_hash):
+                            hashes.add(memory.content_hash)
+                    return hashes
+
+                storage.primary.get_all_content_hashes = (
+                    local_hashes_after_tombstone_reconciliation
+                )
+
+                result = await storage.force_pull_sync()
+
+                assert result["success"] is True
+                assert result["tombstones_applied"] == 1
+                assert not await storage.primary.is_deleted(restored.content_hash)
+                assert await storage.primary.get_by_hash(restored.content_hash) is not None
+                assert await storage.primary.is_deleted(deleted.content_hash)
+                assert await storage.primary.get_by_hash(deleted.content_hash) is None
+            finally:
+                await storage.close()
+
+    @pytest.mark.asyncio
+    async def test_d1_sync_state_fails_closed_if_a_later_page_fails(self):
+        secondary = TombstoneD1MockCloudflareStorage()
+        secondary.stored_memories = {
+            f"hash-{index}": Mock(content_hash=f"hash-{index}")
+            for index in range(1001)
+        }
+        secondary.fail_d1_after = 2
+
+        sync_state = await hybrid_module._fetch_secondary_sync_state(secondary)
+
+        assert sync_state is None
+        assert secondary.d1_read_count == 2
+
+    @pytest.mark.asyncio
     async def test_force_sync_falls_back_when_dedupe_unavailable(self, sync_service_components):
         """If the secondary doesn't expose a bulk hash fetch (no _retry_request /
         d1_database_id attrs), force_sync must still work — pushing all items (old
@@ -552,30 +1131,473 @@ class TestBackgroundSyncService:
         # Fallback path doesn't populate skipped_already_present
         assert result.get('skipped_already_present', 0) == 0
 
+    @pytest.mark.asyncio
+    async def test_pull_sync_reconciles_divergent_sets(self, temp_sqlite_db, mock_cloudflare_config):
+        """A pull sync must not skip cloud-only memories just because the local total is
+        >= the cloud total. With divergent sets — local-only writes queued while the
+        cloud was unreachable, plus memories another device wrote straight to the cloud —
+        the totals can read local >= cloud while the cloud still holds hashes the primary
+        lacks. The count gate skipped the whole pull in that case, and the drift scan only
+        revisits recently-updated memories, so an older cloud-only memory was never pulled.
+        Regression guard: the pull diffs hashes, not counts."""
+
+        class PullMockCloudflareStorage(MockCloudflareStorage):
+            """Secondary that mimics CloudflareStorage enough to expose bulk hash fetch
+            and cursor pagination, both derived from its stored memories."""
+
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.base_url = "https://mock"
+                self.d1_database_id = "mock-db"
+                self.cursor_scan_calls = 0
+
+            def _live(self):
+                return [m for m in self.stored_memories.values()
+                        if getattr(m, "deleted_at", None) is None]
+
+            async def get_by_hash(self, content_hash):
+                memory = self.stored_memories.get(content_hash)
+                if memory is not None and getattr(memory, "deleted_at", None) is None:
+                    return memory
+                return None
+
+            async def _retry_request(self, method, url, **kwargs):
+                # Single-page cursor response, mirroring get_all_memories_cursor: all
+                # hashes on the first page (id > 0), empty thereafter.
+                params = kwargs.get("json", {}).get("params", [])
+                last_id = params[0] if params else 0
+                resp = Mock()
+                if last_id == 0:
+                    resp.json = Mock(return_value={"success": True, "result": [{"results": [
+                        {"id": i, "content_hash": m.content_hash}
+                        for i, m in enumerate(self._live(), start=1)
+                    ]}]})
+                else:
+                    resp.json = Mock(return_value={"success": True, "result": [{"results": []}]})
+                return resp
+
+            async def get_all_memories_cursor(self, limit=100, cursor=None):
+                # Everything on the first call; empty once the loop advances the cursor.
+                self.cursor_scan_calls += 1
+                return list(self._live()) if cursor is None else []
+
+        with patch('mcp_memory_service.storage.hybrid.CloudflareStorage', PullMockCloudflareStorage):
+            storage = HybridMemoryStorage(
+                sqlite_db_path=temp_sqlite_db,
+                embedding_model="all-MiniLM-L6-v2",
+                cloudflare_config=mock_cloudflare_config,
+                sync_interval=1,
+                batch_size=5,
+            )
+            await storage.initialize()
+            try:
+                # Two local-only memories: local total (2) exceeds cloud total (1).
+                for content in ("local-one", "local-two"):
+                    await storage.primary.store(Memory(
+                        content=content,
+                        content_hash=generate_content_hash(content),
+                        tags=["local"],
+                        memory_type="note",
+                    ))
+
+                # Memories that exist only in the cloud (e.g. written by another
+                # device). Old timestamps keep them out of the drift scan, so only the
+                # count-gated pull can bring them down — which is the path under test.
+                old = time.time() - 100_000
+                cloud_only = []
+                for content in ("cloud-only", "cloud-only-older"):
+                    memory = Memory(
+                        content=content,
+                        content_hash=generate_content_hash(content),
+                        tags=["cloud"],
+                        memory_type="note",
+                        created_at=old,
+                        updated_at=old,
+                    )
+                    storage.secondary.stored_memories[memory.content_hash] = memory
+                    cloud_only.append(memory)
+
+                # The count gate would have skipped: local 2 >= cloud 2.
+                assert (await storage.primary.get_stats())["total_memories"] == 2
+                assert (await storage.secondary.get_stats())["total_memories"] == 2
+
+                result = await storage.force_pull_sync()
+                assert result["success"] is True
+
+                local_hashes = await storage.primary.get_all_content_hashes()
+                for memory in cloud_only:
+                    assert memory.content_hash in local_hashes, (
+                        "cloud-only memory was not pulled — the count gate skipped a divergent "
+                        "set instead of diffing hashes"
+                    )
+                # Every known-missing hash must be pulled directly, not left to the
+                # newest-first scan, whose empty-batch give-up can stop before an old
+                # cloud-only memory buried behind shared ones.
+                assert storage.secondary.cursor_scan_calls == 0, (
+                    "pull fell through to the paginated scan even though the exact "
+                    "missing hashes were known"
+                )
+            finally:
+                await storage.close()
+
+    @pytest.mark.asyncio
+    async def test_pull_sync_applies_remote_tombstone_to_local_copy(
+        self, temp_sqlite_db, mock_cloudflare_config
+    ):
+        """A Cloudflare tombstone must delete an older live local copy (#1502)."""
+        with patch(
+            'mcp_memory_service.storage.hybrid.CloudflareStorage',
+            TombstoneD1MockCloudflareStorage,
+        ):
+            storage = HybridMemoryStorage(
+                sqlite_db_path=temp_sqlite_db,
+                embedding_model="all-MiniLM-L6-v2",
+                cloudflare_config=mock_cloudflare_config,
+                sync_interval=1,
+                batch_size=5,
+            )
+            await storage.initialize()
+            try:
+                old = time.time() - 100
+                memory = Memory(
+                    content="remote tombstone should win",
+                    content_hash=generate_content_hash("remote tombstone should win"),
+                    tags=["sync"],
+                    created_at=old,
+                    updated_at=old,
+                )
+                await storage.primary.store(memory)
+                storage.secondary.stored_memories[memory.content_hash] = memory
+                storage.secondary.remote_tombstones[memory.content_hash] = old + 10
+
+                result = await storage.force_pull_sync()
+
+                assert result["success"] is True
+                assert result["tombstones_applied"] == 1
+                assert await storage.primary.is_deleted(memory.content_hash)
+                assert await storage.primary.get_by_hash(memory.content_hash) is None
+            finally:
+                await storage.close()
+
+    @pytest.mark.asyncio
+    async def test_pull_sync_reports_newer_local_tombstone_conflict(
+        self, temp_sqlite_db, mock_cloudflare_config
+    ):
+        """A local edit newer than the remote delete must survive and be reported."""
+        with patch(
+            'mcp_memory_service.storage.hybrid.CloudflareStorage',
+            TombstoneD1MockCloudflareStorage,
+        ):
+            storage = HybridMemoryStorage(
+                sqlite_db_path=temp_sqlite_db,
+                embedding_model="all-MiniLM-L6-v2",
+                cloudflare_config=mock_cloudflare_config,
+                sync_interval=1,
+                batch_size=5,
+            )
+            await storage.initialize()
+            try:
+                now = time.time()
+                memory = Memory(
+                    content="newer local edit",
+                    content_hash=generate_content_hash("newer local edit"),
+                    tags=["sync"],
+                    updated_at=now,
+                )
+                await storage.primary.store(memory)
+                storage.secondary.stored_memories[memory.content_hash] = memory
+                storage.secondary.remote_tombstones[memory.content_hash] = now - 10
+
+                result = await storage.force_pull_sync()
+
+                assert result["success"] is False
+                assert result["tombstone_conflicts"] == 1
+                assert result["tombstones_applied"] == 0
+                assert not await storage.primary.is_deleted(memory.content_hash)
+                assert await storage.primary.get_by_hash(memory.content_hash) is not None
+            finally:
+                await storage.close()
+
+
+    @pytest.mark.asyncio
+    async def test_pull_sync_diffs_hashes_when_cloud_holds_more(self, temp_sqlite_db, mock_cloudflare_config):
+        """When the cloud holds MORE memories than the primary, the pull must still diff
+        hashes. It used to fall through to the newest-first scan, which gives up after
+        HYBRID_MAX_EMPTY_BATCHES batches without a new memory, so an old cloud-only
+        memory buried behind shared ones was never pulled."""
+
+        class PullMockCloudflareStorage(MockCloudflareStorage):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.base_url = "https://mock"
+                self.d1_database_id = "mock-db"
+                self.cursor_scan_calls = 0
+
+            async def get_by_hash(self, content_hash):
+                return self.stored_memories.get(content_hash)
+
+            async def _retry_request(self, method, url, **kwargs):
+                params = kwargs.get("json", {}).get("params", [])
+                last_id = params[0] if params else 0
+                resp = Mock()
+                rows = [
+                    {"id": i, "content_hash": m.content_hash}
+                    for i, m in enumerate(self.stored_memories.values(), start=1)
+                ] if last_id == 0 else []
+                resp.json = Mock(return_value={"success": True, "result": [{"results": rows}]})
+                return resp
+
+            async def get_all_memories_cursor(self, limit=100, cursor=None):
+                self.cursor_scan_calls += 1
+                return list(self.stored_memories.values()) if cursor is None else []
+
+        with patch('mcp_memory_service.storage.hybrid.CloudflareStorage', PullMockCloudflareStorage):
+            storage = HybridMemoryStorage(
+                sqlite_db_path=temp_sqlite_db,
+                embedding_model="all-MiniLM-L6-v2",
+                cloudflare_config=mock_cloudflare_config,
+                sync_interval=1,
+                batch_size=5,
+            )
+            await storage.initialize()
+            try:
+                old = time.time() - 100_000
+                shared = Memory(
+                    content="shared",
+                    content_hash=generate_content_hash("shared"),
+                    tags=["shared"],
+                    memory_type="note",
+                )
+                await storage.primary.store(shared)
+                storage.secondary.stored_memories[shared.content_hash] = shared
+
+                cloud_only = []
+                for content in ("cloud-only", "cloud-only-older"):
+                    memory = Memory(
+                        content=content,
+                        content_hash=generate_content_hash(content),
+                        tags=["cloud"],
+                        memory_type="note",
+                        created_at=old,
+                        updated_at=old,
+                    )
+                    storage.secondary.stored_memories[memory.content_hash] = memory
+                    cloud_only.append(memory)
+
+                # The cloud holds more than the primary: 3 vs 1.
+                assert (await storage.primary.get_stats())["total_memories"] == 1
+                assert (await storage.secondary.get_stats())["total_memories"] == 3
+
+                result = await storage.force_pull_sync()
+                assert result["success"] is True
+                assert result["memories_pulled"] == 2
+
+                local_hashes = await storage.primary.get_all_content_hashes()
+                for memory in cloud_only:
+                    assert memory.content_hash in local_hashes
+                assert storage.secondary.cursor_scan_calls == 0, (
+                    "pull fell through to the paginated scan even though the exact "
+                    "missing hashes were known"
+                )
+            finally:
+                await storage.close()
+
+
+    @pytest.mark.asyncio
+    async def test_pull_sync_scans_when_the_cloud_hash_fetch_fails(self, temp_sqlite_db, mock_cloudflare_config):
+        """A failed D1 hash fetch must not read as "the cloud holds nothing": the pull
+        falls back to the paginated scan and still brings the missing memory down."""
+
+        class FailingHashMockCloudflareStorage(MockCloudflareStorage):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.base_url = "https://mock"
+                self.d1_database_id = "mock-db"
+                self.cursor_scan_calls = 0
+
+            async def _retry_request(self, method, url, **kwargs):
+                raise RuntimeError("D1 unavailable")
+
+            async def list_content_hashes(self, include_deleted=False):
+                # What the MemoryStorage default answers for a backend without a listing.
+                return set()
+
+            async def get_all_memories_cursor(self, limit=100, cursor=None):
+                self.cursor_scan_calls += 1
+                return list(self.stored_memories.values()) if cursor is None else []
+
+        with patch('mcp_memory_service.storage.hybrid.CloudflareStorage', FailingHashMockCloudflareStorage):
+            storage = HybridMemoryStorage(
+                sqlite_db_path=temp_sqlite_db,
+                embedding_model="all-MiniLM-L6-v2",
+                cloudflare_config=mock_cloudflare_config,
+                sync_interval=1,
+                batch_size=5,
+            )
+            await storage.initialize()
+            try:
+                shared = Memory(
+                    content="shared",
+                    content_hash=generate_content_hash("shared"),
+                    tags=["shared"],
+                    memory_type="note",
+                )
+                await storage.primary.store(shared)
+                storage.secondary.stored_memories[shared.content_hash] = shared
+                cloud_only = Memory(
+                    content="cloud-only",
+                    content_hash=generate_content_hash("cloud-only"),
+                    tags=["cloud"],
+                    memory_type="note",
+                )
+                storage.secondary.stored_memories[cloud_only.content_hash] = cloud_only
+                storage.secondary.stored_memories[generate_content_hash("another")] = Memory(
+                    content="another",
+                    content_hash=generate_content_hash("another"),
+                    tags=["cloud"],
+                    memory_type="note",
+                )
+
+                result = await storage.force_pull_sync()
+
+                assert result["success"] is False  # tombstone state was unavailable
+                assert result["memories_pulled"] == 2
+                assert result["tombstone_failures"] == 1
+                assert storage.secondary.cursor_scan_calls > 0
+                assert cloud_only.content_hash in await storage.primary.get_all_content_hashes()
+            finally:
+                await storage.close()
+
+    @pytest.mark.asyncio
+    async def test_pull_sync_skips_semantic_dedup(self, temp_sqlite_db, mock_cloudflare_config):
+        """A memory pulled from the secondary was already deduplicated when it was first
+        written, so the receiving device must not run semantic dedup on it again. With
+        dedup on, a pulled memory that is close to something the primary already holds
+        was rejected ("Duplicate content detected") and never arrived, on every sync."""
+
+        class PullMockCloudflareStorage(MockCloudflareStorage):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.base_url = "https://mock"
+                self.d1_database_id = "mock-db"
+
+            async def get_by_hash(self, content_hash):
+                return self.stored_memories.get(content_hash)
+
+            async def _retry_request(self, method, url, **kwargs):
+                params = kwargs.get("json", {}).get("params", [])
+                last_id = params[0] if params else 0
+                resp = Mock()
+                rows = [
+                    {"id": i, "content_hash": h}
+                    for i, h in enumerate(self.stored_memories, start=1)
+                ] if last_id == 0 else []
+                resp.json = Mock(return_value={"success": True, "result": [{"results": rows}]})
+                return resp
+
+        def make(content):
+            return Memory(content=content, content_hash=generate_content_hash(content),
+                          tags=["t"], memory_type="note")
+
+        original = make("Claude Code is a powerful CLI tool for software engineering.")
+        near_dup = make("The Claude Code CLI is an excellent software development tool.")
+        local_only = make("Totally unrelated: the quarterly invoice is due on Friday.")
+
+        # No automatic pull at startup: the only pull in this test is the explicit one below.
+        with patch('mcp_memory_service.storage.hybrid.HYBRID_SYNC_ON_STARTUP', False), \
+                patch('mcp_memory_service.storage.hybrid.CloudflareStorage', PullMockCloudflareStorage):
+            storage = HybridMemoryStorage(
+                sqlite_db_path=temp_sqlite_db,
+                embedding_model="all-MiniLM-L6-v2",
+                cloudflare_config=mock_cloudflare_config,
+                sync_interval=1,
+                batch_size=5,
+            )
+            await storage.initialize()
+            try:
+                # Semantic dedup is on for the primary (tests/conftest.py turns it off by
+                # default). Which memories count as similar is the input of this test, not the
+                # logic under test, so it is fixed here instead of depending on an embedding
+                # model being installed: the near-duplicate is always judged similar.
+                storage.primary.semantic_dedup_enabled = True
+
+                async def judge_similarity(content, **kwargs):
+                    if content == near_dup.content:
+                        return True, original.content_hash
+                    return False, None
+
+                storage.primary._check_semantic_duplicate = judge_similarity
+
+                # Primary holds the original plus a local-only memory (so local >= cloud
+                # and the hash-diff pull runs); the near-duplicate exists only in the cloud.
+                for memory in (original, local_only):
+                    ok, msg = await storage.primary.store(memory)
+                    assert ok, msg
+                for memory in (original, near_dup):
+                    storage.secondary.stored_memories[memory.content_hash] = memory
+
+                # A normal store of the near-duplicate is rejected, so dedup is in effect.
+                ok, msg = await storage.primary.store(near_dup)
+                assert not ok and "semantically similar" in msg
+
+                result = await storage.force_pull_sync()
+                assert result["success"] is True
+
+                local_hashes = await storage.primary.get_all_content_hashes()
+                assert near_dup.content_hash in local_hashes, (
+                    "pulled memory was rejected by semantic dedup on the receiving device"
+                )
+            finally:
+                await storage.close()
+
 
 class TestPerformanceCharacteristics:
     """Test performance characteristics of hybrid storage."""
 
     @pytest.mark.asyncio
-    async def test_read_performance(self, hybrid_storage, sample_memory):
-        """Test that reads are fast (should use SQLite-vec)."""
-        # Store a memory
-        await hybrid_storage.store(sample_memory)
+    async def test_read_does_not_touch_the_secondary(
+        self, hybrid_storage_slow_secondary, sample_memory
+    ):
+        """Reads must be served from the primary store alone.
 
-        # Measure read performance
-        import time
+        This used to assert `duration < 0.1` against a fast mock, which measured
+        the machine rather than the design: the call phase alone was 0.14-0.21s
+        locally, and the embedding generation inside it is documented at
+        80-150ms, so the budget contradicted the project's own figures (#274).
 
-        start_time = time.time()
-        results = await hybrid_storage.retrieve(sample_memory.content[:10], n_results=1)
-        duration = time.time() - start_time
+        Against a secondary that takes SECONDARY_LATENCY to answer, the margin
+        is what carries the assertion: a read that reached the cloud could not
+        possibly come back inside half that time.
+        """
+        await hybrid_storage_slow_secondary.store(sample_memory)
 
-        # Should be very fast (< 100ms for local SQLite-vec)
-        assert duration < 0.1
-        assert len(results) >= 0  # Should get some results
+        start_time = time.perf_counter()
+        results = await hybrid_storage_slow_secondary.retrieve(
+            sample_memory.content[:10], n_results=1
+        )
+        duration = time.perf_counter() - start_time
+
+        budget = SlowMockCloudflareStorage.SECONDARY_LATENCY / 2
+        assert duration < budget, (
+            f"read took {duration:.3f}s against a secondary answering in "
+            f"{SlowMockCloudflareStorage.SECONDARY_LATENCY}s -- it appears to be "
+            "waiting on the cloud path"
+        )
+        assert len(results) >= 0
 
     @pytest.mark.asyncio
-    async def test_write_performance(self, hybrid_storage):
-        """Test that writes are fast (immediate SQLite-vec write)."""
+    async def test_write_does_not_wait_for_the_secondary(
+        self, hybrid_storage_slow_secondary
+    ):
+        """A write must return once the primary has it, leaving the cloud to the
+        background sync.
+
+        That is what hybrid.store() implements -- it awaits only
+        `self.primary.store(...)` and then enqueues a SyncOperation -- and it is
+        what the old `duration < 0.1` was reaching for. The old form failed
+        about half the time on an idle machine, because the embedding step it
+        was unavoidably timing costs 80-150ms on its own (#274).
+        """
         content = "Performance test memory"
         memory = Memory(
             content=content,
@@ -584,15 +1606,17 @@ class TestPerformanceCharacteristics:
             memory_type="performance_test"
         )
 
-        import time
+        start_time = time.perf_counter()
+        success, message = await hybrid_storage_slow_secondary.store(memory)
+        duration = time.perf_counter() - start_time
 
-        start_time = time.time()
-        success, message = await hybrid_storage.store(memory)
-        duration = time.time() - start_time
-
-        # Should be very fast (< 100ms for local SQLite-vec)
-        assert duration < 0.1
+        budget = SlowMockCloudflareStorage.SECONDARY_LATENCY / 2
         assert success
+        assert duration < budget, (
+            f"write took {duration:.3f}s against a secondary answering in "
+            f"{SlowMockCloudflareStorage.SECONDARY_LATENCY}s -- it appears to be "
+            "waiting for the sync instead of queueing it"
+        )
 
     @pytest.mark.asyncio
     async def test_concurrent_operations(self, hybrid_storage):
@@ -729,7 +1753,6 @@ class TestHybridTimeBasedDeletion:
             await storage.close()
 
         # Cleanup
-        import shutil
         if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
 
@@ -739,9 +1762,6 @@ class TestHybridTimeBasedDeletion:
         hybrid = test_hybrid_storage
 
         # Store test memories
-        import datetime
-        from datetime import timedelta
-
         today = datetime.date.today()
         yesterday = today - timedelta(days=1)
 
@@ -751,7 +1771,9 @@ class TestHybridTimeBasedDeletion:
             content_hash=generate_content_hash(content1),
             tags=["test"],
             memory_type="test",
-            created_at=(yesterday.toordinal() - datetime.date(1970, 1, 1).toordinal()) * 86400.0
+            # Local noon: delete_by_timeframe uses local-day bounds, and UTC
+            # midnight falls on the previous local day west of UTC.
+            created_at=datetime.datetime.combine(yesterday, datetime.time(12)).timestamp()
         )
         await hybrid.store(memory1)
 
@@ -773,9 +1795,6 @@ class TestHybridTimeBasedDeletion:
         hybrid = test_hybrid_storage
 
         # Store test memory first so deletion has something to delete
-        import datetime
-        from datetime import timedelta
-
         today = datetime.date.today()
         yesterday = today - timedelta(days=1)
 
@@ -785,7 +1804,9 @@ class TestHybridTimeBasedDeletion:
             content_hash=generate_content_hash(content1),
             tags=["test"],
             memory_type="test",
-            created_at=(yesterday.toordinal() - datetime.date(1970, 1, 1).toordinal()) * 86400.0
+            # Local noon: delete_by_timeframe uses local-day bounds, and UTC
+            # midnight falls on the previous local day west of UTC.
+            created_at=datetime.datetime.combine(yesterday, datetime.time(12)).timestamp()
         )
         await hybrid.store(memory1)
 
@@ -815,9 +1836,6 @@ class TestHybridTimeBasedDeletion:
         hybrid = test_hybrid_storage
 
         # Store test memory in primary so delete_by_timeframe has something to delete
-        import datetime
-        from datetime import timedelta
-
         today = datetime.date.today()
         yesterday = today - timedelta(days=1)
 
@@ -827,7 +1845,9 @@ class TestHybridTimeBasedDeletion:
             content_hash=generate_content_hash(content1),
             tags=["test"],
             memory_type="test",
-            created_at=(yesterday.toordinal() - datetime.date(1970, 1, 1).toordinal()) * 86400.0
+            # Local noon: delete_by_timeframe uses local-day bounds, and UTC
+            # midnight falls on the previous local day west of UTC.
+            created_at=datetime.datetime.combine(yesterday, datetime.time(12)).timestamp()
         )
         await hybrid.store(memory1)
 
@@ -865,9 +1885,6 @@ class TestHybridTimeBasedDeletion:
         hybrid = test_hybrid_storage
 
         # Store old test memory
-        import datetime
-        from datetime import timedelta
-
         today = datetime.date.today()
         old_date = today - timedelta(days=30)
 
@@ -899,9 +1916,6 @@ class TestHybridTimeBasedDeletion:
         hybrid = test_hybrid_storage
 
         # Store old test memory first so deletion has something to delete
-        import datetime
-        from datetime import timedelta
-
         today = datetime.date.today()
         old_date = today - timedelta(days=30)
 

@@ -3,16 +3,69 @@ import os
 import sys
 import tempfile
 import shutil
+import time
 import uuid
 from typing import Callable, Optional, List
 
 # Add src directory to Python path
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), 'src'))
 
+# src/ has no __init__.py, so importing the package through the `src.` prefix used
+# to resolve as a namespace package and load a second copy of every module;
+# mock.patch targets on that path silently patched nothing (#1120). Make it an
+# ImportError instead.
+sys.modules['src'] = None
+
 # Disable semantic deduplication during tests to avoid interference with test expectations
 # Tests often use similar content patterns (e.g., "Test memory 1", "Test memory 2")
 # which would be caught by semantic dedup and cause unexpected failures
 os.environ['MCP_SEMANTIC_DEDUP_ENABLED'] = 'false'
+
+# Opt the test harness into the hash-embedding fallback (#135). Tests run against
+# ephemeral temp databases and, in ML-free environments (CI installs [dev,sqlite],
+# no sentence-transformers), legitimately fall back to hash embeddings after seeding
+# rows. Without this, the non-empty-database guard added in #135 would raise
+# RuntimeError on those tests. setdefault so an explicit outer value still wins;
+# tests that assert the guard fires (test_hash_fallback_guard.py) monkeypatch/delenv
+# this per-test, which overrides the default.
+os.environ.setdefault('MCP_MEMORY_ALLOW_HASH_EMBEDDINGS', '1')
+
+# Keep the embedding backend deterministic and offline for the test harness (#162).
+# The suite is designed around the hash-embedding fallback above. Now that the
+# [sqlite] extra ships tokenizers alongside onnxruntime, the ONNX path initializes for
+# real and would pull the ~80MB all-MiniLM-L6-v2 model from S3 on first use — hanging
+# the minimal CI runner past the per-test timeout. Disabling the download lets an
+# uncached model raise, so storage tests fall back to hash embeddings as they did
+# before tokenizers was available, while a machine that already has the model cached
+# still exercises the real ONNX path. setdefault so a test can opt back in explicitly.
+os.environ.setdefault('MCP_MEMORY_ONNX_ALLOW_DOWNLOAD', '0')
+
+# Scrub the settings that decide the embedding dimension (#234). Unlike the
+# setdefault calls above, these are removed rather than defaulted, and the
+# difference is the point: an outer value winning is exactly the bug. Whatever a
+# developer has exported picks the model, and with it the vector width, so
+# tests/unit/test_multi_store_migration_dimension.py built 1024-dimensional vec0
+# tables and then loaded the 384-dimensional default. Three tests failed on one
+# machine and passed on another, and a contributor reasonably read that as
+# pre-existing breakage in the tree.
+#
+# Tests that care about these set them explicitly -- per-test via monkeypatch, or
+# per-subprocess as tests/unit/test_cli_status_embedding.py does -- and that keeps
+# working, because this only clears the ambient value at import time.
+#
+# HF_HUB_OFFLINE is deliberately left alone. Both pinning and clearing it change
+# whether the harness may reach the network, which interacts with the download
+# switch above; that decision needs its own look rather than being folded in here.
+for _dimension_var in (
+    'MCP_EMBEDDING_MODEL',
+    'MCP_MEMORY_USE_ONNX',
+    'MCP_EXTERNAL_EMBEDDING_URL',
+    'MCP_EXTERNAL_EMBEDDING_MODEL',
+    'MCP_EXTERNAL_EMBEDDING_API_KEY',
+):
+    if _dimension_var in os.environ:
+        print(f"[Test Safety] Ignoring host {_dimension_var} so the embedding dimension is deterministic")
+        del os.environ[_dimension_var]
 
 # CRITICAL: Force sqlite_vec backend for tests to prevent accidental Cloudflare operations
 # This prevents tests from soft-deleting production memories in Cloudflare D1
@@ -39,6 +92,39 @@ print(f"[Test Safety] Production databases are isolated and protected.")
 
 # Reserved tag for test memories - enables automatic cleanup
 TEST_MEMORY_TAG = "__test__"
+
+
+@pytest.fixture(autouse=True)
+def _disable_plugins(request, monkeypatch):
+    """Prevent external plugins from loading during tests (e.g. hostname-tag injection)."""
+    if 'enable_plugins' in [m.name for m in request.node.iter_markers()]:
+        yield
+        return
+    monkeypatch.setattr(
+        "mcp_memory_service.plugins.registry.PluginRegistry.discover_and_register",
+        lambda self: None,
+    )
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _clear_embedding_caches():
+    """Reset embedding caches after each test for isolation."""
+    import mcp_memory_service.storage.mixins.embeddings as emb_mod
+    from mcp_memory_service.storage.mixins.embeddings import (
+        _MODEL_CACHE, _DIMENSION_CACHE
+    )
+    from mcp_memory_service.storage.shared import _embedding_cache_clear
+    # SETUP: only reset warning flag (allow model reuse like main)
+    emb_mod._HASH_FALLBACK_WARNED = False
+    _embedding_cache_clear()
+    yield
+    # TEARDOWN: full cleanup (prevent ONNX/ST leak to next test)
+    _MODEL_CACHE.clear()
+    _DIMENSION_CACHE.clear()
+    _embedding_cache_clear()
+    emb_mod._HASH_FALLBACK_WARNED = False
+
 
 @pytest.fixture
 def temp_db_path():
@@ -86,6 +172,39 @@ def test_store():
         return store(content, tags=all_tags, **kwargs)
 
     return _store
+
+
+@pytest.fixture
+def local_timezone():
+    """
+    Run a test under a chosen process timezone and put the old one back after.
+
+    monkeypatch.setenv on its own is not enough. It restores the variable during
+    teardown, which runs after the test body, so a time.tzset() the test makes in
+    a finally block still reads the overridden value and does nothing. Nothing
+    calls tzset() once the variable is back, and the C library keeps the test's
+    timezone for every later test in the same worker (#237).
+
+    Usage:
+        def test_example(local_timezone):
+            local_timezone("Asia/Tokyo")
+            ...
+    """
+    original = os.environ.get("TZ")
+
+    def _set(name: str) -> None:
+        os.environ["TZ"] = name
+        if hasattr(time, "tzset"):
+            time.tzset()
+
+    yield _set
+
+    if original is None:
+        os.environ.pop("TZ", None)
+    else:
+        os.environ["TZ"] = original
+    if hasattr(time, "tzset"):
+        time.tzset()
 
 
 def pytest_sessionfinish(session, exitstatus):

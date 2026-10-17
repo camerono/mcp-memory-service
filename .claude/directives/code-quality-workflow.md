@@ -90,6 +90,18 @@ bash scripts/quality/weekly_quality_review.sh
 - **PR Quality Gate**: `--with-pyscn` flag for comprehensive analysis
 - **Periodic**: Weekly pyscn analysis with trend tracking
 
+## PR Quality Gate: Local Model Selection
+
+The local quality gate reads `MCP_QUALITY_LLM_URL` (default
+`http://127.0.0.1:11437/v1`) and probes the models advertised by that endpoint
+in order. It pins the first model that completes the readiness request and names
+it in the gate output. Set `MCP_QUALITY_LLM_MODEL` to require a specific model,
+and `MCP_QUALITY_LLM_API_KEY` when the endpoint requires a bearer token.
+
+If an oMLX endpoint returns HTTP 507 for one listed model, that model may be
+unavailable even when disk space is healthy. Leave `MCP_QUALITY_LLM_MODEL`
+unset to try the remaining advertised models, or set it to a known working ID.
+
 ## Pre-commit Hook Setup
 
 ```bash
@@ -108,4 +120,4 @@ ln -s ../../scripts/hooks/pre-commit .git/hooks/pre-commit
 2. **Gemini CLI** (Fallback) - Slower (2-3s), OAuth browser flow
 3. **Skip checks** - If neither available, commit proceeds
 
-See [`.claude/agents/code-quality-guard.md`](../.claude/agents/code-quality-guard.md) for detailed workflows.
+See `.claude/agents/code-quality-guard.md` (local developer config, untracked since 00995fe7) for detailed workflows.

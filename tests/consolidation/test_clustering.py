@@ -4,8 +4,9 @@ import pytest
 import numpy as np
 from datetime import datetime, timedelta
 
+from mcp_memory_service.consolidation import clustering as clustering_mod
 from mcp_memory_service.consolidation.clustering import SemanticClusteringEngine
-from mcp_memory_service.consolidation.base import MemoryCluster
+from mcp_memory_service.consolidation.base import ConsolidationError, MemoryCluster
 from mcp_memory_service.models.memory import Memory
 
 
@@ -313,11 +314,16 @@ class TestSemanticClusteringEngine:
             assert 0 <= loose_coherence <= 1
     
     @pytest.mark.asyncio
-    async def test_algorithm_fallback_handling(self, clustering_engine):
-        """Test handling of different clustering algorithms."""
+    async def test_each_available_algorithm_labels_its_clusters(self, clustering_engine):
+        """Every algorithm this installation supports produces valid clusters.
+
+        Algorithms needing scikit-learn are exercised only when it is installed;
+        naming one without it is a configuration error now, not a fallback, so
+        this test asks the engine what it can run instead of assuming.
+        """
         memories = []
         base_embedding = [0.5, 0.4, 0.6, 0.3, 0.7] * 64
-        
+
         for i in range(8):  # Enough for clustering
             embedding = [val + np.random.normal(0, 0.05) for val in base_embedding]
             memory = Memory(
@@ -328,25 +334,47 @@ class TestSemanticClusteringEngine:
                 created_at=datetime.now().timestamp()
             )
             memories.append(memory)
-        
-        # Test different algorithms
-        algorithms = ['simple', 'dbscan', 'hierarchical']
-        
+
+        algorithms = ['simple']
+        if clustering_mod.SKLEARN_AVAILABLE:
+            algorithms.extend(clustering_mod.SKLEARN_ALGORITHMS)
+
         for algorithm in algorithms:
             original_algorithm = clustering_engine.algorithm
             clustering_engine.algorithm = algorithm
-            
+
             try:
                 clusters = await clustering_engine.process(memories)
-                
-                # All algorithms should return valid clusters
+
                 assert isinstance(clusters, list)
                 for cluster in clusters:
                     assert isinstance(cluster, MemoryCluster)
                     assert cluster.metadata['algorithm'] in [algorithm, f"{algorithm}_merged"]
-                    
+
             finally:
                 clustering_engine.algorithm = original_algorithm
+
+    @pytest.mark.asyncio
+    async def test_sklearn_algorithm_without_sklearn_is_an_error(
+        self, clustering_engine, monkeypatch
+    ):
+        """The removed behaviour: it used to silently produce simple clusters."""
+        monkeypatch.setattr(clustering_mod, "SKLEARN_AVAILABLE", False)
+        clustering_engine.algorithm = 'dbscan'
+
+        memories = [
+            Memory(
+                content=f"Test content {i}",
+                content_hash=f"nosk_{i}",
+                tags=["test"],
+                embedding=[0.5, 0.4, 0.6, 0.3, 0.7] * 64,
+                created_at=datetime.now().timestamp(),
+            )
+            for i in range(8)
+        ]
+
+        with pytest.raises(ConsolidationError, match="scikit-learn"):
+            await clustering_engine.process(memories)
     
     @pytest.mark.asyncio
     async def test_empty_input_handling(self, clustering_engine):

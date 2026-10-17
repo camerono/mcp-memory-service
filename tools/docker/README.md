@@ -6,20 +6,99 @@
 |-----|-------------|------------------------|
 | `:latest` | Standard image, full feature set | baseline |
 | `:slim` | CPU-only, no PyTorch/CUDA | ~90% smaller |
-| `:quality-cpu` | Slim + pre-exported ONNX quality models, no runtime PyTorch | ~600 MB larger than `:slim` (deberta classifier quantized to fp16/int8 at build) |
 
-### `:quality-cpu` — local quality scoring without runtime PyTorch
+There is **no published `:quality-cpu` tag.** Its last publish was
+`10-quality-cpu` on 2026-05-29; the build job lived in the GitHub workflow
+removed in `9c7f8b89` and was not ported. It is not coming back as a per-release
+build: the ONNX quality models are version-independent, so rebuilding them on
+every patch release is waste, and that job was historically the most expensive
+and flakiest one in the matrix. `tools/docker/Dockerfile.quality-cpu` stays in
+the tree as a supported **build-it-yourself** option (issue #171, from #170).
 
-Pull this tag to get local ONNX quality scoring (`ms-marco-MiniLM-L-6-v2` and
-`nvidia-quality-classifier-deberta`) out-of-the-box, without managing the ONNX
-export yourself and without shipping `torch`/`transformers` in your deployment
-container.
+## Local quality scoring in a container
+
+The standard and `:slim` images ship `onnxruntime` but neither the exported ONNX
+models nor the `torch`/`transformers` needed to export them, so
+`MCP_QUALITY_AI_PROVIDER=local` needs the models supplied from outside. Three
+supported paths, cheapest first.
+
+### 1. Export once, mount the directory (recommended)
+
+On any machine that has `torch` and `transformers`:
 
 ```bash
-docker pull doobidoo/mcp-memory-service:quality-cpu
+python scripts/quality/export_deberta_onnx.py
+# writes to ~/.cache/mcp_memory/onnx_models/<model_name>/
+```
 
-# Verify both quality models load from baked cache (no export triggered):
-docker run --rm doobidoo/mcp-memory-service:quality-cpu \
+Then mount that directory and point the service at it:
+
+```bash
+docker run --rm \
+  -e MCP_QUALITY_BOOST_ENABLED=true \
+  -e MCP_QUALITY_AI_PROVIDER=local \
+  -e MCP_QUALITY_LOCAL_MODEL=nvidia-quality-classifier-deberta \
+  -e MCP_QUALITY_ONNX_MODEL_DIR=/models/onnx_models \
+  -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \
+  -v ~/.cache/mcp_memory/onnx_models:/models/onnx_models:ro \
+  doobidoo/mcp-memory-service:slim
+```
+
+`MCP_QUALITY_ONNX_MODEL_DIR` is the **parent** directory; the loader appends
+`/<model_name>`, so one setting serves every model. It defaults to
+`~/.cache/mcp_memory/onnx_models`. Setting it is what makes the mount target
+explicit — without it the path depends on `Path.home()`, which resolved to
+`/root` only because these images run as root and set neither `USER` nor `HOME`.
+
+Set `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` so a missing artifact fails
+loudly instead of silently attempting a download.
+
+#### Kubernetes, non-root with a read-only root filesystem
+
+Verified in @tecnobrat's deployment (UID 1000, `readOnlyRootFilesystem: true`),
+with the models delivered as an image volume — a `FROM scratch` stage holding
+nothing but the exported artifacts, versioned independently of the service:
+
+```yaml
+env:
+  - name: MCP_QUALITY_ONNX_MODEL_DIR
+    value: /models/onnx_models
+volumeMounts:
+  - name: quality-model
+    mountPath: /models/onnx_models/nvidia-quality-classifier-deberta
+    subPath: opt/onnx_models_baked/nvidia-quality-classifier-deberta
+    readOnly: true
+volumes:
+  - name: quality-model
+    image:
+      reference: <registry>/mcp-memory-service-quality-cpu:latest
+```
+
+On releases before `MCP_QUALITY_ONNX_MODEL_DIR` existed, the same thing was done
+by redirecting `HOME` at a writable volume and mounting the models inside it:
+
+```yaml
+env:
+  - name: HOME
+    value: /home/mcp-memory-service
+volumeMounts:
+  - name: home
+    mountPath: /home/mcp-memory-service        # emptyDir, so $HOME is writable
+  - name: quality-model
+    mountPath: /home/mcp-memory-service/.cache/mcp_memory/onnx_models/nvidia-quality-classifier-deberta
+    subPath: opt/onnx_models_baked/nvidia-quality-classifier-deberta
+    readOnly: true
+```
+
+That indirection is no longer necessary.
+
+### 2. Build `Dockerfile.quality-cpu` yourself
+
+```bash
+docker build -t my-mcp-memory:quality-cpu -f tools/docker/Dockerfile.quality-cpu .
+
+# Verify both models load from the baked cache (no export triggered):
+docker run --rm my-mcp-memory:quality-cpu \
   python -c "
 from mcp_memory_service.quality.onnx_ranker import get_onnx_ranker_model
 print(get_onnx_ranker_model('ms-marco-MiniLM-L-6-v2'))
@@ -28,12 +107,22 @@ print('Both quality models loaded from baked ONNX cache')
 "
 ```
 
-The image sets `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` at runtime, so
-no live model download can occur. Quality scoring uses only the pre-baked
-artifacts at `/root/.cache/mcp_memory/onnx_models/`.
+The image sets `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`, so no live model
+download can occur.
 
-**Homelab use case:** ideal for Raspberry Pi, NAS, or any always-on box where
-you want quality scoring without pulling a 2 GB PyTorch wheel every restart.
+**Expect roughly 736 MB for the deberta artifacts, not the ~600 MB the tags
+table used to claim.** The published `10-quality-cpu` was 1.26 GB compressed
+against 164 MB for `10-slim`. See the quantization note below for why.
+
+### 3. Point at an endpoint you already run
+
+No models to manage:
+
+```bash
+MCP_QUALITY_AI_PROVIDER=openai-compatible
+MCP_QUALITY_AI_BASE_URL=http://localhost:11434/v1
+MCP_QUALITY_AI_MODEL=qwen2.5:7b-instruct
+```
 
 #### Build-time quantization
 
@@ -47,6 +136,11 @@ weights, which dominates the image size. The build pipeline runs
    correlation against the fp32 baseline on 100 sample texts
 4. Replace fp32 with the smallest variant whose correlation is ≥ 0.98
 5. Fall back to fp32 (no failure) if no variant meets the threshold
+
+**In practice, step 5 is what happens for this model.** @tecnobrat measured int8
+at 0.28-0.39 correlation against fp32 for `nvidia-quality-classifier-deberta`, so
+the 0.98 gate rejects it — correctly — and the build keeps fp32. Do not plan
+capacity around a quantization win here; assume the fp32 size.
 
 Override the strategy at build time:
 

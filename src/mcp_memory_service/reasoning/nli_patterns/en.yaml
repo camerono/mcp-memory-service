@@ -1,0 +1,13 @@
+language: en
+version: 1
+
+negation_pairs:
+  - ['\bdisabled?\b', '\benabled?\b']
+  - ['\bremoved?\b', '\badded?\b']
+  - ['\bnever\b', '\balways\b']
+  - ['\bfalse\b', '\btrue\b']
+  - ['\bstopped\b', '\brunning\b']
+  - ['\bnot\b', null]
+
+version_patterns:
+  - '(\w[\w.-]*)\s+(?:version\s+(?:is\s+)?|is\s+v?|=\s*v?)(\d+[\d.]+)'

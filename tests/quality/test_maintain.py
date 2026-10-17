@@ -21,6 +21,8 @@ import pytest
 import pytest_asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import mcp_memory_service.server.handlers.quality as qmod
+from mcp_memory_service.consolidation.insights import InsightCard
 from mcp_memory_service.server.handlers.quality import (
     handle_maintain,
     handle_maintain_status,
@@ -215,10 +217,92 @@ async def test_maintain_step_error_does_not_abort(mock_server):
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_maintain_entity_extraction_sees_memory_tags(mock_server):
+    """Batch extraction must see a memory's tags (Issue #218).
+
+    `tags` is a top-level attribute of Memory; `metadata` is the separate
+    custom-key dict and is empty on a normally-stored memory. Passing
+    `mem.metadata` straight into the extractor means its metadata-tag branch
+    never fires, silently dropping every tag entity.
+    """
+    server, storage = mock_server
+
+    mem = MagicMock()
+    mem.content = "The replication bus lost ordering under load"  # no @/#/URL/path patterns
+    mem.metadata = {}
+    mem.tags = ["message-bus", "kafka"]
+    mem.content_hash = "abc12345"
+    storage.get_all_memories = AsyncMock(return_value=[mem])
+
+    graph = MagicMock()
+    graph.store_entity_link = AsyncMock(return_value=True)
+
+    with patch("mcp_memory_service.server.handlers.graph.get_graph_storage",
+               AsyncMock(return_value=graph)):
+        result = await handle_maintain(server, {"dry_run": False})
+
+    report = json.loads(result[0].text)
+    linked_names = {call.args[1] for call in graph.store_entity_link.call_args_list}
+    assert "message-bus" in linked_names
+    assert "kafka" in linked_names
+    assert report["steps"]["entities"]["entities_found"] >= 2
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_maintain_entity_extraction_merges_tags_with_metadata(mock_server):
+    """Tags are added to metadata, not substituted for it (Issue #218)."""
+    server, storage = mock_server
+
+    mem = MagicMock()
+    mem.content = "see https://wiki.internal/pg-lag for the trace"
+    mem.metadata = {"tags": ["from-metadata"]}
+    mem.tags = ["from-attribute"]
+    mem.content_hash = "def67890"
+    storage.get_all_memories = AsyncMock(return_value=[mem])
+
+    graph = MagicMock()
+    graph.store_entity_link = AsyncMock(return_value=True)
+
+    with patch("mcp_memory_service.server.handlers.graph.get_graph_storage",
+               AsyncMock(return_value=graph)):
+        await handle_maintain(server, {"dry_run": False})
+
+    linked_names = {call.args[1] for call in graph.store_entity_link.call_args_list}
+    assert "from-attribute" in linked_names
+    assert "https://wiki.internal/pg-lag" in linked_names  # content extraction still works
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_maintain_entity_extraction_survives_missing_tags(mock_server):
+    """A memory object without a usable `tags` attribute must not abort the step."""
+    server, storage = mock_server
+
+    mem = MagicMock(spec=["content", "metadata", "content_hash"])  # no .tags at all
+    mem.content = "notes in /src/bus/consumer.py"
+    mem.metadata = {}
+    mem.content_hash = "aaa11111"
+    storage.get_all_memories = AsyncMock(return_value=[mem])
+
+    graph = MagicMock()
+    graph.store_entity_link = AsyncMock(return_value=True)
+
+    with patch("mcp_memory_service.server.handlers.graph.get_graph_storage",
+               AsyncMock(return_value=graph)):
+        result = await handle_maintain(server, {"dry_run": False})
+
+    report = json.loads(result[0].text)
+    assert "error" not in report["steps"]["entities"]
+    linked_names = {call.args[1] for call in graph.store_entity_link.call_args_list}
+    assert "/src/bus/consumer.py" in linked_names
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_maintain_status_never_run():
     """maintain_status returns never_run when no run has happened."""
     # Reset module state
-    import mcp_memory_service.server.handlers.quality as qmod
     qmod._last_maintain_run = {}
 
     result = await handle_maintain_status()
@@ -237,3 +321,34 @@ async def test_maintain_status_after_run(mock_server):
     data = json.loads(result[0].text)
     assert data["action"] == "maintain"
     assert "elapsed_seconds" in data
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_maintain_insight_cards_write_edges_to_graph(mock_server):
+    """The insight-card step passes the graph handle to store_insights(), so
+    derived_from edges reach graph storage (#1319). Memory storage has no
+    store_association(), so without the handle no edge would be written."""
+    server, storage = mock_server
+    storage.store = AsyncMock(return_value=(True, "ok"))
+    storage.get_by_hash = AsyncMock(return_value=None)
+    card = InsightCard(title="t", content="c", source_hashes=["s1", "s2"],
+                       insight_type="pattern", confidence=0.7)
+    graph = MagicMock()
+    graph.store_association = AsyncMock(return_value=True)
+    graph.has_edge = AsyncMock(return_value=False)  # empty graph
+
+    # The handler imports MCP_INSIGHT_CARDS_ENABLED from config, which reads
+    # the environment once at import, so patch the value, not the env var.
+    with patch("mcp_memory_service.config.MCP_INSIGHT_CARDS_ENABLED", True), \
+         patch("mcp_memory_service.server.handlers.graph.get_graph_storage",
+               AsyncMock(return_value=graph)), \
+         patch("mcp_memory_service.consolidation.insights.InsightGenerator.generate_insights",
+               return_value=[card]):
+        result = await handle_maintain(server, {"dry_run": False})
+
+    report = json.loads(result[0].text)
+    assert report["steps"]["insights"].get("stored") == 1, report["steps"]["insights"]
+    sources = sorted(c.kwargs["source_hash"] for c in graph.store_association.await_args_list
+                     if c.kwargs.get("relationship_type") == "derived_from")
+    assert sources == ["s1", "s2"]

@@ -1,0 +1,46 @@
+<!doctype html>
+<meta charset="utf-8">
+<div id="log"></div>
+<script type="module">
+const log = (...a) => { console.log(...a); document.getElementById('log').textContent += a.join(' ') + '\n'; };
+try {
+  const sqlite3InitModule = (await import('./node_modules/sqlite-vec-wasm-demo/sqlite3.mjs')).default;
+  // WORKAROUND: sqlite-vec-wasm-demo 0.1.9 bundles a sqlite3 WASM whose post-js runs after
+  // Emscripten runtime init in modern browsers -> abort on Module.postRun assignment.
+  // Pre-seeding postRun as an own property skips both the abort trap and the reassignment;
+  // the sqlite3 bootstrap callback lands in our array and we invoke it manually if needed.
+  // In modern Emscripten MODULARIZE builds the internal Module IS the moduleArg we pass,
+  // so a push-interceptor can run the sqlite3 bootstrap immediately (runtime is already up).
+  const cfg = {};
+  cfg.postRun = Object.assign([], { push(fn) { fn(cfg); } });
+  // No heap views are exported in this build; assertion getters abort on access.
+  // Capture wasm memory via the supported instantiateWasm hook, then pre-seed own-property
+  // lazy getters for every heap view (fresh view per access also survives memory growth).
+  let mem;
+  cfg.instantiateWasm = (imports, cb) => {
+    WebAssembly.instantiateStreaming(
+      fetch('./node_modules/sqlite-vec-wasm-demo/sqlite3.wasm'), imports
+    ).then(({ instance, module }) => {
+      mem = instance.exports.memory || imports.env?.memory;
+      log('[shim] memory source:', instance.exports.memory ? 'exports' : (imports.env?.memory ? 'imports.env' : 'MISSING'));
+      cb(instance, module);
+    });
+    return {};
+  };
+  const views = { HEAP8: Int8Array, HEAPU8: Uint8Array, HEAP16: Int16Array, HEAPU16: Uint16Array,
+    HEAP32: Int32Array, HEAPU32: Uint32Array, HEAPF32: Float32Array, HEAPF64: Float64Array,
+    HEAP64: BigInt64Array, HEAPU64: BigUint64Array };
+  for (const [name, T] of Object.entries(views))
+    Object.defineProperty(cfg, name, { configurable: true, get: () => new T(mem.buffer) });
+  const sqlite3 = await sqlite3InitModule(cfg);
+  log('typeof sqlite3:', typeof sqlite3, 'oo1:', typeof sqlite3?.oo1);
+  const db = new sqlite3.oo1.DB(':memory:');
+  log('sqlite', sqlite3.version.libVersion, 'vec', db.selectValue('select vec_version()'));
+  db.exec('create virtual table t using vec0(embedding float[4])');
+  db.exec({ sql: 'insert into t(rowid, embedding) values (?, ?)', bind: [1, JSON.stringify([1, 0, 0, 0])] });
+  db.exec({ sql: 'insert into t(rowid, embedding) values (?, ?)', bind: [2, JSON.stringify([0, 1, 0, 0])] });
+  const rows = db.selectArrays('select rowid, distance from t where embedding match ? order by distance limit 2', [JSON.stringify([0.9, 0.1, 0, 0])]);
+  log('knn:', JSON.stringify(rows));
+  log(rows[0][0] === 1 ? 'SELFTEST-PASS' : 'SELFTEST-FAIL');
+} catch (e) { log('FATAL', e.message); }
+</script>

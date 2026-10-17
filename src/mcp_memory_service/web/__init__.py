@@ -23,3 +23,10 @@ try:
     from .. import __version__
 except (ImportError, AttributeError):
     __version__ = "0.0.0.dev0"
+
+# Installed here rather than in app.py's lifespan so it is in place no matter
+# how the server is started, and before the first request is ever logged. See
+# log_redaction.install() for why the ordering works out for both launchers.
+from .log_redaction import install as _install_log_redaction
+
+_install_log_redaction()

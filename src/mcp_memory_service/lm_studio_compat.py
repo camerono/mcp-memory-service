@@ -10,6 +10,8 @@ import sys
 import platform
 from typing import Any, Union
 
+from .compat import _sanitize_log_value
+
 logger = logging.getLogger(__name__)
 
 def add_windows_timeout_handling():
@@ -21,8 +23,7 @@ def add_windows_timeout_handling():
     
     try:
         # Add better timeout handling for Windows
-        import signal
-        import asyncio
+        import signal  # inline import: only reached on Windows, and only when this handler is installed
         
         def timeout_handler(signum, frame):
             logger.warning("Server received timeout signal - attempting graceful shutdown")
@@ -38,7 +39,7 @@ def add_windows_timeout_handling():
         logger.info("Added Windows-specific timeout handling")
         
     except Exception as e:
-        logger.debug(f"Could not set up Windows timeout handling: {e}")
+        logger.debug(f"Could not set up Windows timeout handling: {_sanitize_log_value(e)}")
         # Not critical, continue without it
 
 def create_cancelled_notification_class():
@@ -70,7 +71,7 @@ def patch_mcp_for_lm_studio():
     success = False
     
     try:
-        import mcp.shared.session as session_module
+        import mcp.shared.session as session_module  # inline import: guarded by the surrounding try/except ImportError, which falls back to patch_alternative_approach()
         from pydantic_core import ValidationError
         
         # Create or get the CancelledNotification class
@@ -103,13 +104,13 @@ def patch_mcp_for_lm_studio():
             @classmethod
             def patched_validate(cls, obj, *args, **kwargs):
                 """Enhanced validation that handles cancelled notifications."""
-                logger.debug(f"Patched validate called with: {type(obj)} - {obj}")
+                logger.debug(f"Patched validate called with: {type(obj)} - {_sanitize_log_value(obj)}")
                 
                 if isinstance(obj, dict):
                     method = obj.get('method', '')
                     if method == 'notifications/cancelled':
                         params = obj.get('params', {})
-                        logger.info(f"[PATCH] PATCH INTERCEPTED cancelled notification: {params.get('reason', 'Unknown')}")
+                        logger.info(f"[PATCH] PATCH INTERCEPTED cancelled notification: {_sanitize_log_value(params.get('reason', 'Unknown'))}")
                         # Return a proper CancelledNotification instance with structured params
                         notification = CancelledNotification()
                         if params:
@@ -137,26 +138,19 @@ def patch_mcp_for_lm_studio():
             logger.info("[PATCH] Applied NEW LM Studio patch to ClientNotification.model_validate v2.0")
             success = True
         
-        # Patch 2: Patch BaseSession to handle errors at the session level
+        # There used to be a second patch here, wrapping
+        # BaseSession._handle_notification. That method no longer exists in the
+        # MCP SDK and has not for some time -- it was already absent at 1.27.1,
+        # so its removal is not fallout from the 1.29.0 bump. Guarded by
+        # hasattr, the branch simply stopped running and said nothing, which is
+        # why nobody noticed. Patch 3 below covers the same failure at the
+        # receive loop, so behaviour is unchanged by dropping it.
+        #
+        # test_handle_notification_is_still_absent() is the canary: if a future
+        # SDK reintroduces the method, that test fails and the decision to
+        # patch it again becomes a deliberate one.
         from mcp.shared.session import BaseSession
-        
-        if hasattr(BaseSession, '_handle_notification'):
-            original_handle = BaseSession._handle_notification
-            
-            async def patched_handle_notification(self, notification):
-                """Handle notifications including cancelled ones."""
-                # Check if this is a CancelledNotification
-                if hasattr(notification, 'method') and notification.method == 'notifications/cancelled':
-                    logger.info("Handling cancelled notification - ignoring")
-                    return None  # Just ignore it
 
-                # Otherwise handle normally
-                return await original_handle(self, notification)
-            
-            BaseSession._handle_notification = patched_handle_notification
-            logger.info("[PATCH] Applied NEW patch to BaseSession._handle_notification v2.0")
-            success = True
-        
         # Patch 3: As a last resort, patch the session's _receive_loop
         if hasattr(BaseSession, '_receive_loop'):
             original_loop = BaseSession._receive_loop
@@ -182,10 +176,10 @@ def patch_mcp_for_lm_studio():
             success = True
         
     except ImportError as e:
-        logger.warning(f"Could not import MCP modules: {e}")
+        logger.warning(f"Could not import MCP modules: {_sanitize_log_value(e)}")
         return patch_alternative_approach()
     except Exception as e:
-        logger.error(f"Error applying LM Studio compatibility patch: {e}")
+        logger.error(f"Error applying LM Studio compatibility patch: {_sanitize_log_value(e)}")
     
     if not success:
         logger.warning("Primary patching failed, trying alternative approach")
@@ -200,7 +194,7 @@ def patch_alternative_approach():
     """
     try:
         # Try to patch pydantic validation directly
-        import pydantic_core
+        import pydantic_core  # inline import: optional at this point, the caller falls back if it is missing
         from pydantic_core import ValidationError
         
         original_validation_error = ValidationError.__init__
@@ -222,5 +216,5 @@ def patch_alternative_approach():
         return True
         
     except Exception as e:
-        logger.error(f"Alternative patch failed: {e}")
+        logger.error(f"Alternative patch failed: {_sanitize_log_value(e)}")
         return False

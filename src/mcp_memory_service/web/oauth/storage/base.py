@@ -18,9 +18,40 @@ Abstract base class for OAuth 2.1 storage backends.
 Defines the interface that all OAuth storage implementations must follow.
 """
 
+import hashlib
+import secrets
 from abc import ABC, abstractmethod
 from typing import Dict, Optional
 from ..models import RegisteredClient
+
+_SECRET_HASH_PREFIX = "sha256$"
+
+
+def hash_client_secret(secret: str) -> str:
+    """Hash a client secret for storage at rest (SHA-256, prefixed)."""
+    digest = hashlib.sha256(secret.encode("utf-8")).hexdigest()
+    return f"{_SECRET_HASH_PREFIX}{digest}"
+
+
+def is_hashed_secret(stored: str) -> bool:
+    """Return True if ``stored`` is already a hashed secret (vs legacy plaintext)."""
+    return isinstance(stored, str) and stored.startswith(_SECRET_HASH_PREFIX)
+
+
+def verify_client_secret(stored: str, provided: str) -> bool:
+    """
+    Constant-time check of ``provided`` against a ``stored`` client secret.
+
+    Handles both hashed values and legacy plaintext rows written before secrets
+    were hashed at rest. Callers should upgrade legacy rows on a successful
+    match (see ``authenticate_client`` implementations).
+    """
+    if not stored or not provided:
+        return False
+    if is_hashed_secret(stored):
+        return secrets.compare_digest(hash_client_secret(provided), stored)
+    # Legacy plaintext row — compare in constant time, caller upgrades on match.
+    return secrets.compare_digest(provided, stored)
 
 
 class OAuthStorage(ABC):

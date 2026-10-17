@@ -9,6 +9,8 @@ import logging
 import os
 from typing import Tuple, Optional
 
+from .compat import _sanitize_log_value
+
 logger = logging.getLogger(__name__)
 
 def detect_mcp_client_simple():
@@ -20,7 +22,7 @@ def detect_mcp_client_simple():
         if os.getenv('CLAUDE_DESKTOP'):
             return 'claude_desktop'
             
-        import psutil
+        import psutil  # inline import: optional dependency, the caller degrades when it is absent
         current_process = psutil.Process()
         parent = current_process.parent()
         
@@ -42,7 +44,7 @@ def check_torch_installed() -> Tuple[bool, Optional[str]]:
     Returns (is_installed, version_string)
     """
     try:
-        import torch
+        import torch  # inline import: presence of this package is exactly what is being probed
         # Check if torch has __version__ attribute (it should)
         version = getattr(torch, '__version__', 'unknown')
         # Also verify torch is functional
@@ -60,7 +62,7 @@ def check_sentence_transformers_installed() -> Tuple[bool, Optional[str]]:
     Returns (is_installed, version_string)
     """
     try:
-        import sentence_transformers
+        import sentence_transformers  # inline import: presence of this package is exactly what is being probed
         return True, sentence_transformers.__version__
     except ImportError:
         return False, None
@@ -77,14 +79,14 @@ def check_critical_dependencies() -> Tuple[bool, list]:
     if not torch_installed:
         missing.append("torch")
     else:
-        logger.debug(f"PyTorch {torch_version} is installed")
+        logger.debug(f"PyTorch {_sanitize_log_value(torch_version)} is installed")
     
     # Check sentence-transformers
     st_installed, st_version = check_sentence_transformers_installed()
     if not st_installed:
         missing.append("sentence-transformers")
     else:
-        logger.debug(f"sentence-transformers {st_version} is installed")
+        logger.debug(f"sentence-transformers {_sanitize_log_value(st_version)} is installed")
     
     # Check other critical packages
     critical_packages = [
@@ -98,7 +100,7 @@ def check_critical_dependencies() -> Tuple[bool, list]:
     for package in critical_packages:
         try:
             __import__(package.replace("-", "_"))
-            logger.debug(f"{package} is installed")
+            logger.debug(f"{_sanitize_log_value(package)} is installed")
         except ImportError:
             missing.append(package)
     
@@ -122,23 +124,31 @@ def run_dependency_check() -> bool:
     Run the dependency check and provide user feedback.
     Returns True if all dependencies are satisfied, False otherwise.
     """
-    client_type = detect_mcp_client_simple()
     all_installed, missing = check_critical_dependencies()
-    
-    # Only show output for LM Studio to avoid JSON parsing errors in Claude Desktop
-    if client_type == 'lm_studio':
-        print("\n=== MCP Memory Service Dependency Check ===", file=sys.stdout, flush=True)
-        
-        if all_installed:
-            print("[OK] All dependencies are installed", file=sys.stdout, flush=True)
-        else:
-            print(f"[MISSING] Missing dependencies detected: {', '.join(missing)}", file=sys.stdout, flush=True)
-            print("\n[WARNING] IMPORTANT: Missing dependencies will cause timeouts!", file=sys.stdout, flush=True)
-            print("[INSTALL] To install missing dependencies, run:", file=sys.stdout, flush=True)
-            print(f"   {suggest_installation_command(missing)}", file=sys.stdout, flush=True)
-            print("\nThe server will attempt to continue, but may timeout during initialization.", file=sys.stdout, flush=True)
-            print("============================================\n", file=sys.stdout, flush=True)
-    
+
+    # stderr, not stdout. On a stdio MCP server stdout IS the JSON-RPC channel,
+    # so anything human-readable written there corrupts the protocol stream.
+    #
+    # This used to be `if client_type == 'lm_studio'`, with a comment about
+    # avoiding JSON parsing errors in Claude Desktop. The diagnosis was right
+    # and the remedy was not: LM Studio speaks stdio too, so restricting the
+    # output to that client moved the corruption rather than removing it.
+    # Driving the server over stdio with a single initialize request put seven
+    # non-JSON lines ahead of the response (issue #275). On stderr the output
+    # is safe for every client, which is why there is no longer a guard --
+    # every client now gets the warning instead of only the broken one.
+    print("\n=== MCP Memory Service Dependency Check ===", file=sys.stderr, flush=True)  # debug: startup diagnostic, stderr keeps it off the JSON-RPC channel
+
+    if all_installed:
+        print("[OK] All dependencies are installed", file=sys.stderr, flush=True)  # debug: startup diagnostic on stderr
+    else:
+        print(f"[MISSING] Missing dependencies detected: {', '.join(missing)}", file=sys.stderr, flush=True)  # debug: startup diagnostic on stderr
+        print("\n[WARNING] IMPORTANT: Missing dependencies will cause timeouts!", file=sys.stderr, flush=True)  # debug: startup diagnostic on stderr
+        print("[INSTALL] To install missing dependencies, run:", file=sys.stderr, flush=True)  # debug: startup diagnostic on stderr
+        print(f"   {suggest_installation_command(missing)}", file=sys.stderr, flush=True)  # debug: startup diagnostic on stderr
+        print("\n[WARNING] The server will attempt to continue, but may timeout during initialization.", file=sys.stderr, flush=True)  # debug: startup diagnostic on stderr
+        print("============================================\n", file=sys.stderr, flush=True)  # debug: startup diagnostic on stderr
+
     return all_installed
 
 def is_first_run() -> bool:
@@ -192,7 +202,7 @@ def is_first_run() -> bool:
                         'sentence-transformers', 'miniml', 'all-miniml', 
                         'paraphrase', 'distilbert', 'mpnet', 'roberta'
                     ]):
-                        logger.debug(f"Found cached model in {path}: {item}")
+                        logger.debug(f"Found cached model in {_sanitize_log_value(path)}: {_sanitize_log_value(item)}")
                         return False
                         
                 # Also check for any model directories
@@ -203,13 +213,13 @@ def is_first_run() -> bool:
                             sub_contents = os.listdir(item_path)
                             # Look for model files
                             if any(f.endswith(('.bin', '.safetensors', '.json')) for f in sub_contents):
-                                logger.debug(f"Found model files in {item_path}")
+                                logger.debug(f"Found model files in {_sanitize_log_value(item_path)}")
                                 return False
                         except (OSError, PermissionError):
                             continue
                             
             except (OSError, PermissionError):
-                logger.debug(f"Could not access cache directory: {path}")
+                logger.debug(f"Could not access cache directory: {_sanitize_log_value(path)}")
                 continue
     
     logger.debug("No cached sentence-transformers models found - this appears to be first run")
@@ -231,11 +241,11 @@ def get_recommended_timeout() -> float:
         try:
             override = float(env_timeout)
             if override > 0:
-                logger.info(f"Using MCP_INIT_TIMEOUT override: {override}s")
+                logger.info(f"Using MCP_INIT_TIMEOUT override: {_sanitize_log_value(override)}s")
                 return override
-            logger.warning(f"MCP_INIT_TIMEOUT must be a positive number, got '{env_timeout}'. Using automatic detection.")
+            logger.warning(f"MCP_INIT_TIMEOUT must be a positive number, got '{_sanitize_log_value(env_timeout)}'. Using automatic detection.")
         except ValueError:
-            logger.warning(f"Invalid MCP_INIT_TIMEOUT value '{env_timeout}', using automatic detection")
+            logger.warning(f"Invalid MCP_INIT_TIMEOUT value '{_sanitize_log_value(env_timeout)}', using automatic detection")
 
     # Check if dependencies are missing
     all_installed, missing = check_critical_dependencies()
@@ -249,12 +259,12 @@ def get_recommended_timeout() -> float:
     # Extend timeout if dependencies are missing
     if not all_installed:
         timeout *= 2  # Double the timeout
-        logger.warning(f"Dependencies missing, extending base timeout to {timeout}s (before client cap)")
+        logger.warning(f"Dependencies missing, extending base timeout to {_sanitize_log_value(timeout)}s (before client cap)")
 
     # Extend timeout if it's first run
     if first_run:
         timeout *= 2  # Double the timeout
-        logger.warning(f"First run detected, extending base timeout to {timeout}s (before client cap)")
+        logger.warning(f"First run detected, extending base timeout to {_sanitize_log_value(timeout)}s (before client cap)")
 
     # Strict stdio clients often have small handshake budgets.
     # Keep eager init conservative and rely on lazy-load fallback.

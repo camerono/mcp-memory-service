@@ -220,6 +220,92 @@ class TestHarvestClassifier:
         assert result.keep is True
 
 
+PROVIDER_ENV = {
+    "HARVEST_LLM_PROVIDERS": "local",
+    "HARVEST_LLM_LOCAL_BASE_URL": "http://localhost:11434/v1",
+    "HARVEST_LLM_LOCAL_MODEL": "qwen2.5-coder",
+    "HARVEST_LLM_LOCAL_API_KEY": "",
+    "GROQ_API_KEY": "",
+}
+
+NO_PROVIDER_ENV = {
+    "HARVEST_LLM_PROVIDERS": "",
+    "HARVEST_LLM_PROVIDER": "",
+    "GROQ_API_KEY": "",
+}
+
+
+def _classifier_without_groq_key():
+    """A classifier that has no Groq credentials of its own."""
+    c = HarvestClassifier(groq_api_key=None)
+    c._api_key = None
+    return c
+
+
+class TestClassifierProviderChain:
+    """The classifier must honor HARVEST_LLM_PROVIDERS, not only GROQ_API_KEY (#178)."""
+
+    def test_provider_chain_without_groq_key_is_usable(self):
+        """This is the #178 bug: a configured non-Groq endpoint used to be ignored."""
+        with patch.dict("os.environ", PROVIDER_ENV, clear=False):
+            c = _classifier_without_groq_key()
+            assert c._ensure_initialized() is True
+            assert [p.name for p in c._providers] == ["local"]
+
+    def test_no_providers_and_no_key_stays_unavailable(self):
+        with patch.dict("os.environ", NO_PROVIDER_ENV, clear=False):
+            c = _classifier_without_groq_key()
+            assert c._ensure_initialized() is False
+
+    def test_keyless_groq_entry_does_not_count_as_configured(self):
+        """The legacy path synthesizes a Groq provider even with no key; it must not qualify."""
+        with patch.dict("os.environ", {"HARVEST_LLM_PROVIDERS": "", "GROQ_API_KEY": ""}, clear=False):
+            c = _classifier_without_groq_key()
+            assert c._ensure_initialized() is False
+            assert c._providers == []
+
+    def test_classification_goes_through_the_provider_endpoint(self):
+        """A configured chain classifies without ever touching the Groq bridge."""
+        with patch.dict("os.environ", PROVIDER_ENV, clear=False):
+            c = _classifier_without_groq_key()
+            assert c._ensure_initialized() is True
+            with patch.object(
+                c, "_call_openai_compatible",
+                return_value=json.dumps({"keep": False, "reason": "conversation noise", "confidence": 0.2}),
+            ) as mock_call:
+                candidate = HarvestCandidate(
+                    content="let me check the tests", memory_type="context", confidence=0.6, tags=[]
+                )
+                result = c._classify_single(candidate, "context")
+
+        assert result.keep is False
+        assert mock_call.call_count == 1
+        assert mock_call.call_args[0][0] == "http://localhost:11434/v1"
+        assert c._groq_bridge is None
+
+    def test_provider_failure_falls_through_to_the_next_one(self):
+        env = dict(PROVIDER_ENV)
+        env.update({
+            "HARVEST_LLM_PROVIDERS": "broken,local",
+            "HARVEST_LLM_BROKEN_BASE_URL": "http://127.0.0.1:9/v1",
+            "HARVEST_LLM_BROKEN_MODEL": "nope",
+        })
+        with patch.dict("os.environ", env, clear=False):
+            c = _classifier_without_groq_key()
+            assert c._ensure_initialized() is True
+            assert [p.name for p in c._providers] == ["broken", "local"]
+
+            with patch.object(
+                c, "_call_openai_compatible",
+                side_effect=[Exception("connection refused"), json.dumps({"keep": True, "reason": "ok", "confidence": 0.9})],
+            ) as mock_call:
+                candidate = HarvestCandidate(content="test", memory_type="decision", confidence=0.7, tags=[])
+                result = c._classify_single(candidate, "context")
+
+        assert result.keep is True
+        assert mock_call.call_count == 2
+
+
 class TestHarvesterLLMIntegration:
     """Test harvester integration with LLM classifier."""
 
@@ -255,6 +341,11 @@ class TestHarvesterLLMIntegration:
             )
         ]
         harvester._classifier = mock_classifier
+        # Force the legacy classifier path: harvest() prefers the LLM rewriter
+        # whenever a provider key is configured (e.g. GROQ_API_KEY in a local
+        # .env), which would bypass the classifier this test asserts on. Pin the
+        # rewriter off so the test is hermetic regardless of ambient env.
+        harvester._rewriter = None
 
         results = harvester.harvest(config)
         assert len(results) == 1

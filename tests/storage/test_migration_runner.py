@@ -1,230 +1,70 @@
 """Unit tests for MigrationRunner.
 
-Tests the SQL migration execution utility for both synchronous and
-asynchronous database connections.
+Tests the versioned SQL migration runner with registry tracking.
 """
 
 import sqlite3
 from pathlib import Path
 
-import aiosqlite
 import pytest
 
 from mcp_memory_service.storage.migration_runner import MigrationRunner
 
 
+@pytest.fixture
+def setup_migrations(tmp_path):
+    """Create a migrations directory with test files and a DB connection."""
+    migrations_dir = tmp_path / "migrations"
+    migrations_dir.mkdir()
+
+    (migrations_dir / "001_first.sql").write_text(
+        "CREATE TABLE IF NOT EXISTS first_table (id INTEGER PRIMARY KEY);"
+    )
+    (migrations_dir / "002_second.sql").write_text(
+        "CREATE TABLE IF NOT EXISTS second_table (id INTEGER);"
+    )
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    return migrations_dir, conn
+
+
 @pytest.mark.unit
-def test_migration_runner_sync_executes_sql_files(tmp_path):
-    """Test that migration runner executes SQL files synchronously."""
-    # Setup: Create test migration file
-    migrations_dir = tmp_path / "migrations"
-    migrations_dir.mkdir()
+def test_migration_runner_sync_executes_sql_files(setup_migrations):
+    """Test that migration runner executes SQL files."""
+    migrations_dir, conn = setup_migrations
 
-    test_migration = migrations_dir / "001_test.sql"
-    test_migration.write_text(
-        "CREATE TABLE IF NOT EXISTS test_table (id INTEGER PRIMARY KEY);"
-    )
-
-    # Create test database
-    db_path = tmp_path / "test.db"
-
-    # Execute migration using sync connection
-    conn = sqlite3.connect(db_path)
-    try:
-        runner = MigrationRunner(migrations_dir)
-        success, message = runner.run_migrations_sync(conn, ["001_test.sql"])
-
-        # Verify success
-        assert success
-        assert "Successfully executed 1 migrations" in message
-
-        # Verify table was created
-        cursor = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='test_table'"
-        )
-        result = cursor.fetchone()
-        assert result is not None
-        assert result[0] == "test_table"
-    finally:
-        conn.close()
-
-
-@pytest.mark.asyncio
-async def test_migration_runner_async_executes_sql_files(tmp_path):
-    """Test that migration runner executes SQL files asynchronously."""
-    # Setup: Create test migration file
-    migrations_dir = tmp_path / "migrations"
-    migrations_dir.mkdir()
-
-    test_migration = migrations_dir / "001_test.sql"
-    test_migration.write_text(
-        "CREATE TABLE IF NOT EXISTS test_table (id INTEGER PRIMARY KEY);"
-    )
-
-    # Create test database
-    db_path = tmp_path / "test.db"
-
-    # Execute migration
     runner = MigrationRunner(migrations_dir)
-    success, message = await runner.run_migrations_async(str(db_path), ["001_test.sql"])
+    result = runner.run_pending(conn)
 
-    # Verify success
-    assert success
-    assert "Successfully executed 1 migrations" in message
+    assert result["error"] is None
+    assert len(result["applied"]) == 2
 
     # Verify table was created
-    async with aiosqlite.connect(db_path) as conn:
-        cursor = await conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='test_table'"
-        )
-        result = await cursor.fetchone()
-        assert result is not None
-        assert result[0] == "test_table"
+    cursor = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='first_table'"
+    )
+    assert cursor.fetchone() is not None
 
 
 @pytest.mark.unit
-def test_migration_runner_sync_multiple_files(tmp_path):
+def test_migration_runner_sync_multiple_files(setup_migrations):
     """Test that migration runner executes multiple files in order."""
-    # Setup: Create multiple migration files
-    migrations_dir = tmp_path / "migrations"
-    migrations_dir.mkdir()
+    migrations_dir, conn = setup_migrations
 
-    # Create migrations in non-sorted order to test sorting
-    (migrations_dir / "002_second.sql").write_text(
-        "CREATE TABLE IF NOT EXISTS second_table (id INTEGER);"
-    )
-    (migrations_dir / "001_first.sql").write_text(
-        "CREATE TABLE IF NOT EXISTS first_table (id INTEGER);"
-    )
-
-    # Create test database
-    db_path = tmp_path / "test.db"
-
-    # Execute migrations (should be sorted automatically)
-    conn = sqlite3.connect(db_path)
-    try:
-        runner = MigrationRunner(migrations_dir)
-        success, message = runner.run_migrations_sync(
-            conn, ["002_second.sql", "001_first.sql"]
-        )
-
-        # Verify success
-        assert success
-        assert "Successfully executed 2 migrations" in message
-
-        # Verify both tables were created
-        cursor = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
-        )
-        results = cursor.fetchall()
-        table_names = [row[0] for row in results]
-        assert "first_table" in table_names
-        assert "second_table" in table_names
-    finally:
-        conn.close()
-
-
-@pytest.mark.asyncio
-async def test_migration_runner_async_multiple_files(tmp_path):
-    """Test that migration runner executes multiple files in order asynchronously."""
-    # Setup: Create multiple migration files
-    migrations_dir = tmp_path / "migrations"
-    migrations_dir.mkdir()
-
-    (migrations_dir / "002_second.sql").write_text(
-        "CREATE TABLE IF NOT EXISTS second_table (id INTEGER);"
-    )
-    (migrations_dir / "001_first.sql").write_text(
-        "CREATE TABLE IF NOT EXISTS first_table (id INTEGER);"
-    )
-
-    # Create test database
-    db_path = tmp_path / "test.db"
-
-    # Execute migrations
     runner = MigrationRunner(migrations_dir)
-    success, message = await runner.run_migrations_async(
-        str(db_path), ["002_second.sql", "001_first.sql"]
-    )
+    result = runner.run_pending(conn)
 
-    # Verify success
-    assert success
-    assert "Successfully executed 2 migrations" in message
+    assert result["error"] is None
+    assert len(result["applied"]) == 2
 
     # Verify both tables were created
-    async with aiosqlite.connect(db_path) as conn:
-        cursor = await conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
-        )
-        results = await cursor.fetchall()
-        table_names = [row[0] for row in results]
-        assert "first_table" in table_names
-        assert "second_table" in table_names
-
-
-@pytest.mark.unit
-def test_migration_runner_sync_missing_file(tmp_path):
-    """Test that migration runner handles missing files gracefully."""
-    migrations_dir = tmp_path / "migrations"
-    migrations_dir.mkdir()
-
-    # Create only one migration file
-    (migrations_dir / "001_exists.sql").write_text(
-        "CREATE TABLE IF NOT EXISTS exists_table (id INTEGER);"
+    cursor = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
     )
-
-    # Try to run with a missing file
-    db_path = tmp_path / "test.db"
-    conn = sqlite3.connect(db_path)
-    try:
-        runner = MigrationRunner(migrations_dir)
-        success, message = runner.run_migrations_sync(
-            conn, ["001_exists.sql", "999_missing.sql"]
-        )
-
-        # Should succeed but skip missing file
-        assert success
-        assert "Successfully executed 1 migrations" in message
-
-        # Verify existing table was created
-        cursor = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='exists_table'"
-        )
-        result = cursor.fetchone()
-        assert result is not None
-    finally:
-        conn.close()
-
-
-@pytest.mark.asyncio
-async def test_migration_runner_async_missing_file(tmp_path):
-    """Test that migration runner handles missing files gracefully (async)."""
-    migrations_dir = tmp_path / "migrations"
-    migrations_dir.mkdir()
-
-    # Create only one migration file
-    (migrations_dir / "001_exists.sql").write_text(
-        "CREATE TABLE IF NOT EXISTS exists_table (id INTEGER);"
-    )
-
-    # Try to run with a missing file
-    db_path = tmp_path / "test.db"
-    runner = MigrationRunner(migrations_dir)
-    success, message = await runner.run_migrations_async(
-        str(db_path), ["001_exists.sql", "999_missing.sql"]
-    )
-
-    # Should succeed but skip missing file
-    assert success
-    assert "Successfully executed 1 migrations" in message
-
-    # Verify existing table was created
-    async with aiosqlite.connect(db_path) as conn:
-        cursor = await conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='exists_table'"
-        )
-        result = await cursor.fetchone()
-        assert result is not None
+    table_names = [row[0] for row in cursor.fetchall()]
+    assert "first_table" in table_names
+    assert "second_table" in table_names
 
 
 @pytest.mark.unit
@@ -232,109 +72,90 @@ def test_migration_runner_sync_invalid_sql(tmp_path):
     """Test that migration runner handles invalid SQL gracefully."""
     migrations_dir = tmp_path / "migrations"
     migrations_dir.mkdir()
-
-    # Create migration with invalid SQL
     (migrations_dir / "001_invalid.sql").write_text("INVALID SQL STATEMENT;")
 
-    db_path = tmp_path / "test.db"
-    conn = sqlite3.connect(db_path)
-    try:
-        runner = MigrationRunner(migrations_dir)
-        success, message = runner.run_migrations_sync(conn, ["001_invalid.sql"])
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
 
-        # Should fail
-        assert not success
-        assert "Migration error" in message
-    finally:
-        conn.close()
-
-
-@pytest.mark.asyncio
-async def test_migration_runner_async_invalid_sql(tmp_path):
-    """Test that migration runner handles invalid SQL gracefully (async)."""
-    migrations_dir = tmp_path / "migrations"
-    migrations_dir.mkdir()
-
-    # Create migration with invalid SQL
-    (migrations_dir / "001_invalid.sql").write_text("INVALID SQL STATEMENT;")
-
-    db_path = tmp_path / "test.db"
     runner = MigrationRunner(migrations_dir)
-    success, message = await runner.run_migrations_async(str(db_path), ["001_invalid.sql"])
+    result = runner.run_pending(conn)
 
-    # Should fail
-    assert not success
-    assert "Migration error" in message
+    assert result["error"] is not None
 
 
 @pytest.mark.unit
-def test_migration_runner_sync_idempotent(tmp_path):
+def test_migration_runner_sync_idempotent(setup_migrations):
     """Test that migrations are idempotent (can run multiple times)."""
-    migrations_dir = tmp_path / "migrations"
-    migrations_dir.mkdir()
+    migrations_dir, conn = setup_migrations
 
-    # Create idempotent migration with IF NOT EXISTS
-    (migrations_dir / "001_idempotent.sql").write_text(
-        "CREATE TABLE IF NOT EXISTS idempotent_table (id INTEGER PRIMARY KEY);"
-    )
-
-    db_path = tmp_path / "test.db"
-    conn = sqlite3.connect(db_path)
-    try:
-        runner = MigrationRunner(migrations_dir)
-
-        # Run migration first time
-        success1, message1 = runner.run_migrations_sync(conn, ["001_idempotent.sql"])
-        assert success1
-        assert "Successfully executed 1 migrations" in message1
-
-        # Run migration second time (should not fail)
-        success2, message2 = runner.run_migrations_sync(conn, ["001_idempotent.sql"])
-        assert success2
-        assert "Successfully executed 1 migrations" in message2
-
-        # Verify table exists
-        cursor = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='idempotent_table'"
-        )
-        result = cursor.fetchone()
-        assert result is not None
-    finally:
-        conn.close()
-
-
-@pytest.mark.asyncio
-async def test_migration_runner_async_idempotent(tmp_path):
-    """Test that migrations are idempotent (can run multiple times) async."""
-    migrations_dir = tmp_path / "migrations"
-    migrations_dir.mkdir()
-
-    # Create idempotent migration with IF NOT EXISTS
-    (migrations_dir / "001_idempotent.sql").write_text(
-        "CREATE TABLE IF NOT EXISTS idempotent_table (id INTEGER PRIMARY KEY);"
-    )
-
-    db_path = tmp_path / "test.db"
     runner = MigrationRunner(migrations_dir)
 
-    # Run migration first time
-    success1, message1 = await runner.run_migrations_async(
-        str(db_path), ["001_idempotent.sql"]
-    )
-    assert success1
-    assert "Successfully executed 1 migrations" in message1
+    # Run first time
+    result1 = runner.run_pending(conn)
+    assert result1["error"] is None
+    assert len(result1["applied"]) == 2
 
-    # Run migration second time (should not fail)
-    success2, message2 = await runner.run_migrations_async(
-        str(db_path), ["001_idempotent.sql"]
-    )
-    assert success2
-    assert "Successfully executed 1 migrations" in message2
+    # Run second time (should skip all)
+    result2 = runner.run_pending(conn)
+    assert result2["error"] is None
+    assert len(result2["applied"]) == 0
+    assert len(result2["skipped"]) == 2
 
-    # Verify table exists
-    async with aiosqlite.connect(db_path) as conn:
-        cursor = await conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='idempotent_table'"
-        )
-        result = await cursor.fetchone()
-        assert result is not None
+
+@pytest.mark.unit
+def test_stamp_baseline_recovers_v16_after_partial_rollback(tmp_path):
+    """Greptile P3: a partial rollback that keeps v15 registered but removes the v16
+    registry row (while retaining the hlc columns) must NOT make the next upgrade re-run
+    the unconditional ADD COLUMN and fail with duplicate-column.
+
+    _stamp_baseline must probe versions ABSENT from the registry (not early-return just
+    because the registry is non-empty), so it detects the retained hlc_physical column and
+    stamps v16 as applied, letting run_pending skip the forward ADD COLUMN.
+    """
+    migrations_dir = tmp_path / "migrations"
+    migrations_dir.mkdir()
+    # Minimal stand-ins mirroring the real 015/016 shapes and their unconditional DDL.
+    (migrations_dir / "015_add_sync_events.sql").write_text(
+        "CREATE TABLE sync_events (seq INTEGER PRIMARY KEY, content_hash TEXT, agent_id TEXT, event_id TEXT);"
+    )
+    (migrations_dir / "016_add_hlc_to_sync_events.sql").write_text(
+        "ALTER TABLE sync_events ADD COLUMN hlc_physical INTEGER;\n"
+        "ALTER TABLE sync_events ADD COLUMN hlc_logical INTEGER;\n"
+        "CREATE INDEX IF NOT EXISTS idx_sync_events_hlc "
+        "ON sync_events(hlc_physical, hlc_logical, agent_id, event_id);"
+    )
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+
+    runner = MigrationRunner(migrations_dir)
+    first = runner.run_pending(conn)
+    assert first["error"] is None
+    assert {m["version"] for m in first["applied"]} == {15, 16}
+
+    # Simulate a partial manual rollback of 016 on old SQLite: drop the index + the registry
+    # row + schema_version, but keep the hlc columns (cannot DROP COLUMN before 3.35).
+    conn.execute("DROP INDEX IF EXISTS idx_sync_events_hlc")
+    conn.execute("DELETE FROM migration_registry WHERE version = 16")
+    conn.execute("UPDATE metadata SET value = '15' WHERE key = 'schema_version'")
+    conn.commit()
+    # Sanity: v15 still registered, v16 gone, column retained, index gone.
+    regd = {r[0] for r in conn.execute("SELECT version FROM migration_registry").fetchall()}
+    assert 15 in regd and 16 not in regd
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(sync_events)").fetchall()]
+    assert "hlc_physical" in cols
+    idx = conn.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_sync_events_hlc'").fetchone()
+    assert idx is None, "precondition: the index was dropped by the rollback"
+
+    # Re-upgrade must succeed: the baseline probe detects the retained column, REPAIRS the
+    # dropped index, and stamps v16 — the forward ADD COLUMN never re-runs (duplicate-column).
+    second = runner.run_pending(conn)
+    assert second["error"] is None, f"re-upgrade failed: {second['error']}"
+    regd2 = {r[0] for r in conn.execute("SELECT version FROM migration_registry").fetchall()}
+    assert 16 in regd2, "v16 must be recovered (stamped) after the partial rollback"
+    idx2 = conn.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_sync_events_hlc'").fetchone()
+    assert idx2 is not None, "v16 recovery must repair the dropped HLC index"
+    sv = conn.execute("SELECT value FROM metadata WHERE key='schema_version'").fetchone()
+    assert sv is not None and int(sv[0]) == 16, (
+        f"recovery must restore schema_version to 16, got {sv and sv[0]}"
+    )

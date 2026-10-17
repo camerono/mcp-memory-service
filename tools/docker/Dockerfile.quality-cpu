@@ -16,7 +16,7 @@
 # ---------------------------------------------------------------------------
 # Stage 1 — builder: export both quality models to ONNX
 # ---------------------------------------------------------------------------
-FROM python:3.10-slim AS builder
+FROM python:3.12-slim AS builder
 
 # Build-time networking: allow HuggingFace downloads
 ENV PYTHONUNBUFFERED=1 \
@@ -48,7 +48,7 @@ COPY src/ /build/src/
 RUN python -m uv pip install \
     "torch>=2.1.0" --extra-index-url https://download.pytorch.org/whl/cpu && \
     python -m uv pip install \
-    "transformers>=4.30,<5.0.0" \
+    "transformers>=5.5.0,<6.0.0" \
     "huggingface_hub>=0.20.0" \
     "onnx>=1.14.0" \
     "onnxscript>=0.1.0" \
@@ -79,7 +79,7 @@ RUN python /build/quantize_quality_models.py \
 # ---------------------------------------------------------------------------
 # Stage 2 — runtime: slim image with baked ONNX artifacts
 # ---------------------------------------------------------------------------
-FROM python:3.10-slim
+FROM python:3.12-slim
 
 # Environment mirrors :slim — sqlite_vec backend, ONNX quality enabled
 ENV PYTHONUNBUFFERED=1 \
@@ -87,7 +87,7 @@ ENV PYTHONUNBUFFERED=1 \
     MCP_MEMORY_USE_ONNX=1 \
     MCP_QUALITY_SYSTEM_ENABLED=true \
     MCP_QUALITY_LOCAL_MODEL=ms-marco-MiniLM-L-6-v2 \
-    MCP_MEMORY_SQLITE_PATH=/app/sqlite_db \
+    MCP_MEMORY_SQLITE_PATH=/app/sqlite_db/memory.db \
     MCP_MEMORY_BACKUPS_PATH=/app/backups \
     PYTHONPATH=/app/src \
     DOCKER_CONTAINER=1 \
@@ -137,7 +137,7 @@ COPY tools/docker/docker-entrypoint-unified.sh /usr/local/bin/
 # Hand-curated list MUST stay in sync with pyproject.toml `dependencies`
 # minus the heavy ML deps. See issue #811.
 RUN python -m uv pip install \
-    "mcp>=1.8.0,<2.0.0" \
+    "mcp>=1.9.2,<2.0.0" \
     "sqlite-vec>=0.1.0" \
     "onnxruntime>=1.15.0" \
     "tokenizers>=0.22.2" \

@@ -10,7 +10,7 @@ ARG FORCE_CPU_PYTORCH=false
 # Set environment variables
 ENV PYTHONUNBUFFERED=1 \
     MCP_MEMORY_STORAGE_BACKEND=sqlite_vec \
-    MCP_MEMORY_SQLITE_PATH=/app/sqlite_db \
+    MCP_MEMORY_SQLITE_PATH=/app/sqlite_db/memory.db \
     MCP_MEMORY_BACKUPS_PATH=/app/backups \
     PYTHONPATH=/app/src \
     DOCKER_CONTAINER=1 \
@@ -48,6 +48,12 @@ COPY run_server.py ./
 COPY scripts/utils/uv_wrapper.py ./uv_wrapper.py
 COPY scripts/utils/memory_wrapper_uv.py ./memory_wrapper_uv.py
 
+# Administrative scripts. Without these, re-embedding or repairing a database
+# means copying files into a running container by hand (#188). They import
+# src.mcp_memory_service relative to /app, so run them from WORKDIR.
+COPY scripts/maintenance/ /app/scripts/maintenance/
+COPY scripts/migration/ /app/scripts/migration/
+
 # Copy Docker entrypoint scripts
 COPY tools/docker/docker-entrypoint.sh /usr/local/bin/
 COPY tools/docker/docker-entrypoint-persistent.sh /usr/local/bin/
@@ -55,9 +61,16 @@ COPY tools/docker/docker-entrypoint-unified.sh /usr/local/bin/
 
 # Install the package with UV (configurable dependency group)
 # First install core dependencies, then add extras to ensure all dependencies are installed
-# Use CPU-only PyTorch by default to save disk space in CI/test environments
-RUN if [ "$FORCE_CPU_PYTORCH" = "true" ] || [ "$INSTALL_EXTRA" = "[sqlite]" ]; then \
-        echo "Installing CPU-only PyTorch to save disk space..."; \
+#
+# PyTorch is only installed when explicitly requested via FORCE_CPU_PYTORCH, in
+# which case the CPU wheel is used (~750 MB instead of ~2 GB for CUDA). The
+# default build (INSTALL_EXTRA="[sqlite]") used to pull it in too, but nothing
+# in that image can use it: `[sqlite]` is onnxruntime + tokenizers, embeddings
+# go through the ONNX path, and the one code path that imports torch — the ONNX
+# export in quality/onnx_ranker.py — also needs `transformers`, which only the
+# `ml` extra installs. See issue #172.
+RUN if [ "$FORCE_CPU_PYTORCH" = "true" ]; then \
+        echo "Installing CPU-only PyTorch (FORCE_CPU_PYTORCH=true)..."; \
         python -m uv pip install torch --index-url https://download.pytorch.org/whl/cpu; \
     fi && \
     echo "Installing core dependencies..." && \
@@ -66,6 +79,13 @@ RUN if [ "$FORCE_CPU_PYTORCH" = "true" ] || [ "$INSTALL_EXTRA" = "[sqlite]" ]; t
         echo "Installing optional dependencies: ${INSTALL_EXTRA}..." && \
         python -m uv pip install -e ".${INSTALL_EXTRA}"; \
     fi
+
+# Verify the ONNX embedding backend is actually usable. It needs BOTH onnxruntime
+# and tokenizers; a missing tokenizers used to slip through unnoticed and left the
+# image falling back to hash pseudo-vectors (issue #162). Fail the build early
+# instead of shipping a broken image.
+RUN echo "Verifying ONNX embedding dependencies..." && \
+    python -c "import onnxruntime, tokenizers; print('onnxruntime', onnxruntime.__version__, '/ tokenizers', tokenizers.__version__, 'available')"
 
 # Conditionally pre-download ONNX models for lightweight embedding
 RUN if [ "$SKIP_MODEL_DOWNLOAD" != "true" ]; then \

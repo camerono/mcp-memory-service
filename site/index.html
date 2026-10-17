@@ -1,0 +1,595 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Memory for AI Agents — REST, MCP, OAuth, CLI · mcp-memory-service v12.1.0</title>
+<meta name="description" content="Memory layer for AI agents. REST API + MCP + OAuth + CLI + dashboard — one self-hosted service, every transport. 14+ client integrations, knowledge graph, automatic consolidation. LongMemEval R@5 86%, session ingestion, zero cloud cost.">
+<meta property="og:title" content="MCP Memory Service v12.1.0">
+<meta property="og:description" content="Self-hosted AI memory — REST, MCP, OAuth 2.1, CLI, dashboard. Semantic search, knowledge graph, automatic consolidation. LongMemEval R@5 86%, zero cloud cost.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://mcpmemory.services/">
+<meta property="og:image" content="https://mcpmemory.services/assets/images/og-home.jpg">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Memory for AI agents: mcp-memory-service, a graph of linked memories beside the install command">
+<meta property="twitter:card" content="summary_large_image">
+<meta property="twitter:image" content="https://mcpmemory.services/assets/images/og-home.jpg">
+<meta property="twitter:title" content="MCP Memory Service — Self-Hosted AI Memory">
+<meta property="twitter:description" content="Persistent memory for AI agents — REST API, MCP, OAuth 2.1, CLI. Semantic search, knowledge graph, automatic consolidation.">
+<link rel="canonical" href="https://mcpmemory.services/">
+<link rel="icon" href="/favicon.ico" sizes="any">
+<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16.png">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="preload" href="/assets/fonts/bricolage-grotesque-latin.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="/assets/fonts/fonts.css">
+<link rel="stylesheet" href="/assets/site.css">
+<style>
+/* Hero */
+.hero{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.1fr);gap:3.5rem;align-items:center;padding-block:4.5rem}
+.hero h1{font-family:var(--display);font-weight:700;font-stretch:92%;font-size:clamp(3rem,8vw,6rem);line-height:.98;letter-spacing:-.025em;margin-bottom:1.5rem}
+.hero .sub{color:var(--band-muted);font-size:1.25rem;max-width:34ch;margin-bottom:2rem}
+.hero-links{display:flex;gap:1.5rem;margin-top:1.1rem;font-size:1rem}
+
+/* Recall console */
+.console{background:var(--console);color:var(--console-text);border:1px solid var(--console-line);border-radius:10px;box-shadow:0 24px 60px rgba(0,0,0,.45),0 0 80px rgba(25,194,218,.1);overflow:hidden;font-family:var(--mono);font-size:.9rem;line-height:1.55}
+.c-bar{display:flex;justify-content:space-between;padding:.6rem 1rem;border-bottom:1px solid var(--console-line);color:var(--console-muted);font-size:.78rem}
+.graph svg{display:block;width:100%;height:auto;border-bottom:1px solid var(--console-line)}
+.graph .e{stroke:rgba(146,166,184,.22);stroke-width:1}
+.graph .rel{stroke:var(--cyan);stroke-width:1.6;transition:stroke-dashoffset .45s ease-out}
+.graph .n .core{fill:rgba(146,166,184,.55);transform:scale(.5);transform-box:fill-box;transform-origin:center;transition:transform .3s,fill .3s}
+.graph .n .halo{fill:none;stroke:var(--cyan);opacity:0;transform:scale(.4);transform-box:fill-box;transform-origin:center;transition:transform .5s,opacity .5s}
+.graph .n.lit .core{fill:var(--cyan);transform:scale(1)}
+.graph .n.lit .halo{opacity:.45;transform:scale(1)}
+.graph .s{font:600 14px var(--mono);fill:var(--cyan)}
+.c-q{padding:1rem 1rem .8rem;min-height:3.4rem;font-size:1rem}
+.c-q .p{color:var(--cyan);margin-right:.6rem}
+.caret{display:inline-block;width:.55em;height:1.05em;margin-left:2px;background:var(--console-text);vertical-align:text-bottom;animation:blink 1s steps(1) infinite}
+@keyframes blink{50%{opacity:0}}
+.c-res{list-style:none;min-height:13.5rem}
+.c-res li{display:grid;grid-template-columns:3.2rem 1fr;gap:.9rem;padding:.8rem 1rem;border-top:1px solid var(--console-line)}
+.score{font-weight:600;color:var(--cyan)}
+.score i{display:block;height:3px;margin-top:.35rem;background:var(--console-line);border-radius:2px;position:relative}
+.score i::after{content:"";position:absolute;inset:0;width:calc(var(--s)*100%);background:var(--cyan);border-radius:2px}
+.c-res p{font-family:var(--serif);font-size:1.02rem;line-height:1.5}
+.c-res .meta{font-family:var(--mono);font-size:.74rem;color:var(--console-muted);margin-top:.2rem}
+.c-res mark{background:linear-gradient(var(--cyan),var(--cyan)) no-repeat 0 100%/0 100%;transition:background-size .5s ease-out;color:var(--console-text)}
+.c-res mark.on{background-size:100% 100%;color:#06121f}
+.c-chips{display:flex;flex-wrap:wrap;gap:.5rem;padding:.8rem 1rem;border-top:1px solid var(--console-line)}
+.c-chips button{background:none;border:1px solid var(--console-line);color:var(--console-muted);padding:.3rem .7rem;border-radius:999px;font:inherit;font-size:.76rem;cursor:pointer;text-align:left}
+.c-chips button:hover,.c-chips button[aria-pressed=true]{border-color:var(--cyan);color:var(--console-text)}
+.c-chips button:focus-visible{outline-color:var(--console-text)}
+
+/* Facts */
+.facts{display:grid;grid-template-columns:repeat(4,1fr);border-top:1px solid var(--band-line)}
+.facts div{display:flex;flex-direction:column;padding:1.8rem 1.5rem 2rem 0}
+.facts div + div{padding-left:1.5rem;border-left:1px solid var(--band-line)}
+.facts dd{font-family:var(--display);font-stretch:85%;font-weight:700;font-size:clamp(2.2rem,4.5vw,3.4rem);line-height:1;letter-spacing:-.02em;color:var(--cyan)}
+.facts dt{font-family:var(--mono);font-size:.8rem;color:var(--band-muted);margin-top:.6rem}
+
+/* Watch */
+.watch{display:grid;grid-template-columns:1fr 1fr;gap:1.5rem}
+.watch figure video{display:block;width:100%;aspect-ratio:16/9;object-fit:cover;border-radius:8px;border:1px solid var(--line);background:#000}
+.watch figcaption{color:var(--muted);font-size:1rem;margin-top:.7rem;max-width:48ch}
+
+/* Releases */
+.rel{list-style:none;border-top:1px solid var(--line)}
+.rel li{display:grid;grid-template-columns:9rem 1fr;gap:1.5rem;padding:1.6rem 0;border-bottom:1px solid var(--line)}
+.rel .tag{font-family:var(--mono);font-size:.8rem;color:var(--muted);padding-top:.35rem}
+.rel h3{font-size:1.3rem;margin-bottom:.35rem}
+.rel p{color:var(--muted);max-width:66ch}
+.rel code,.cmp-note code{font-family:var(--mono);font-size:.82em;background:var(--mark-soft);padding:.05em .3em;border-radius:3px;overflow-wrap:anywhere}
+.more{margin-top:1.5rem}
+
+/* How it works: three lanes into one service */
+.lanes{display:grid;grid-template-columns:1fr 1fr 1.1fr;grid-template-rows:repeat(3,auto);gap:0 1.6rem}
+.lane{display:contents}
+.who,.how,.core{border:1px solid var(--line);background:var(--panel);padding:1rem 1.1rem;margin-bottom:1rem}
+.who{grid-column:1}
+.how{grid-column:2;position:relative}
+.how::before{content:"→";position:absolute;left:-1.5rem;top:50%;transform:translateY(-50%);width:1.4rem;text-align:center;color:var(--muted)}
+.core{grid-column:3;grid-row:1/4;margin-left:.2rem;display:flex;flex-direction:column;justify-content:center;gap:.5rem;background:var(--band);color:var(--band-text);border-color:var(--band)}
+.core{position:relative}
+.core::before{content:"→";position:absolute;left:-1.7rem;top:50%;transform:translateY(-50%);width:1.4rem;text-align:center;color:var(--muted)}
+.lanes .core .mono{color:var(--band-muted)}
+.core strong{font-size:1.35rem;line-height:1.25}
+.lane.auth .how{box-shadow:inset 0 -3px 0 var(--cyan)}
+.mono{display:block}
+.lanes strong{font-family:var(--display);font-weight:600;font-size:1.1rem;line-height:1.3;display:block}
+.lanes .mono{color:var(--muted)}
+.flow-note{margin-top:1rem;color:var(--muted);font-size:1rem}
+
+/* Quotes */
+.quotes{display:grid;grid-template-columns:1.4fr 1fr;gap:3rem 3.5rem}
+.quote.big{grid-row:span 2}
+blockquote{font-family:var(--serif);font-weight:400;font-size:1.2rem;line-height:1.55;border-left:4px solid var(--cyan);padding-left:1.25rem}
+.quote.big blockquote{font-size:clamp(1.5rem,2.6vw,2rem);line-height:1.35}
+.quote .by{display:block;margin-top:.9rem;color:var(--muted);font-size:1rem}
+.quote .what{margin-top:.6rem;color:var(--muted);font-size:1rem;max-width:56ch}
+
+/* Compare */
+.table-wrap{overflow-x:auto}
+.cmp{width:100%;border-collapse:collapse;font-size:1rem;min-width:520px}
+.cmp th,.cmp td{padding:.65rem .9rem;text-align:left;border-bottom:1px solid var(--line);vertical-align:top}
+.cmp thead th{font-family:var(--mono);font-size:.8rem;font-weight:600;color:var(--muted)}
+.cmp tbody th{font-weight:400;color:var(--muted)}
+.cmp .us{background:var(--cyan-soft);font-weight:600}
+.cmp thead .us{box-shadow:inset 0 -3px 0 var(--cyan)}
+.cmp .n{color:var(--muted)}
+.cmp-note{color:var(--muted);font-size:1rem;margin-top:1.2rem;max-width:80ch}
+.sub-h{font-size:1.35rem;margin:3rem 0 1rem}
+.sub-h:first-of-type{margin-top:0}
+
+/* Media list */
+.media{list-style:none;border-top:1px solid var(--line)}
+.media li{padding:1.1rem 0;border-bottom:1px solid var(--line);display:grid;grid-template-columns:14rem 1fr;gap:1.5rem}
+.media .src{font-family:var(--mono);font-size:.8rem;color:var(--muted);padding-top:.3rem}
+.media p{color:var(--muted);font-size:1rem;margin-top:.15rem}
+
+/* Link tiles with a thumbnail of the page they open (images made by scripts/maintenance/site_thumbnails.mjs) */
+.tiles{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1.5rem;margin-top:2rem}
+.tile{display:block;border:1px solid var(--line);background:var(--panel);text-decoration:none;transition:border-color .15s}
+.tile:hover{border-color:var(--cyan)}
+.tile img{display:block;width:100%;height:auto;aspect-ratio:16/9;object-fit:cover;border-bottom:1px solid var(--line);background:var(--console)}
+.tile-text{display:block;padding:.9rem 1.1rem 1.1rem}
+.tile-text strong{display:block;font-family:var(--display);font-weight:600;font-size:1.15rem;line-height:1.3}
+.tile-text span{display:block;color:var(--muted);font-size:1rem;margin-top:.2rem}
+.band-end .tile{background:rgba(255,255,255,.04);border-color:var(--band-line)}
+.band-end .tile:hover{border-color:var(--cyan)}
+.band-end .tile img{border-bottom-color:var(--band-line)}
+.band-end .tile-text span{color:var(--band-muted)}
+
+/* Install */
+.install{display:grid;grid-template-columns:1.1fr 1fr;gap:3.5rem;align-items:center}
+.install .cmd{max-width:none;font-size:1.15rem;padding:1.1rem 1.25rem}
+.band-end{background:var(--band);color:var(--band-text);border-top:0!important}
+.band-end a{text-decoration-color:var(--band-line)}
+.band-end a:hover{text-decoration-color:var(--cyan)}
+.band-end .lede{color:var(--band-muted)}
+.band-end .consult{border-top-color:var(--band-line)}
+.band-end .consult p{color:var(--band-muted)}
+.band-end .btn{border-color:var(--band-text)}
+.consult{margin-top:3rem;padding-top:2rem;border-top:1px solid var(--line);display:flex;justify-content:space-between;gap:2rem;align-items:center;flex-wrap:wrap}
+.consult p{max-width:56ch;color:var(--muted);font-size:1rem}
+.consult strong{display:block;color:inherit;font-family:var(--display);font-weight:600;font-size:1.3rem;margin-bottom:.2rem}
+
+@media(max-width:880px){
+  .hero,.install,.watch,.quotes,.tiles{grid-template-columns:1fr}
+  .hero{gap:2.5rem;padding-block:2.5rem}
+  .facts{grid-template-columns:1fr 1fr}
+  .facts div:nth-child(3){border-left:0;padding-left:0}
+  .facts div:nth-child(even){padding-right:0}
+  .facts div:nth-child(n+3){border-top:1px solid var(--band-line)}
+  .lanes{grid-template-columns:1fr;gap:0}
+  .lane{display:block;margin-bottom:1rem;border:1px solid var(--line);background:var(--panel)}
+  .who,.how,.core{grid-column:1;grid-row:auto;margin:0}
+  .lane .who,.lane .how{border:0;background:none}
+  .lane .how{border-top:1px solid var(--line);padding-top:.8rem}
+  .how::before{content:none}
+  .core{margin-top:.2rem}
+  .core::before{content:"↓";left:50%;top:-1.2rem;transform:translateX(-50%)}
+  .rel li,.media li{grid-template-columns:1fr;gap:.3rem}
+  .quote.big{grid-row:auto}
+}
+@media(max-width:480px){
+  .install .cmd{font-size:.82rem}
+}
+@media(prefers-reduced-motion:reduce){
+  .caret{animation:none}
+  .c-res mark,.graph .rel,.graph .n .core,.graph .n .halo{transition:none}
+}
+</style>
+</head>
+<body>
+
+<div class="band">
+<div class="wrap">
+  <nav class="nav" aria-label="Main">
+    <a class="brand" href="/"><img src="brain-icon.png" alt="">mcp-memory-service</a>
+    <ul>
+      <li><a href="#features">Release</a></li>
+      <li><a href="#compare">Compare</a></li>
+      <li><a href="/demo/">Demo</a></li>
+      <li><a href="https://github.com/doobidoo/mcp-memory-service/wiki" target="_blank" rel="noopener">Docs</a></li>
+      <li><a href="https://github.com/doobidoo/mcp-memory-service" target="_blank" rel="noopener">GitHub</a></li>
+    </ul>
+    <span class="ver">v12.1</span>
+  </nav>
+</div>
+
+<header class="wrap hero">
+  <div>
+    <h1>Memory for AI agents</h1>
+    <p class="sub">One self-hosted service your agents search by meaning, over REST, MCP, OAuth or the CLI.</p>
+    <button class="cmd" type="button" data-copy="pip install mcp-memory-service" aria-label="Copy install command">
+      <span>pip install mcp-memory-service</span><span>copy</span>
+    </button>
+    <div class="hero-links">
+      <a href="/demo/">Try it in your browser</a>
+      <a href="https://github.com/doobidoo/mcp-memory-service" target="_blank" rel="noopener">GitHub</a>
+      <a href="https://pypi.org/project/mcp-memory-service/" target="_blank" rel="noopener">PyPI</a>
+    </div>
+  </div>
+
+  <div class="console" role="region" aria-label="Example of recalling memories by meaning">
+    <div class="c-bar"><span>recall</span><span>example data</span></div>
+    <div class="graph"><svg id="graph" viewBox="0 0 600 190" role="img" aria-label="Memory graph: the memories that match the query light up and are linked"></svg></div>
+    <div class="c-q"><span class="p">&gt;</span><span id="q"></span><span class="caret" aria-hidden="true"></span></div>
+    <ol class="c-res" id="results" aria-live="polite"></ol>
+    <div class="c-chips" id="chips"></div>
+  </div>
+</header>
+<div class="wrap">
+  <dl class="facts">
+    <div><dd>5 ms</dd><dt>local read latency</dt></div>
+    <div><dd>86%</dd><dt>LongMemEval R@5, session mode</dt></div>
+    <div><dd>4,704</dd><dt>tests</dt></div>
+    <div><dd>25+</dd><dt>AI apps supported</dt></div>
+  </dl>
+</div>
+</div>
+
+<main>
+
+<section class="sec" id="watch">
+  <div class="wrap">
+    <div class="watch">
+      <figure>
+        <video autoplay loop muted playsinline poster="assets/images/memory-network-poster.jpg"
+               aria-label="Animated memory network: nodes linked by pulsing edges">
+          <source src="assets/videos/memory-network.webm" type="video/webm">
+          <source src="assets/videos/memory-network.mp4" type="video/mp4">
+        </video>
+        <figcaption>Every memory is a node, every relationship an edge. Recall works by meaning, not keywords.</figcaption>
+      </figure>
+      <figure>
+        <video controls preload="metadata" playsinline poster="assets/images/explainer-poster.png"
+               aria-label="Explainer video: an agent forgets between sessions, mcp-memory-service stores tagged memories, retrieves them by meaning, links them in a graph and consolidates old ones">
+          <source src="assets/videos/explainer.mp4" type="video/mp4">
+        </video>
+        <figcaption>See it in 50 seconds: store, retrieve, link and consolidate. Narrated with a local text-to-speech model.</figcaption>
+      </figure>
+    </div>
+  </div>
+</section>
+
+<section class="sec" id="features">
+  <div class="wrap">
+    <h2>What's new in v12.1</h2>
+    <p class="lede">3 changes since the previous patch release, 4,704 tests.</p>
+    <ul class="rel">
+      <li>
+        <span class="tag">Security</span>
+        <div>
+          <h3>Stored tag could run script in the dashboard</h3>
+          <p>The dashboard's <code>escapeHtml()</code> left quote characters alone, so a crafted memory tag could inject an attribute and run JavaScript when hovered. It now encodes both quotes. Affected for years; upgrade if the dashboard is reachable by anyone who can write memories.</p>
+        </div>
+      </li>
+      <li>
+        <span class="tag">Sync</span>
+        <div>
+          <h3>Resolve conflicts with remote tombstones</h3>
+          <p>When a local memory was edited after the remote copy was deleted, sync now reports the conflict and the authenticated sync API can keep the local memory or accept the deletion, after rechecking both stores.</p>
+        </div>
+      </li>
+      <li>
+        <span class="tag">Dashboard</span>
+        <div>
+          <h3>Same look as this site</h3>
+          <p>The dashboard uses the site's brand tokens, self-hosted Bricolage Grotesque and JetBrains Mono (so it still works offline), and the brain logo in the header.</p>
+        </div>
+      </li>
+    </ul>
+    <p class="more"><a href="https://github.com/doobidoo/mcp-memory-service/releases/tag/v12.1.0" target="_blank" rel="noopener">Full release notes for v12.1.0</a></p>
+  </div>
+</section>
+
+<section class="sec" id="architecture">
+  <div class="wrap">
+    <h2>One service, three ways in</h2>
+    <p class="lede">Agents on your machine talk to it over stdio, frameworks over REST, and browser chat apps over Remote MCP with OAuth 2.1.</p>
+    <div class="lanes">
+      <div class="lane">
+        <div class="who"><span class="mono">Terminal and IDE agents</span><strong>Claude Code, Codex CLI, Cursor, OpenCode</strong></div>
+        <div class="how"><span class="mono">Local MCP</span><strong>stdio, on your machine</strong></div>
+      </div>
+      <div class="lane">
+        <div class="who"><span class="mono">Agent frameworks</span><strong>LangGraph, CrewAI, AutoGen, any HTTP client</strong></div>
+        <div class="how"><span class="mono">REST API</span><strong>HTTP with API key or OAuth</strong></div>
+      </div>
+      <div class="lane auth">
+        <div class="who"><span class="mono">Browser chat</span><strong>claude.ai, ChatGPT (Developer Mode)</strong></div>
+        <div class="how"><span class="mono">Remote MCP</span><strong>Streamable HTTP, OAuth 2.1 + PKCE</strong></div>
+      </div>
+      <div class="core">
+        <span class="mono">Memory service</span>
+        <strong>Search by meaning, knowledge graph, consolidation</strong>
+        <span class="mono">SQLite-vec, Cloudflare or Hybrid storage</span>
+      </div>
+    </div>
+    <p class="flow-note">The underlined lane is the one that crosses the network with OAuth. Local MCP is a process on your machine, with no network hop.</p>
+    <div class="tiles">
+      <a class="tile" href="/architecture/">
+        <img src="/assets/images/thumb-architecture.webp" width="1200" height="675" loading="lazy" alt="The architecture diagram: stdio, REST and Streamable HTTP entries leading to MemoryServer and the storage backends">
+        <span class="tile-text"><strong>Architecture diagram</strong><span>The three ways in, with the source lines behind every box.</span></span>
+      </a>
+      <a class="tile" href="/deployment/">
+        <img src="/assets/images/thumb-deployment.webp" width="1200" height="675" loading="lazy" alt="The deployment diagram: GitHub, its Actions runner, PyPI, Docker Hub, Cloudflare Pages and the GitLab mirror">
+        <span class="tile-text"><strong>Deployment landscape</strong><span>Where releases and the site are built, published and mirrored.</span></span>
+      </a>
+    </div>
+  </div>
+</section>
+
+<section class="sec" id="case-studies">
+  <div class="wrap">
+    <h2>In the wild</h2>
+    <p class="lede">Three deployments people built and run themselves.</p>
+    <div class="quotes">
+      <div class="quote big">
+        <blockquote>
+          "After I work with one of the cluster agents on something I want my local agent to know about, the cluster agent adds a special tag to the memory entry that my local agent recognizes as a message from a cluster agent. So they end up using it as a comms bridge, and it's pretty delightful."
+        </blockquote>
+        <span class="by"><a href="https://github.com/jeremykoerber" target="_blank" rel="noopener">@jeremykoerber</a></span>
+        <p class="what">A five-agent cluster uses one memory service as shared state and as an inter-agent channel, with no custom protocol: cluster agents write a sentinel tag, the local agent filters on it. <a href="https://github.com/doobidoo/mcp-memory-service/blob/main/docs/agents/README.md" target="_blank" rel="noopener">The pattern</a></p>
+      </div>
+      <div class="quote">
+        <blockquote>
+          "File-based memory demands constant discipline. Semantic recall from a live database doesn't. Storing data on my own hardware while making it remotely accessible across platforms turned out to be a feature I didn't know I needed."
+        </blockquote>
+        <span class="by"><a href="https://github.com/PL-Peter" target="_blank" rel="noopener">@PL-Peter</a></span>
+        <p class="what">Two Docker containers on one SQLite backend, a Cloudflare tunnel for name-based routing, and an auth gateway in front. <a href="https://github.com/doobidoo/mcp-memory-service/blob/main/docs/deployment/production-guide.md" target="_blank" rel="noopener">The checklist</a></p>
+      </div>
+      <div class="quote">
+        <blockquote>
+          "Claude Code, Claude Desktop, Codex CLI and OpenCode all talk to the same sqlite-vec DB over stdio on my Mac. ~5,900 memories and counting. It's the closest thing to persistent identity my agents have."
+        </blockquote>
+        <span class="by">Mingjian Shao, AI PM and consultant, September 2026</span>
+        <p class="what">One local sqlite-vec database shared by four agents: no server, no cloud, offline embeddings, daily backups and scheduled consolidation.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="sec" id="compare">
+  <div class="wrap">
+    <h2>How it compares</h2>
+    <p class="lede">Against the commercial memory APIs and the MCP-native alternatives.</p>
+
+    <h3 class="sub-h">Commercial memory APIs</h3>
+    <div class="table-wrap">
+      <table class="cmp">
+        <thead><tr><th></th><th class="us">mcp-memory-service</th><th>Mem0</th><th>Zep</th><th>DIY Redis+Pinecone</th></tr></thead>
+        <tbody>
+          <tr><th>License</th><td class="us">Apache 2.0</td><td>Proprietary</td><td>Enterprise</td><td>&mdash;</td></tr>
+          <tr><th>Cost</th><td class="us">$0</td><td>Per-call API</td><td>Enterprise</td><td>Infra costs</td></tr>
+          <tr><th>claude.ai browser</th><td class="us">Remote MCP</td><td>Desktop only</td><td>Desktop only</td><td class="n">No</td></tr>
+          <tr><th>OAuth 2.0 + DCR</th><td class="us">Yes</td><td>Unknown</td><td>Unknown</td><td class="n">No</td></tr>
+          <tr><th>Streamable HTTP</th><td class="us">Yes (SSE too)</td><td class="n">No</td><td class="n">No</td><td class="n">No</td></tr>
+          <tr><th>Framework integration</th><td class="us">REST, any HTTP client</td><td>SDK</td><td>SDK</td><td>Manual</td></tr>
+          <tr><th>Knowledge graph</th><td class="us">Yes, typed edges</td><td class="n">No</td><td>Limited</td><td class="n">No</td></tr>
+          <tr><th>Auto consolidation</th><td class="us">Yes, decay + compression</td><td class="n">No</td><td class="n">No</td><td class="n">No</td></tr>
+          <tr><th>On-premise embeddings</th><td class="us">Yes, ONNX local</td><td class="n">No</td><td class="n">No</td><td>Manual</td></tr>
+          <tr><th>Privacy</th><td class="us">100% local</td><td>Cloud</td><td>Cloud</td><td>Partial</td></tr>
+          <tr><th>Hybrid search</th><td class="us">Yes, BM25 + vector</td><td class="n">No</td><td>Yes</td><td>Manual</td></tr>
+          <tr><th>MCP protocol</th><td class="us">Yes</td><td class="n">No</td><td class="n">No</td><td class="n">No</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 class="sub-h">MCP-native: MemPalace</h3>
+    <div class="table-wrap">
+      <table class="cmp">
+        <thead><tr><th></th><th class="us">mcp-memory-service</th><th>MemPalace</th></tr></thead>
+        <tbody>
+          <tr><th>LongMemEval R@5 (raw ChromaDB, zero LLM)</th><td class="us">86.0% session / 80.4% turn</td><td>96.6%<sup>1</sup></td></tr>
+          <tr><th>LongMemEval R@5 (with reranking)</th><td class="us">&mdash;</td><td>100%<sup>2</sup></td></tr>
+          <tr><th>Storage granularity</th><td class="us">Turn-level and session-level</td><td>Session-level</td></tr>
+          <tr><th>Team / multi-device sync</th><td class="us">Cloudflare sync</td><td>Local only</td></tr>
+          <tr><th>REST API / web dashboard</th><td class="us">Yes</td><td class="n">No</td></tr>
+          <tr><th>OAuth 2.1 + multi-user</th><td class="us">Yes</td><td class="n">No</td></tr>
+          <tr><th>Knowledge graph</th><td class="us">Yes, typed edges</td><td class="n">No</td></tr>
+          <tr><th>Auto consolidation</th><td class="us">Yes, decay + compression</td><td class="n">No</td></tr>
+          <tr><th>License</th><td class="us">Apache 2.0</td><td>MIT</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="cmp-note">
+      <strong>Why the benchmark gap?</strong> MemPalace stores whole sessions as single units, and LongMemEval asks which session contains the answer, so that granularity answers the question structurally. This service defaults to turn-level storage for finer retrieval; session-mode ingestion brings it to 86.0% R@5.<br>
+      <sup>1</sup> Measured in MemPalace "raw mode": plain text in ChromaDB with default embeddings. Per <a href="https://github.com/MemPalace/mempalace/issues/27" target="_blank" rel="noopener">Issue #27</a>, the Palace structural features are bypassed in that configuration, and the maintainers acknowledged most of the review's points.<br>
+      <sup>2</sup> Uses optional LLM reranking (~500 API calls) on a partially tuned test set. Clean held-out score as reported by the maintainers: 98.4% R@5.<br>
+      Full numbers and the run commands: <a href="https://github.com/doobidoo/mcp-memory-service/blob/main/docs/BENCHMARKS.md" target="_blank" rel="noopener">docs/BENCHMARKS.md</a>
+    </p>
+
+    <h3 class="sub-h">SHODH ecosystem</h3>
+    <p class="cmp-note" style="margin-top:0">Fully compatible with the <a href="https://github.com/varun29ankuS/shodh-memory/blob/main/specs/openapi.yaml" target="_blank" rel="noopener">SHODH Unified Memory API Specification</a>: every SHODH implementation shares the same memory schema (emotional metadata, episodic memory, source tracking, quality scoring), so memories export and import across implementations with full fidelity. The reference implementation is <a href="https://github.com/varun29ankuS/shodh-memory" target="_blank" rel="noopener">shodh-memory</a> (RocksDB); shodh-cloudflare runs on Workers + Vectorize; this service runs SQLite-vec or Hybrid.</p>
+  </div>
+</section>
+
+<section class="sec" id="media">
+  <div class="wrap">
+    <h2>In the media</h2>
+    <p class="lede">Talks and coverage from the community.</p>
+    <ul class="media">
+      <li>
+        <span class="src">Heavybit, Humans in the Loop</span>
+        <div><a href="https://www.linkedin.com/pulse/humans-loop-deep-dive-agents-overdrawn-rbrcc/" target="_blank" rel="noopener">Agents Overdrawn at the Memory Bank</a>
+        <p>A deep dive with maintainer Heinrich Krupp on agent amnesia and why persistent memory is the missing infrastructure layer for agentic systems.</p></div>
+      </li>
+      <li>
+        <span class="src">AI Tinkerers Zürich</span>
+        <div><a href="https://zurich.aitinkerers.org/talks/rsvp_DuHc2MBp1uo" target="_blank" rel="noopener">Talk by Heinrich Krupp</a> &middot; <a href="https://drive.google.com/file/d/1NJDLetJ5CE7Jiek9OtyXCrt-zm768YB6/view" target="_blank" rel="noopener">full video</a>
+        <p>Persistent memory architecture, semantic search, and multi-agent memory sharing.</p></div>
+      </li>
+      <li>
+        <span class="src">LinkedIn, Dr. Álvaro Cintas</span>
+        <div><a href="https://www.linkedin.com/feed/update/urn:li:activity:7508652464548802560/" target="_blank" rel="noopener">Solving session amnesia</a>
+        <p>How mcp-memory-service gives Claude Code, Cursor and OpenCode a shared memory over MCP, with on-device ONNX embeddings and no external API calls.</p></div>
+      </li>
+    </ul>
+    <p class="cmp-note">"Your project has inspired me in many ways. In my view, it's the best implementation of MCP memory I've found so far." &mdash; Micha&#322; Zubkowicz</p>
+  </div>
+</section>
+
+<section class="sec band-end" id="install">
+  <div class="wrap">
+    <div class="install">
+      <div>
+        <h2>Get started in seconds</h2>
+        <p class="lede" style="margin-bottom:0">Install from PyPI and connect your agents to persistent memory.</p>
+      </div>
+      <div>
+        <button class="cmd" type="button" data-copy="pip install mcp-memory-service" aria-label="Copy install command">
+          <span>pip install mcp-memory-service</span><span>copy</span>
+        </button>
+        <div class="btns">
+          <a href="https://github.com/doobidoo/mcp-memory-service" target="_blank" rel="noopener">GitHub</a>
+          <a href="https://github.com/doobidoo/mcp-memory-service/wiki" target="_blank" rel="noopener">Documentation</a>
+        </div>
+      </div>
+    </div>
+    <div class="tiles">
+      <a class="tile" href="/demo/">
+        <img src="/assets/images/thumb-demo.webp" width="1200" height="675" loading="lazy" alt="The live demo: a stored memory list and a search that returns ranked results, all in the browser">
+        <span class="tile-text"><strong>Live demo</strong><span>Store and search memories in your browser. Nothing is uploaded.</span></span>
+      </a>
+      <a class="tile" href="/blog/remote-mcp-tutorial.html">
+        <img src="/assets/images/thumb-blog.webp" width="1200" height="675" loading="lazy" alt="The tutorial: how to add persistent memory to claude.ai in five minutes">
+        <span class="tile-text"><strong>Set up claude.ai in 5 minutes</strong><span>Remote MCP with OAuth, step by step.</span></span>
+      </a>
+    </div>
+    <div class="consult">
+      <p><strong>Deploying for a team?</strong>I help teams run self-hosted memory in production: OAuth, hybrid sync, multi-client rollout. Free 30-minute intro call.</p>
+      <a class="btn" href="mailto:deploy@mcpmemory.services?subject=Deployment%20inquiry">Get in touch</a>
+    </div>
+  </div>
+</section>
+</main>
+
+<footer>
+  <div class="wrap">MCP Memory Service, open source under Apache 2.0 &middot; <a href="https://github.com/doobidoo/mcp-memory-service">github.com/doobidoo/mcp-memory-service</a></div>
+</footer>
+
+<script>
+// ---- Recall console: scripted example, no backend ----
+// Words in [[double brackets]] are the matched terms that get highlighted.
+const EXAMPLES = [
+  { q: 'why did we stop using the global sync lock?', hits: [
+    { s: .91, t: 'Dropped the [[global sync lock]]: the HTTP server is the only sync owner, the MCP server talks to SQLite directly.', m: 'decision · hybrid · 3 weeks ago' },
+    { s: .84, t: 'Delta-sync [[deadlocked]] on empty-content events; skip and log instead of retrying forever.', m: 'fix · sync · 5 weeks ago' },
+    { s: .67, t: 'WAL mode is required, otherwise two servers on one file give "database is locked".', m: 'config · sqlite · 2 months ago' } ] },
+  { q: 'how do two agents hand work to each other?', hits: [
+    { s: .93, t: 'The cluster agent writes a [[sentinel tag]]; the local agent filters on it and treats the memory as a [[message]].', m: 'pattern · agents · 1 week ago' },
+    { s: .78, t: 'Session summaries are committed at the end, so any agent can [[pick up where another left off]].', m: 'workflow · sessions · 2 weeks ago' },
+    { s: .61, t: 'Scope by store when several teams share one service.', m: 'api · stores · 4 days ago' } ] },
+  { q: 'which login does claude.ai use?', hits: [
+    { s: .95, t: 'Remote MCP over Streamable HTTP with [[OAuth 2.1 + PKCE]] and dynamic client registration.', m: 'auth · remote · 6 weeks ago' },
+    { s: .72, t: 'Non-loopback binds need [[MCP_API_KEY]] or OAuth; the server refuses to start without one.', m: 'security · config · 1 week ago' },
+    { s: .58, t: 'A Cloudflare tunnel gives name-based routing for the self-hosted instance.', m: 'deployment · tunnel · 3 months ago' } ] }
+];
+const AT = [[[110,50],[300,115],[500,55]],[[90,140],[270,45],[440,130]],[[520,150],[350,70],[170,100]]];
+const reduceMq = matchMedia('(prefers-reduced-motion: reduce)');
+let reduce = reduceMq.matches;
+const qEl = document.getElementById('q'), listEl = document.getElementById('results'), chipsEl = document.getElementById('chips');
+let run = 0;
+
+function line(hit) {
+  const li = document.createElement('li');
+  const sc = document.createElement('div'); sc.className = 'score';
+  sc.textContent = hit.s.toFixed(2);
+  const bar = document.createElement('i'); bar.style.setProperty('--s', hit.s); sc.append(bar);
+  const body = document.createElement('div');
+  const p = document.createElement('p');
+  hit.t.split(/\[\[(.+?)\]\]/).forEach((part, i) => {
+    if (i % 2) { const m = document.createElement('mark'); m.textContent = part; p.append(m); }
+    else p.append(part);
+  });
+  const meta = document.createElement('p'); meta.className = 'meta'; meta.textContent = hit.m;
+  body.append(p, meta); li.append(sc, body);
+  return li;
+}
+
+// ---- Graph: a fixed, seeded network; the hits of each example light up ----
+const NS = 'http://www.w3.org/2000/svg', svg = document.getElementById('graph');
+let seed = 7; const rnd = () => (seed = seed * 16807 % 2147483647) / 2147483647;
+const nodes = [];
+for (let r = 0; r < 4; r++) for (let c = 0; c < 11; c++) nodes.push({ x: 30 + c * 54 + (rnd() - .5) * 30, y: 28 + r * 44 + (rnd() - .5) * 26 });
+const mk = (n, a, parent = svg) => { const e = document.createElementNS(NS, n); for (const k in a) e.setAttribute(k, a[k]); parent.append(e); return e; };
+const d2 = (a, b) => (a.x - b.x) ** 2 + (a.y - b.y) ** 2;
+const edges = new Set();
+nodes.forEach((a, i) => nodes.map((b, j) => [j, d2(a, b)]).filter(([j]) => j !== i).sort((p, q) => p[1] - q[1]).slice(0, 2)
+  .forEach(([j]) => edges.add(i < j ? i + '-' + j : j + '-' + i)));
+edges.forEach(k => { const [i, j] = k.split('-'); mk('line', { x1: nodes[i].x, y1: nodes[i].y, x2: nodes[j].x, y2: nodes[j].y, class: 'e' }); });
+const links = mk('g', {});
+const dots = nodes.map(n => { const g = mk('g', { class: 'n', transform: `translate(${n.x} ${n.y})` }); mk('circle', { class: 'halo', r: 14 }, g); mk('circle', { class: 'core', r: 5 }, g); return g; });
+const nearest = ([x, y]) => nodes.reduce((best, n, i) => { const d = d2(n, { x, y }); return d < best.d ? { i, d } : best; }, { i: 0, d: Infinity }).i;
+
+function resetGraph() {
+  dots.forEach(d => d.classList.remove('lit'));
+  links.replaceChildren();
+  svg.querySelectorAll('text').forEach(t => t.remove());
+}
+
+function lightGraph(i, me) {
+  const ids = AT[i].map(nearest);
+  ids.forEach((id, k) => setTimeout(() => {
+    if (me !== run) return;
+    const n = nodes[id];
+    dots[id].classList.add('lit');
+    mk('text', { x: n.x + 10, y: n.y - 9, class: 's' }).textContent = EXAMPLES[i].hits[k].s.toFixed(2);
+    if (!k) return;
+    const p = nodes[ids[k - 1]], len = Math.hypot(n.x - p.x, n.y - p.y);
+    const l = mk('line', { x1: p.x, y1: p.y, x2: n.x, y2: n.y, class: 'rel', 'stroke-dasharray': len, 'stroke-dashoffset': reduce ? 0 : len }, links);
+    if (!reduce) requestAnimationFrame(() => requestAnimationFrame(() => l.setAttribute('stroke-dashoffset', 0)));
+  }, reduce ? 0 : k * 260));
+}
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function show(i) {
+  const me = ++run, ex = EXAMPLES[i];
+  chipsEl.querySelectorAll('button').forEach((b, j) => b.setAttribute('aria-pressed', j === i));
+  listEl.replaceChildren();
+  resetGraph();
+  qEl.textContent = '';
+  if (reduce) qEl.textContent = ex.q;
+  else for (const ch of ex.q) { if (me !== run) return; qEl.textContent += ch; await sleep(26); }
+  if (me !== run) return;
+  ex.hits.forEach(h => listEl.append(line(h)));
+  lightGraph(i, me);
+  const marks = listEl.querySelectorAll('mark');
+  if (reduce) return marks.forEach(m => m.classList.add('on'));
+  await sleep(120);
+  marks.forEach((m, k) => setTimeout(() => m.classList.add('on'), k * 220));
+}
+
+EXAMPLES.forEach((ex, i) => {
+  const b = document.createElement('button');
+  b.type = 'button'; b.textContent = ex.q.replace(/\?$/, '');
+  b.addEventListener('click', () => show(i));
+  chipsEl.append(b);
+});
+show(0);
+
+// ---- Copy install command ----
+document.querySelectorAll('[data-copy]').forEach(btn => btn.addEventListener('click', () => {
+  navigator.clipboard.writeText(btn.dataset.copy);
+  const hint = btn.lastElementChild;
+  hint.textContent = 'copied';
+  clearTimeout(btn.timer);
+  btn.timer = setTimeout(() => { hint.textContent = 'copy'; }, 1800);
+}));
+
+// ---- Keep the decorative loop still for reduced motion ----
+const loops = document.querySelectorAll('video[autoplay]');
+if (reduce) loops.forEach(v => { v.removeAttribute('autoplay'); v.pause(); });
+// The setting can change while the page is open: stop or resume the loop, and show() reads the new value.
+reduceMq.addEventListener('change', e => {
+  reduce = e.matches;
+  loops.forEach(v => (reduce ? v.pause() : v.play().catch(() => {})));
+});
+</script>
+<!-- Cloudflare Web Analytics: injected automatically at the proxy (zone-level automatic setup) — do not add a manual beacon here, it would double-count. -->
+</body>
+</html>

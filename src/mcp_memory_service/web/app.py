@@ -22,12 +22,16 @@ import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
+from html import escape
 from typing import Optional, Any
+
+from ..compat import _sanitize_log_value
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
+from starlette.types import Receive, Scope, Send
 
 try:
     from .. import __version__
@@ -36,10 +40,12 @@ except (ImportError, AttributeError):
 from ..config import (
     HTTP_PORT,
     HTTP_HOST,
+    HTTP_ROOT_PATH,
     CORS_ORIGINS,
     MDNS_ENABLED,
     HTTPS_ENABLED,
     OAUTH_ENABLED,
+    METRICS_ENABLED,
     CONSOLIDATION_ENABLED,
     CONSOLIDATION_CONFIG,
     CONSOLIDATION_SCHEDULE,
@@ -63,9 +69,26 @@ from .api.configuration import router as configuration_router
 from .api.oauth_status import router as oauth_status_router
 from .api.conflicts import router as conflicts_router
 from .api.harvest import router as harvest_router
+from .api.sync_events import router as sync_events_router
 from .sse import sse_manager
 
 logger = logging.getLogger(__name__)
+
+
+class RootPathStaticFiles(StaticFiles):
+    """Serve a mounted directory when the proxy strips the external root path."""
+
+    def __init__(self, *, directory: str, external_root_path: str) -> None:
+        super().__init__(directory=directory)
+        self.external_root_path = external_root_path
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        root_path = scope.get("root_path", "")
+        if (self.external_root_path and root_path.startswith(self.external_root_path)
+                and not scope["path"].startswith(self.external_root_path + "/")):
+            scope = dict(scope)
+            scope["root_path"] = root_path[len(self.external_root_path):]
+        await super().__call__(scope, receive, send)
 
 # Global storage instance
 storage: Optional["MemoryStorage"] = None
@@ -82,6 +105,17 @@ consolidation_scheduler: Optional["ConsolidationScheduler"] = None
 # Global backup scheduler instance
 backup_scheduler: Optional["BackupScheduler"] = None
 
+# Env vars that each enable an opt-in interval job on the consolidation scheduler.
+# When any is set (not blank / not "disabled"), the scheduler is started even if the
+# consolidation cadences themselves are all disabled — otherwise a host that only
+# enables one of these would never get a scheduler and the job would silently never run.
+# One entry per line so independent features can append their own without editing a
+# shared literal (keeps feature PRs orthogonal).
+_OPTIN_SCHEDULE_ENV_VARS = (
+    "MCP_HARVEST_SCHEDULE",
+    "MCP_SYNC_SCHEDULE",  # delta-sync Phase 4d
+)
+
 
 async def oauth_cleanup_background_task():
     """Background task to periodically clean up expired OAuth tokens and codes."""
@@ -95,14 +129,15 @@ async def oauth_cleanup_background_task():
             storage = get_oauth_storage()
             cleanup_stats = await storage.cleanup_expired()
             if cleanup_stats["expired_codes_cleaned"] > 0 or cleanup_stats["expired_tokens_cleaned"] > 0:
-                logger.info(f"OAuth cleanup: removed {cleanup_stats['expired_codes_cleaned']} codes, "
-                           f"{cleanup_stats['expired_tokens_cleaned']} tokens")
+                logger.info("OAuth cleanup: removed %s codes, %s tokens",
+                            _sanitize_log_value(cleanup_stats['expired_codes_cleaned']),
+                            _sanitize_log_value(cleanup_stats['expired_tokens_cleaned']))
 
         except asyncio.CancelledError:
             logger.info("OAuth cleanup task cancelled")
             break
         except Exception as e:
-            logger.error(f"Error in OAuth cleanup task: {e}")
+            logger.error("Error in OAuth cleanup task: %s", _sanitize_log_value(e))
             # Continue running even if there's an error
 
 
@@ -117,8 +152,17 @@ async def lifespan(app: FastAPI):
         storage = await create_storage_backend()
         set_storage(storage)  # Set the global storage instance
 
-        # Initialize consolidation system if enabled
-        if CONSOLIDATION_ENABLED:
+        # Initialize consolidation system if enabled — OR if any opt-in interval job
+        # (see _OPTIN_SCHEDULE_ENV_VARS) is configured. The scheduler needs a consolidator
+        # instance to attach jobs to, so a host that only enables e.g. MCP_SYNC_SCHEDULE
+        # (with consolidation disabled) must still reach this block, build the consolidator,
+        # and start the scheduler — otherwise the opt-in job silently never runs (Greptile P1).
+        import os as _os
+        _optin_jobs_on = any(
+            (_os.getenv(v, '').strip().lower() not in ('', 'disabled'))
+            for v in _OPTIN_SCHEDULE_ENV_VARS
+        )
+        if CONSOLIDATION_ENABLED or _optin_jobs_on:
             try:
                 from ..consolidation.base import ConsolidationConfig
                 from ..consolidation.consolidator import DreamInspiredConsolidator
@@ -135,11 +179,24 @@ async def lifespan(app: FastAPI):
                 # Set global consolidator for API access
                 set_consolidator(consolidator)
 
-                # Initialize scheduler if any schedules are enabled
-                if any(schedule != 'disabled' for schedule in CONSOLIDATION_SCHEDULE.values()):
+                # Start the scheduler when consolidation cadences OR any opt-in job is enabled.
+                #
+                # If we only got here because an opt-in job (sync/harvest) is on while
+                # consolidation is DISABLED, the scheduler must NOT register consolidation
+                # jobs — passing the raw CONSOLIDATION_SCHEDULE would re-activate cadences
+                # (e.g. a leftover MCP_SCHEDULE_WEEKLY) that can archive/delete memories the
+                # user turned off (Greptile P1). Neutralize every cadence to 'disabled' in
+                # that case; the opt-in jobs schedule themselves from their own env vars.
+                if CONSOLIDATION_ENABLED:
+                    effective_schedule = CONSOLIDATION_SCHEDULE
+                else:
+                    effective_schedule = {k: 'disabled' for k in CONSOLIDATION_SCHEDULE}
+
+                _consolidation_on = any(schedule != 'disabled' for schedule in effective_schedule.values())
+                if _consolidation_on or _optin_jobs_on:
                     consolidation_scheduler = ConsolidationScheduler(
                         consolidator,
-                        CONSOLIDATION_SCHEDULE,
+                        effective_schedule,
                         enabled=True
                     )
 
@@ -155,7 +212,7 @@ async def lifespan(app: FastAPI):
                     logger.info("Consolidation scheduler disabled (all schedules set to 'disabled')")
 
             except Exception as e:
-                logger.error(f"Failed to initialize consolidation system: {e}")
+                logger.error("Failed to initialize consolidation system: %s", _sanitize_log_value(e))
                 consolidation_scheduler = None
         else:
             logger.info("Consolidation system disabled")
@@ -188,7 +245,7 @@ async def lifespan(app: FastAPI):
                 logger.warning("mDNS support not available (zeroconf not installed)")
                 mdns_advertiser = None
             except Exception as e:
-                logger.error(f"Error starting mDNS advertisement: {e}")
+                logger.error("Error starting mDNS advertisement: %s", _sanitize_log_value(e))
                 mdns_advertiser = None
         else:
             logger.info("mDNS service advertisement disabled")
@@ -204,13 +261,13 @@ async def lifespan(app: FastAPI):
                 logger.warning("Backup scheduler not available (backup module not installed)")
                 backup_scheduler = None
             except Exception as e:
-                logger.error(f"Error starting backup scheduler: {e}")
+                logger.error("Error starting backup scheduler: %s", _sanitize_log_value(e))
                 backup_scheduler = None
         else:
             logger.info("Backup scheduler disabled")
 
     except Exception as e:
-        logger.error(f"Failed to initialize storage: {e}")
+        logger.error("Failed to initialize storage: %s", _sanitize_log_value(e))
         raise
     
     yield
@@ -224,7 +281,7 @@ async def lifespan(app: FastAPI):
             await consolidation_scheduler.stop()
             logger.info("Consolidation scheduler stopped")
         except Exception as e:
-            logger.error(f"Error stopping consolidation scheduler: {e}")
+            logger.error("Error stopping consolidation scheduler: %s", _sanitize_log_value(e))
 
     # Stop backup scheduler
     if backup_scheduler:
@@ -232,7 +289,7 @@ async def lifespan(app: FastAPI):
             await backup_scheduler.stop()
             logger.info("Backup scheduler stopped")
         except Exception as e:
-            logger.error(f"Error stopping backup scheduler: {e}")
+            logger.error("Error stopping backup scheduler: %s", _sanitize_log_value(e))
 
     # Stop mDNS advertisement
     if mdns_advertiser:
@@ -240,7 +297,7 @@ async def lifespan(app: FastAPI):
             await mdns_advertiser.stop()
             logger.info("mDNS service advertisement stopped")
         except Exception as e:
-            logger.error(f"Error stopping mDNS advertisement: {e}")
+            logger.error("Error stopping mDNS advertisement: %s", _sanitize_log_value(e))
 
     # Stop OAuth cleanup task
     if oauth_cleanup_task:
@@ -251,7 +308,7 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             logger.info("OAuth cleanup task cancelled successfully")
         except Exception as e:
-            logger.error(f"Error stopping OAuth cleanup task: {e}")
+            logger.error("Error stopping OAuth cleanup task: %s", _sanitize_log_value(e))
 
     # Stop SSE manager
     await sse_manager.stop()
@@ -269,6 +326,7 @@ def create_app() -> FastAPI:
         description="HTTP REST API and SSE interface for semantic memory storage",
         version=__version__,
         lifespan=lifespan,
+        root_path=HTTP_ROOT_PATH,
         docs_url="/api/docs",
         redoc_url="/api/redoc"
     )
@@ -286,58 +344,68 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
-    
+
+    # Request body-size cap (disk/memory exhaustion + buffer-overflow guard).
+    # Global cap for all routes, tighter cap for /oauth/*, document ingestion
+    # exempt. Added last so it runs first (outermost) on the inbound path.
+    from .body_limit import BodySizeLimitMiddleware
+    app.add_middleware(BodySizeLimitMiddleware)
+
     # Include API routers
     logger.info("Including API routers...")
     app.include_router(health_router, prefix="/api", tags=["health"])
-    logger.info(f"✓ Included health router with {len(health_router.routes)} routes")
+    logger.info("✓ Included health router with %s routes", _sanitize_log_value(len(health_router.routes)))
     app.include_router(memories_router, prefix="/api", tags=["memories"])
-    logger.info(f"✓ Included memories router with {len(memories_router.routes)} routes")
+    logger.info("✓ Included memories router with %s routes", _sanitize_log_value(len(memories_router.routes)))
     app.include_router(search_router, prefix="/api", tags=["search"])
-    logger.info(f"✓ Included search router with {len(search_router.routes)} routes")
+    logger.info("✓ Included search router with %s routes", _sanitize_log_value(len(search_router.routes)))
     app.include_router(manage_router, prefix="/api/manage", tags=["management"])
-    logger.info(f"✓ Included manage router with {len(manage_router.routes)} routes")
+    logger.info("✓ Included manage router with %s routes", _sanitize_log_value(len(manage_router.routes)))
     app.include_router(analytics_router, prefix="/api/analytics", tags=["analytics"])
-    logger.info(f"✓ Included analytics router with {len(analytics_router.routes)} routes")
+    logger.info("✓ Included analytics router with %s routes", _sanitize_log_value(len(analytics_router.routes)))
     app.include_router(events_router, prefix="/api", tags=["events"])
-    logger.info(f"✓ Included events router with {len(events_router.routes)} routes")
+    logger.info("✓ Included events router with %s routes", _sanitize_log_value(len(events_router.routes)))
     app.include_router(sync_router, prefix="/api", tags=["sync"])
-    logger.info(f"✓ Included sync router with {len(sync_router.routes)} routes")
+    logger.info("✓ Included sync router with %s routes", _sanitize_log_value(len(sync_router.routes)))
     app.include_router(backup_router, prefix="/api", tags=["backup"])
-    logger.info(f"✓ Included backup router with {len(backup_router.routes)} routes")
+    logger.info("✓ Included backup router with %s routes", _sanitize_log_value(len(backup_router.routes)))
     app.include_router(quality_router, prefix="/api/quality", tags=["quality"])
-    logger.info(f"✓ Included quality router with {len(quality_router.routes)} routes")
+    logger.info("✓ Included quality router with %s routes", _sanitize_log_value(len(quality_router.routes)))
     try:
         app.include_router(documents_router, prefix="/api/documents", tags=["documents"])
-        logger.info(f"✓ Included documents router with {len(documents_router.routes)} routes")
+        logger.info("✓ Included documents router with %s routes", _sanitize_log_value(len(documents_router.routes)))
     except Exception as e:
-        logger.error(f"✗ Failed to include documents router: {e}")
-        import traceback
+        logger.error("✗ Failed to include documents router: %s", _sanitize_log_value(e))
+        import traceback  # inline import: only reached on this router-import failure
         logger.error(traceback.format_exc())
 
     # Include consolidation router
     app.include_router(consolidation_router, tags=["consolidation"])
-    logger.info(f"✓ Included consolidation router with {len(consolidation_router.routes)} routes")
+    logger.info("✓ Included consolidation router with %s routes", _sanitize_log_value(len(consolidation_router.routes)))
 
     # Include server management router
     app.include_router(server_router, prefix="/api/server", tags=["server-management"])
-    logger.info(f"✓ Included server router with {len(server_router.routes)} routes")
+    logger.info("✓ Included server router with %s routes", _sanitize_log_value(len(server_router.routes)))
 
     # Include configuration router
     app.include_router(configuration_router, prefix="/api", tags=["configuration"])
-    logger.info(f"✓ Included configuration router with {len(configuration_router.routes)} routes")
+    logger.info("✓ Included configuration router with %s routes", _sanitize_log_value(len(configuration_router.routes)))
 
     # Include OAuth status router (always available, returns disabled status if OAuth off)
     app.include_router(oauth_status_router, prefix="/api", tags=["oauth-status"])
-    logger.info(f"✓ Included OAuth status router with {len(oauth_status_router.routes)} routes")
+    logger.info("✓ Included OAuth status router with %s routes", _sanitize_log_value(len(oauth_status_router.routes)))
 
     # Include conflicts router (P3 conflict detection)
     app.include_router(conflicts_router, prefix="/api", tags=["conflicts"])
-    logger.info(f"✓ Included conflicts router with {len(conflicts_router.routes)} routes")
+    logger.info("✓ Included conflicts router with %s routes", _sanitize_log_value(len(conflicts_router.routes)))
 
     # Include session harvest router (Issue #630)
     app.include_router(harvest_router, tags=["harvest"])
-    logger.info(f"✓ Included harvest router with {len(harvest_router.routes)} routes")
+    logger.info("✓ Included harvest router with %s routes", _sanitize_log_value(len(harvest_router.routes)))
+
+    # Include delta-sync event feed router (#1345 Phase 4 — pull/push transport)
+    app.include_router(sync_events_router, prefix="/api", tags=["sync"])
+    logger.info("✓ Included sync_events router with %s routes", _sanitize_log_value(len(sync_events_router.routes)))
 
     # Include MCP protocol router
     app.include_router(mcp_router, tags=["mcp-protocol"])
@@ -356,10 +424,28 @@ def create_app() -> FastAPI:
     else:
         logger.info("OAuth 2.1 endpoints disabled")
 
+    # Include Prometheus metrics router if enabled (issue #1097, opt-in).
+    # Read the module-level flag (not the import-time local) so tests that
+    # monkeypatch ``web.app.METRICS_ENABLED`` and rebuild the app are honoured,
+    # exactly the way OAUTH_ENABLED gates its routers above.
+    if METRICS_ENABLED:
+        from .api.metrics import router as metrics_router
+        app.include_router(metrics_router, tags=["metrics"])
+        logger.info("Prometheus /metrics endpoint enabled")
+    else:
+        logger.info("Prometheus /metrics endpoint disabled")
+
     # Serve static files (dashboard)
     static_path = os.path.join(os.path.dirname(__file__), "static")
     if os.path.exists(static_path):
-        app.mount("/static", StaticFiles(directory=static_path), name="static")
+        app.mount(
+            "/static",
+            RootPathStaticFiles(
+                directory=static_path,
+                external_root_path=HTTP_ROOT_PATH,
+            ),
+            name="static",
+        )
     
     def get_api_overview_html():
         """Generate the API overview HTML template."""
@@ -735,13 +821,13 @@ def create_app() -> FastAPI:
                         <span>✅</span> <span id="version-display">Loading...</span> - Latest Release
                     </div>
                     <div class="nav-buttons">
-                        <a href="/" class="nav-btn">
+                        <a href="./" class="nav-btn">
                             <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
                                 <path d="M10,20V14H14V20H19V12H22L12,3L2,12H5V20H10Z"/>
                             </svg>
                             Interactive Dashboard
                         </a>
-                        <a href="/api/docs" class="nav-btn secondary" target="_blank">
+                        <a href="api/docs" class="nav-btn secondary" target="_blank">
                             <svg width="20" height="20" fill="currentColor" viewBox="0 0 24 24">
                                 <path d="M14,17H7V15H14M17,13H7V11H17M17,9H7V7H17M19,3H5C3.89,3 3,3.89 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19V5C21,3.89 20.1,3 19,3Z"/>
                             </svg>
@@ -770,10 +856,10 @@ def create_app() -> FastAPI:
                 </div>
                 
                 <div class="action-buttons">
-                    <a href="/api/docs" class="btn btn-primary">
+                    <a href="api/docs" class="btn btn-primary">
                         <span>📚</span> Interactive API Docs
                     </a>
-                    <a href="/api/redoc" class="btn btn-secondary">
+                    <a href="api/redoc" class="btn btn-secondary">
                         <span>📖</span> ReDoc Documentation
                     </a>
                     <a href="https://github.com/doobidoo/mcp-memory-service" class="btn btn-secondary" target="_blank">
@@ -788,22 +874,22 @@ def create_app() -> FastAPI:
                             <p class="endpoint-description">Store, retrieve, and manage semantic memories</p>
                         </div>
                         <div class="endpoint-list">
-                            <div class="endpoint-item" onclick="window.location.href='/api/docs#/memories/store_memory_api_memories_post'">
+                            <div class="endpoint-item" onclick="window.location.href='api/docs#/memories/store_memory_api_memories_post'">
                                 <span class="method method-post">POST</span>
                                 <span class="endpoint-path">/api/memories</span>
                                 <div class="endpoint-desc">Store a new memory with automatic embedding generation</div>
                             </div>
-                            <div class="endpoint-item" onclick="window.location.href='/api/docs#/memories/list_memories_api_memories_get'">
+                            <div class="endpoint-item" onclick="window.location.href='api/docs#/memories/list_memories_api_memories_get'">
                                 <span class="method method-get">GET</span>
                                 <span class="endpoint-path">/api/memories</span>
                                 <div class="endpoint-desc">List all memories with pagination support</div>
                             </div>
-                            <div class="endpoint-item" onclick="window.location.href='/api/docs#/memories/get_memory_api_memories__content_hash__get'">
+                            <div class="endpoint-item" onclick="window.location.href='api/docs#/memories/get_memory_api_memories__content_hash__get'">
                                 <span class="method method-get">GET</span>
                                 <span class="endpoint-path">/api/memories/{hash}</span>
                                 <div class="endpoint-desc">Retrieve a specific memory by content hash</div>
                             </div>
-                            <div class="endpoint-item" onclick="window.location.href='/api/docs#/memories/delete_memory_api_memories__content_hash__delete'">
+                            <div class="endpoint-item" onclick="window.location.href='api/docs#/memories/delete_memory_api_memories__content_hash__delete'">
                                 <span class="method method-delete">DELETE</span>
                                 <span class="endpoint-path">/api/memories/{hash}</span>
                                 <div class="endpoint-desc">Delete a memory and its embeddings</div>
@@ -817,22 +903,22 @@ def create_app() -> FastAPI:
                             <p class="endpoint-description">Powerful semantic and tag-based search</p>
                         </div>
                         <div class="endpoint-list">
-                            <div class="endpoint-item" onclick="window.location.href='/api/docs#/search/semantic_search_api_search_post'">
+                            <div class="endpoint-item" onclick="window.location.href='api/docs#/search/semantic_search_api_search_post'">
                                 <span class="method method-post">POST</span>
                                 <span class="endpoint-path">/api/search</span>
                                 <div class="endpoint-desc">Semantic similarity search using embeddings</div>
                             </div>
-                            <div class="endpoint-item" onclick="window.location.href='/api/docs#/search/tag_search_api_search_by_tag_post'">
+                            <div class="endpoint-item" onclick="window.location.href='api/docs#/search/tag_search_api_search_by_tag_post'">
                                 <span class="method method-post">POST</span>
                                 <span class="endpoint-path">/api/search/by-tag</span>
                                 <div class="endpoint-desc">Search memories by tags (AND/OR logic)</div>
                             </div>
-                            <div class="endpoint-item" onclick="window.location.href='/api/docs#/search/time_search_api_search_by_time_post'">
+                            <div class="endpoint-item" onclick="window.location.href='api/docs#/search/time_search_api_search_by_time_post'">
                                 <span class="method method-post">POST</span>
                                 <span class="endpoint-path">/api/search/by-time</span>
                                 <div class="endpoint-desc">Natural language time-based queries</div>
                             </div>
-                            <div class="endpoint-item" onclick="window.location.href='/api/docs#/search/find_similar_api_search_similar__content_hash__get'">
+                            <div class="endpoint-item" onclick="window.location.href='api/docs#/search/find_similar_api_search_similar__content_hash__get'">
                                 <span class="method method-get">GET</span>
                                 <span class="endpoint-path">/api/search/similar/{hash}</span>
                                 <div class="endpoint-desc">Find memories similar to a specific one</div>
@@ -846,17 +932,17 @@ def create_app() -> FastAPI:
                             <p class="endpoint-description">Server-Sent Events for live updates</p>
                         </div>
                         <div class="endpoint-list">
-                            <div class="endpoint-item" onclick="window.location.href='/api/events'">
+                            <div class="endpoint-item" onclick="window.location.href='api/events'">
                                 <span class="method method-get">GET</span>
                                 <span class="endpoint-path">/api/events</span>
                                 <div class="endpoint-desc">Subscribe to real-time memory events stream</div>
                             </div>
-                            <div class="endpoint-item" onclick="window.location.href='/api/events/stats'">
+                            <div class="endpoint-item" onclick="window.location.href='api/events/stats'">
                                 <span class="method method-get">GET</span>
                                 <span class="endpoint-path">/api/events/stats</span>
                                 <div class="endpoint-desc">View SSE connection statistics</div>
                             </div>
-                            <div class="endpoint-item" onclick="window.location.href='/static/sse_test.html'">
+                            <div class="endpoint-item" onclick="window.location.href='static/sse_test.html'">
                                 <span class="method method-get">GET</span>
                                 <span class="endpoint-path">/static/sse_test.html</span>
                                 <div class="endpoint-desc">Interactive SSE testing interface</div>
@@ -870,22 +956,22 @@ def create_app() -> FastAPI:
                             <p class="endpoint-description">Monitor service health and performance</p>
                         </div>
                         <div class="endpoint-list">
-                            <div class="endpoint-item" onclick="window.location.href='/api/health'">
+                            <div class="endpoint-item" onclick="window.location.href='api/health'">
                                 <span class="method method-get">GET</span>
                                 <span class="endpoint-path">/api/health</span>
                                 <div class="endpoint-desc">Quick health check endpoint</div>
                             </div>
-                            <div class="endpoint-item" onclick="window.location.href='/api/health/detailed'">
+                            <div class="endpoint-item" onclick="window.location.href='api/health/detailed'">
                                 <span class="method method-get">GET</span>
                                 <span class="endpoint-path">/api/health/detailed</span>
                                 <div class="endpoint-desc">Detailed health with database statistics</div>
                             </div>
-                            <div class="endpoint-item" onclick="window.location.href='/api/docs'">
+                            <div class="endpoint-item" onclick="window.location.href='api/docs'">
                                 <span class="method method-get">GET</span>
                                 <span class="endpoint-path">/api/docs</span>
                                 <div class="endpoint-desc">Interactive Swagger UI documentation</div>
                             </div>
-                            <div class="endpoint-item" onclick="window.location.href='/api/redoc'">
+                            <div class="endpoint-item" onclick="window.location.href='api/redoc'">
                                 <span class="method method-get">GET</span>
                                 <span class="endpoint-path">/api/redoc</span>
                                 <div class="endpoint-desc">Alternative ReDoc documentation</div>
@@ -933,10 +1019,10 @@ def create_app() -> FastAPI:
                 // Fetch and display live stats
                 async function updateStats() {
                     try {
-                        const healthResponse = await fetch('/api/health');
+                        const healthResponse = await fetch('api/health');
                         const health = await healthResponse.json();
 
-                        const detailedResponse = await fetch('/api/health/detailed', { headers: getAuthHeaders() });
+                        const detailedResponse = await fetch('api/health/detailed', { headers: getAuthHeaders() });
                         const detailed = await detailedResponse.json();
                         
                         const stats = document.getElementById('stats');
@@ -946,7 +1032,14 @@ def create_app() -> FastAPI:
                                 <div class="stat-label">Total Memories</div>
                             </div>
                             <div class="stat-card">
-                                <div class="stat-value">all-MiniLM-L6-v2</div>
+                                <!-- Two paths, same order as static/app.js's
+                                     settingsEmbeddingModel sources: the hybrid
+                                     backend reports the name under
+                                     primary_stats, everything else at the top
+                                     level. Reading only one of them shows
+                                     "unknown" on whichever backend is not
+                                     covered. -->
+                                <div class="stat-value">${detailed.storage?.primary_stats?.embedding_model || detailed.storage?.embedding_model || 'unknown'}</div>
                                 <div class="stat-label">Embedding Model</div>
                             </div>
                             <div class="stat-card">
@@ -985,7 +1078,7 @@ def create_app() -> FastAPI:
                 async function loadDynamicInfo() {
                     try {
                         // Load detailed health information
-                        const response = await fetch('/api/health/detailed', { headers: getAuthHeaders() });
+                        const response = await fetch('api/health/detailed', { headers: getAuthHeaders() });
                         if (!response.ok) {
                             throw new Error(`HTTP ${response.status}`);
                         }
@@ -1058,13 +1151,19 @@ def create_app() -> FastAPI:
             if os.path.exists(dashboard_path):
                 # Read and serve the migrated dashboard
                 with open(dashboard_path, 'r', encoding='utf-8') as f:
-                    return f.read()
+                    dashboard_html = f.read()
+                base_href = escape(f"{HTTP_ROOT_PATH}/" if HTTP_ROOT_PATH else "/", quote=True)
+                return dashboard_html.replace(
+                    "<head>",
+                    f'<head>\n    <base href="{base_href}">',
+                    1,
+                )
             else:
                 # Fallback to original template if dashboard not found
                 return html_template
         except Exception as e:
             # Error fallback to original template
-            logger.warning(f"Error loading migrated dashboard: {e}")
+            logger.warning("Error loading migrated dashboard: %s", _sanitize_log_value(e))
             return html_template
 
     @app.get("/api/languages")
@@ -1094,7 +1193,7 @@ def create_app() -> FastAPI:
             return {"languages": languages}
 
         except Exception as e:
-            logger.error(f"Error scanning i18n directory: {e}")
+            logger.error("Error scanning i18n directory: %s", _sanitize_log_value(e))
             return {"languages": ["en"]}  # Fallback to English on error
 
     return app

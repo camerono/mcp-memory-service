@@ -1,17 +1,13 @@
 """Tests for NVIDIA DeBERTa quality classifier integration."""
 
+import os
+import time
+
 import pytest
-from pathlib import Path
 from mcp_memory_service.quality.onnx_ranker import ONNXRankerModel, get_onnx_ranker_model
 from mcp_memory_service.quality.config import QualityConfig, SUPPORTED_MODELS
 
-# Check if ONNX models are available
-DEBERTA_AVAILABLE = Path.home().joinpath(
-    ".cache/mcp_memory/onnx_models/nvidia-quality-classifier-deberta/model.onnx"
-).exists()
-MS_MARCO_AVAILABLE = Path.home().joinpath(
-    ".cache/mcp_memory/onnx_models/ms-marco-MiniLM-L-6-v2/model.onnx"
-).exists()
+from tests.quality_model_availability import DEBERTA_AVAILABLE, MS_MARCO_AVAILABLE
 
 
 class TestModelRegistry:
@@ -229,7 +225,6 @@ class TestBackwardCompatibility:
 
     def test_config_override_to_ms_marco(self):
         """Test users can override config back to MS-MARCO."""
-        import os
         original_value = os.getenv('MCP_QUALITY_LOCAL_MODEL')
 
         try:
@@ -251,7 +246,6 @@ class TestPerformance:
 
     def test_deberta_inference_speed(self):
         """Test DeBERTa inference completes within acceptable time."""
-        import time
 
         model = get_onnx_ranker_model(
             model_name='nvidia-quality-classifier-deberta',
@@ -283,7 +277,6 @@ class TestPerformance:
     @pytest.mark.skipif(not MS_MARCO_AVAILABLE, reason="MS-MARCO model not found")
     def test_performance_comparison(self):
         """Compare DeBERTa vs MS-MARCO inference speed."""
-        import time
 
         deberta = get_onnx_ranker_model(
             model_name='nvidia-quality-classifier-deberta',

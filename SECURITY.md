@@ -6,9 +6,11 @@ We actively maintain and provide security updates for the following versions of 
 
 | Version | Supported          | Notes |
 | ------- | ------------------ | ----- |
-| 8.x.x   | :white_check_mark: | Current stable release - full support |
-| 7.x.x   | :white_check_mark: | Previous stable - security fixes only |
-| < 7.0   | :x:                | No longer supported |
+| 11.x.x  | :white_check_mark: | Current stable release - full support |
+| < 11.0  | :x:                | No longer supported - upgrade to 11.x |
+
+There is no maintenance branch for older major versions. Security fixes land on
+`main` and ship in the next 11.x release; they are not backported.
 
 ## Reporting a Vulnerability
 
@@ -16,18 +18,21 @@ We take the security of MCP Memory Service seriously. If you discover a security
 
 ### How to Report
 
-**For sensitive security issues**, please use one of these private reporting methods:
+Development of this project happens on
+[GitHub](https://github.com/doobidoo/mcp-memory-service). Issues there are public from
+the moment they are opened, which is fine for everything except an unfixed
+vulnerability. GitHub Security Advisories are the confidential channel for those: the
+report stays private until a fix ships, and that is where sensitive reports go.
 
-1. **GitHub Security Advisory** (Preferred):
-   - Navigate to the [Security Advisories](https://github.com/doobidoo/mcp-memory-service/security/advisories) page
-   - Click "Report a vulnerability"
-   - Provide detailed information about the vulnerability
+**For sensitive security issues** - anything exploitable, or anything you would not
+want public before a fix ships:
 
-2. **Direct Contact**:
-   - Open a GitHub Discussion with `[SECURITY]` prefix for initial contact
-   - We'll provide a secure communication channel for details
+- Open a private report through [GitHub Security Advisories](https://github.com/doobidoo/mcp-memory-service/security/advisories/new)
+- Provide detailed information about the vulnerability (see below)
 
-**For non-sensitive security concerns**, you may open a regular GitHub issue.
+**For non-sensitive security concerns** - hardening suggestions, dependency
+questions, defaults you find too permissive - open a regular
+[GitHub issue](https://github.com/doobidoo/mcp-memory-service/issues).
 
 ### What to Include
 
@@ -149,8 +154,8 @@ We use the following severity levels to prioritize security issues:
 ## Security Updates
 
 Security patches are released as:
-- **Patch versions** (8.x.Y) for low/medium severity
-- **Minor versions** (8.X.0) for high severity requiring API changes
+- **Patch versions** (11.x.Y) for low/medium severity
+- **Minor versions** (11.X.0) for high severity requiring API changes
 - **Out-of-band releases** for critical vulnerabilities
 
 Security advisories are published at:
@@ -173,18 +178,18 @@ We appreciate security researchers following responsible disclosure practices an
 
 ## Security Hall of Fame
 
-We recognize security researchers who help make MCP Memory Service more secure:
-
-<!-- Security contributors will be listed here -->
-*No security vulnerabilities have been publicly disclosed to date.*
+We recognize security researchers who help make MCP Memory Service more secure.
+Reporters are credited by name in the advisory for the vulnerability they found -
+see the [published advisories](https://github.com/doobidoo/mcp-memory-service/security/advisories)
+for the full list.
 
 ## Contact
 
 For security concerns that don't fit the above categories:
-- **General Security Questions**: [GitHub Discussions](https://github.com/doobidoo/mcp-memory-service/discussions)
+- **General Security Questions**: [GitHub issue](https://github.com/doobidoo/mcp-memory-service/issues)
 - **Project Security**: See reporting instructions above
 
 ---
 
-**Last Updated**: November 2025
-**Policy Version**: 1.0
+**Last Updated**: August 2026
+**Policy Version**: 1.1

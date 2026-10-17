@@ -28,7 +28,7 @@ storage backend (e.g., SQLite).
 import time
 import asyncio
 from typing import Dict, Optional
-from .base import OAuthStorage
+from .base import OAuthStorage, hash_client_secret, is_hashed_secret, verify_client_secret
 from ..models import RegisteredClient
 from ....config import (
     OAUTH_ACCESS_TOKEN_EXPIRE_MINUTES,
@@ -76,7 +76,16 @@ class MemoryOAuthStorage(OAuthStorage):
             client: RegisteredClient instance containing client metadata
         """
         async with self._lock:
-            self._clients[client.client_id] = client
+            # Hash the secret at rest unless already hashed (legacy upgrade path).
+            # A public client carries no secret; hashing the empty string would
+            # store the SHA-256 of "" and make a secretless client look like it
+            # has one, so leave an empty value as it is.
+            if not client.client_secret or is_hashed_secret(client.client_secret):
+                self._clients[client.client_id] = client
+            else:
+                self._clients[client.client_id] = client.model_copy(
+                    update={"client_secret": hash_client_secret(client.client_secret)}
+                )
 
     async def get_client(self, client_id: str) -> Optional[RegisteredClient]:
         """
@@ -105,7 +114,14 @@ class MemoryOAuthStorage(OAuthStorage):
         client = await self.get_client(client_id)
         if not client:
             return False
-        return client.client_secret == client_secret
+        if not verify_client_secret(client.client_secret, client_secret):
+            return False
+        # Transparently upgrade legacy plaintext rows to a hash on next use.
+        if not is_hashed_secret(client.client_secret):
+            self._clients[client_id] = client.model_copy(
+                update={"client_secret": hash_client_secret(client_secret)}
+            )
+        return True
 
     async def store_authorization_code(
         self,

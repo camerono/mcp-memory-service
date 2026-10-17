@@ -21,8 +21,7 @@ Implements RFC 7591 - OAuth 2.0 Dynamic Client Registration Protocol.
 import secrets
 import time
 import logging
-from typing import List, Optional
-from urllib.parse import urlparse, ParseResult
+from typing import List
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import ValidationError
 
@@ -32,6 +31,8 @@ from .models import (
     RegisteredClient
 )
 from .storage import get_oauth_storage
+from .rate_limit import auth_rate_limit
+from .redirect import validate_registration_redirect_uris
 from mcp_memory_service.config import DCR_REGISTRATION_KEY
 
 logger = logging.getLogger(__name__)
@@ -44,134 +45,9 @@ def _sanitize_log_value(value: object) -> str:
     return str(value).replace("\n", "\\n").replace("\r", "\\r").replace("\x1b", "\\x1b")
 
 
-def validate_redirect_uris(redirect_uris: Optional[List[str]]) -> None:
-    """
-    Validate redirect URIs according to OAuth 2.1 security requirements.
-
-    Uses proper URL parsing to prevent bypass attacks and validates schemes
-    against a secure whitelist to prevent dangerous scheme injection.
-    """
-    if not redirect_uris:
-        return
-
-    # Allowed schemes - whitelist approach for security
-    ALLOWED_SCHEMES = {
-        'https',    # HTTPS (preferred)
-        'http',     # HTTP (localhost only)
-        # IDE deep-link schemes for OAuth callback in editor extensions
-        'cursor',
-        'vscode',
-        'vscode-insiders',
-        # Native app custom schemes (common patterns)
-        'com.example.app',  # Reverse domain notation
-        'myapp',           # Simple custom scheme
-        # Add more custom schemes as needed, but NEVER allow:
-        # javascript:, data:, file:, vbscript:, about:, chrome:, etc.
-    }
-
-    # Dangerous schemes that must be blocked
-    DANGEROUS_SCHEMES = {
-        'javascript', 'data', 'file', 'vbscript', 'about', 'chrome',
-        'chrome-extension', 'moz-extension', 'ms-appx', 'blob'
-    }
-
-    for uri in redirect_uris:
-        uri_str = str(uri).strip()
-
-        if not uri_str:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail={
-                    "error": "invalid_redirect_uri",
-                    "error_description": "Empty redirect URI not allowed"
-                }
-            )
-
-        try:
-            # Parse URL using proper URL parser to prevent bypass attacks
-            parsed: ParseResult = urlparse(uri_str)
-
-            if not parsed.scheme:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail={
-                        "error": "invalid_redirect_uri",
-                        "error_description": f"Missing scheme in redirect URI: {uri_str}"
-                    }
-                )
-
-            # Check for dangerous schemes first (security)
-            if parsed.scheme.lower() in DANGEROUS_SCHEMES:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail={
-                        "error": "invalid_redirect_uri",
-                        "error_description": f"Dangerous scheme '{parsed.scheme}' not allowed in redirect URI"
-                    }
-                )
-
-            # For HTTP scheme, enforce strict localhost validation
-            if parsed.scheme.lower() == 'http':
-                if not parsed.netloc:
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail={
-                            "error": "invalid_redirect_uri",
-                            "error_description": f"HTTP URI missing host: {uri_str}"
-                        }
-                    )
-
-                # Extract hostname from netloc (handles port numbers correctly)
-                hostname = parsed.hostname
-                if not hostname:
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail={
-                            "error": "invalid_redirect_uri",
-                            "error_description": f"Cannot extract hostname from HTTP URI: {uri_str}"
-                        }
-                    )
-
-                # Strict localhost validation - only allow exact matches
-                if hostname.lower() not in ('localhost', '127.0.0.1', '::1'):
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail={
-                            "error": "invalid_redirect_uri",
-                            "error_description": f"HTTP redirect URIs must use localhost, 127.0.0.1, or ::1. Got: {hostname}"
-                        }
-                    )
-
-            # For HTTPS, allow any valid hostname (production requirement)
-            elif parsed.scheme.lower() == 'https':
-                if not parsed.netloc:
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail={
-                            "error": "invalid_redirect_uri",
-                            "error_description": f"HTTPS URI missing host: {uri_str}"
-                        }
-                    )
-
-            # For custom schemes (native apps), validate they're in allowed list
-            elif parsed.scheme.lower() not in [s.lower() for s in ALLOWED_SCHEMES]:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail={
-                        "error": "invalid_redirect_uri",
-                        "error_description": f"Unsupported scheme '{parsed.scheme}'. Allowed: {', '.join(sorted(ALLOWED_SCHEMES))}"
-                    }
-                )
-
-        except ValueError as e:
-            # URL parsing failed
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail={
-                    "error": "invalid_redirect_uri",
-                    "error_description": f"Invalid URL format: {uri_str}. Error: {str(e)}"
-                }
-            )
+# Redirect-URI scheme validation lives in one place (oauth/redirect.py). This
+# thin alias preserves the historical import path used by callers and tests.
+validate_redirect_uris = validate_registration_redirect_uris
 
 
 def validate_grant_types(grant_types: List[str]) -> None:
@@ -242,7 +118,45 @@ def _validate_registration_key(raw_request: Request) -> None:
         )
 
 
-@router.post("/register", response_model=ClientRegistrationResponse, status_code=status.HTTP_201_CREATED)
+def _refuse_client_credentials_while_open(grant_types) -> None:
+    """Reject a self-service registration that asks for client_credentials.
+
+    With MCP_DCR_REGISTRATION_KEY unset this endpoint is open by design, for
+    RFC 7591 and Claude.ai Remote MCP. That is defensible for
+    authorization_code, which puts a human in the loop before any token
+    exists. client_credentials has no such step: a caller could register
+    itself as confidential, exchange its own client_id and client_secret, and
+    hold a read-write token without the owner ever being consulted
+    (GHSA-6mvm-q4j3-27qg). The grant is machine-to-machine, so the
+    registration behind it has to be gated too.
+
+    The token endpoint refuses the same combination independently. That is
+    not redundant: this check only covers registrations made from now on,
+    while the advisory is about clients that already registered.
+    """
+    if not grant_types or "client_credentials" not in grant_types:
+        return
+    if DCR_REGISTRATION_KEY:
+        return
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail={
+            "error": "invalid_client_metadata",
+            "error_description": (
+                "The client_credentials grant requires gated registration. "
+                "Set MCP_DCR_REGISTRATION_KEY and register with it, or use "
+                "authorization_code with PKCE."
+            ),
+        },
+    )
+
+
+@router.post(
+    "/register",
+    response_model=ClientRegistrationResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(auth_rate_limit)],
+)
 async def register_client(
     request: ClientRegistrationRequest,
     _: None = Depends(_validate_registration_key),
@@ -269,14 +183,23 @@ async def register_client(
         if request.response_types:
             validate_response_types(request.response_types)
 
-        # Generate client credentials
-        client_id = get_oauth_storage().generate_client_id()
-        client_secret = get_oauth_storage().generate_client_secret()
+        _refuse_client_credentials_while_open(request.grant_types)
 
         # Prepare default values
         grant_types = request.grant_types or ["authorization_code"]
         response_types = request.response_types or ["code"]
         token_endpoint_auth_method = request.token_endpoint_auth_method or "client_secret_basic"
+
+        # Generate client credentials. A public client (RFC 7591: auth method
+        # "none", e.g. the PKCE flow claude.ai uses) must not be issued a secret
+        # at all — handing one out let a caller turn a registration into client
+        # authentication. The empty string is stored rather than None so the model
+        # and the SQLite row stay unchanged; verify_client_secret() already
+        # refuses an empty stored secret, so such a client cannot authenticate
+        # with one.
+        client_id = get_oauth_storage().generate_client_id()
+        is_public_client = token_endpoint_auth_method == "none"
+        client_secret = "" if is_public_client else get_oauth_storage().generate_client_secret()
 
         # Create registered client
         registered_client = RegisteredClient(
@@ -293,10 +216,10 @@ async def register_client(
         # Store the client
         await get_oauth_storage().store_client(registered_client)
 
-        # Create response
+        # Create response. client_secret is omitted entirely for a public client.
         response = ClientRegistrationResponse(
             client_id=client_id,
-            client_secret=client_secret,
+            client_secret=client_secret or None,
             redirect_uris=registered_client.redirect_uris,
             grant_types=grant_types,
             response_types=response_types,
@@ -308,7 +231,7 @@ async def register_client(
         return response
 
     except ValidationError as e:
-        logger.warning(f"OAuth client registration validation error: {e}")
+        logger.warning(f"OAuth client registration validation error: {_sanitize_log_value(e)}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={
@@ -320,7 +243,7 @@ async def register_client(
         # Re-raise HTTP exceptions (validation errors)
         raise
     except Exception as e:
-        logger.error(f"OAuth client registration error: {e}")
+        logger.error(f"OAuth client registration error: {_sanitize_log_value(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={

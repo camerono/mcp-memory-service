@@ -12,6 +12,7 @@ Covers:
 import asyncio
 import hashlib
 import os
+import sqlite3
 import time
 from datetime import datetime
 from pathlib import Path
@@ -26,13 +27,7 @@ from mcp_memory_service.quality.ai_evaluator import QualityEvaluator
 from mcp_memory_service.quality.async_scorer import AsyncQualityScorer
 from mcp_memory_service.quality.config import QualityConfig
 
-# Check if ONNX models are available for integration tests
-DEBERTA_AVAILABLE = Path.home().joinpath(
-    ".cache/mcp_memory/onnx_models/nvidia-quality-classifier-deberta/model.onnx"
-).exists()
-MS_MARCO_AVAILABLE = Path.home().joinpath(
-    ".cache/mcp_memory/onnx_models/ms-marco-MiniLM-L-6-v2/model.onnx"
-).exists()
+from tests.quality_model_availability import DEBERTA_AVAILABLE, MS_MARCO_AVAILABLE
 
 
 def _make_memory(content: str, tags=None) -> Memory:
@@ -296,7 +291,6 @@ class TestStoreBatchMocked:
 
     async def test_batch_embedding_failure_rolls_back_memory(self):
         """If embedding INSERT fails, SAVEPOINT rollback prevents orphaned memories row."""
-        import sqlite3
         from mcp_memory_service.storage.sqlite_vec import SqliteVecMemoryStorage
 
         storage = SqliteVecMemoryStorage.__new__(SqliteVecMemoryStorage)

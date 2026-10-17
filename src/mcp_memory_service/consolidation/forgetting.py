@@ -24,6 +24,7 @@ import hashlib
 
 from .base import ConsolidationBase, ConsolidationConfig
 from .decay import RelevanceScore
+from ..compat import _sanitize_log_value
 from ..models.memory import Memory
 
 @dataclass
@@ -103,7 +104,7 @@ class ControlledForgettingEngine(ConsolidationBase):
             action = result.action_taken
             actions_summary[action] = actions_summary.get(action, 0) + 1
         
-        self.logger.info(f"Forgetting results: {actions_summary}")
+        self.logger.info("Forgetting results: %s", _sanitize_log_value(actions_summary))
         return results
     
     async def _identify_forgetting_candidates(
@@ -161,8 +162,14 @@ class ControlledForgettingEngine(ConsolidationBase):
                     last_accessed = last_accessed.replace(tzinfo=timezone.utc)
                 days_since_access = (current_time - last_accessed).days
 
-                # Quality-based retention thresholds
-                quality_score = memory.quality_score
+                # Quality-based retention thresholds.
+                # Read computed_quality (machine score), NOT the effective quality_score:
+                # a human down-vote de-ranks search but must not push a memory toward
+                # deletion — forgetting is not reversible the way ranking is (#1312).
+                # Fallback to quality_score for memories stored before the split.
+                quality_score = memory.metadata.get(
+                    "computed_quality", memory.quality_score
+                )
 
                 if quality_score >= 0.7:
                     # High quality: Keep longer
@@ -181,8 +188,11 @@ class ControlledForgettingEngine(ConsolidationBase):
                 if days_since_access > threshold_days:
                     forgetting_reasons.append("old_access")
                     self.logger.info(
-                        f"Archival candidate: {memory.content_hash[:12]} quality={quality_score:.2f}, "
-                        f"inactive={days_since_access:.0f}d, threshold={threshold_days}d"
+                        "Archival candidate: %s quality=%s, inactive=%sd, threshold=%sd",
+                        _sanitize_log_value(memory.content_hash[:12]),
+                        _sanitize_log_value(f"{quality_score:.2f}"),
+                        _sanitize_log_value(f"{days_since_access:.0f}"),
+                        _sanitize_log_value(threshold_days)
                     )
                     if days_since_access > threshold_days * 2:
                         archive_priority = min(archive_priority, 1)  # High priority
@@ -208,8 +218,10 @@ class ControlledForgettingEngine(ConsolidationBase):
                 forgetting_reasons.append("low_quality")
                 archive_priority = min(archive_priority, 2)
             
-            # Duplicate content check
-            if self._appears_to_be_duplicate(memory, memories):
+            # Duplicate content check. Only the *redundant* copies are flagged: the
+            # best-ranked member of a near-duplicate group is never a candidate, so
+            # deduplication always leaves a survivor in storage.
+            if self._is_redundant_copy(memory, memories, score_lookup):
                 forgetting_reasons.append("potential_duplicate")
                 can_be_deleted = True
                 archive_priority = 1
@@ -235,7 +247,7 @@ class ControlledForgettingEngine(ConsolidationBase):
         # Sort by priority (higher priority = lower number = first in list)
         candidates.sort(key=lambda c: (c.archive_priority, -c.relevance_score.total_score))
         
-        self.logger.info(f"Identified {len(candidates)} forgetting candidates")
+        self.logger.info("Identified %s forgetting candidates", _sanitize_log_value(len(candidates)))
         return candidates
     
     def _is_low_quality_content(self, memory: Memory) -> bool:
@@ -269,40 +281,79 @@ class ControlledForgettingEngine(ConsolidationBase):
         return False
     
     def _appears_to_be_duplicate(self, memory: Memory, all_memories: List[Memory]) -> bool:
-        """Check if memory appears to be a duplicate of another memory."""
+        """Check if memory appears to be a duplicate of another memory.
+
+        Note this is a *symmetric* relation, so it is true for both members of a pair.
+        Use :meth:`_is_redundant_copy` to decide what may be deleted.
+        """
+        return any(self._is_near_duplicate_of(memory, other) for other in all_memories
+                   if other.content_hash != memory.content_hash)
+
+    def _is_near_duplicate_of(self, memory: Memory, other_memory: Memory) -> bool:
+        """Pairwise near-duplicate test. Symmetric by construction."""
         content = memory.content.strip().lower()
-        
+
         # Skip very short content for duplicate detection
         if len(content) < 20:
             return False
-        
+
+        other_content = other_memory.content.strip().lower()
+
+        # Exact match
+        if content == other_content:
+            return True
+
+        # Very similar content (simple check): only worth testing on longer texts
+        if min(len(content), len(other_content)) <= 50:
+            return False
+
+        # Check if one is a substring of the other with high overlap
+        if content in other_content or other_content in content:
+            return True
+
+        # Check word overlap
+        words1 = set(content.split())
+        words2 = set(other_content.split())
+        if min(len(words1), len(words2)) <= 5:
+            return False
+
+        overlap = len(words1.intersection(words2))
+        union = len(words1.union(words2))
+        return overlap / union > 0.8  # 80% word overlap
+
+    @staticmethod
+    def _keep_rank(memory: Memory, score_lookup: Dict[str, "RelevanceScore"]):
+        """Sort key for "which copy is worth keeping" - lower sorts first (kept)."""
+        score = score_lookup.get(memory.content_hash)
+        return (
+            -(score.total_score if score else 0.0),   # best relevance first
+            memory.created_at or 0.0,                  # then the original, not the copy
+            memory.content_hash or "",                 # then a stable tiebreak
+        )
+
+    def _is_redundant_copy(
+        self,
+        memory: Memory,
+        all_memories: List[Memory],
+        score_lookup: Dict[str, "RelevanceScore"],
+    ) -> bool:
+        """True only if a near-duplicate exists that OUTRANKS this memory.
+
+        `_appears_to_be_duplicate` is symmetric, so flagging on it deleted *every*
+        member of a duplicate group instead of the extras. Ranking each candidate
+        against its own duplicates fixes that without needing to build groups first,
+        which matters because near-duplicate matching is not transitive: the
+        best-ranked member of any group is outranked by nobody, so it is never
+        flagged and always survives.
+        """
+        mine = self._keep_rank(memory, score_lookup)
         for other_memory in all_memories:
             if other_memory.content_hash == memory.content_hash:
                 continue
-            
-            other_content = other_memory.content.strip().lower()
-            
-            # Exact match
-            if content == other_content:
+            if not self._is_near_duplicate_of(memory, other_memory):
+                continue
+            if self._keep_rank(other_memory, score_lookup) < mine:
                 return True
-            
-            # Very similar content (simple check)
-            if len(content) > 50 and len(other_content) > 50:
-                # Check if one is a substring of the other with high overlap
-                if content in other_content or other_content in content:
-                    return True
-                
-                # Check word overlap
-                words1 = set(content.split())
-                words2 = set(other_content.split())
-                
-                if len(words1) > 5 and len(words2) > 5:
-                    overlap = len(words1.intersection(words2))
-                    union = len(words1.union(words2))
-                    
-                    if overlap / union > 0.8:  # 80% word overlap
-                        return True
-        
         return False
     
     async def _process_forgetting_candidate(self, candidate: ForgettingCandidate) -> ForgettingResult:
@@ -324,7 +375,7 @@ class ControlledForgettingEngine(ConsolidationBase):
                 return await self._compress_memory(candidate)
         
         except Exception as e:
-            self.logger.error(f"Error processing forgetting candidate {memory.content_hash}: {e}")
+            self.logger.error("Error processing forgetting candidate %s: %s", _sanitize_log_value(memory.content_hash), _sanitize_log_value(e))
             return ForgettingResult(
                 memory_hash=memory.content_hash,
                 action_taken='skipped',
@@ -554,7 +605,7 @@ class ControlledForgettingEngine(ConsolidationBase):
                         return Memory.from_dict(memory_data)
                 
                 except Exception as e:
-                    self.logger.warning(f"Error reading archive file {archive_file}: {e}")
+                    self.logger.warning("Error reading archive file %s: %s", _sanitize_log_value(archive_file), _sanitize_log_value(e))
         
         return None
     
@@ -603,6 +654,6 @@ class ControlledForgettingEngine(ConsolidationBase):
                                 stats['newest_archive'] = timestamp
                                 
             except Exception as e:
-                self.logger.warning(f"Error reading forgetting log: {e}")
+                self.logger.warning("Error reading forgetting log: %s", _sanitize_log_value(e))
         
         return stats

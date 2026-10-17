@@ -43,7 +43,7 @@ class CreativeAssociationEngine(ConsolidationBase):
     
     Similar to how dreams create unexpected associations, this engine randomly
     pairs memories to discover non-obvious connections in the "sweet spot"
-    of moderate similarity (0.3-0.7 range).
+    of moderate similarity (0.45-0.7 range).
     """
     
     def __init__(self, config: ConsolidationConfig):
@@ -65,6 +65,12 @@ class CreativeAssociationEngine(ConsolidationBase):
     
     async def process(self, memories: List[Memory], **kwargs) -> List[MemoryAssociation]:
         """Discover creative associations between memories."""
+        # Exclude consolidation-generated association records from the candidate
+        # pool. Without this, every run also relates prior associations to each
+        # other and to new ones, producing "meta-associations" (assoc_X_assoc_Y)
+        # that compound with each subsequent run.
+        memories = [m for m in memories if "association" not in m.tags]
+
         if not self._validate_memories(memories) or len(memories) < 2:
             return []
         
@@ -88,7 +94,7 @@ class CreativeAssociationEngine(ConsolidationBase):
             if self.min_similarity <= similarity <= self.max_similarity:
                 analysis = await self._analyze_association(mem1, mem2, similarity)
                 
-                if analysis.confidence_score > 0.3:  # Minimum confidence threshold
+                if analysis.confidence_score >= 0.5:  # Minimum confidence threshold
                     association = await self._create_association_memory(analysis)
                     associations.append(association)
         
@@ -237,7 +243,12 @@ class CreativeAssociationEngine(ConsolidationBase):
         return concepts
     
     def _analyze_temporal_relationship(self, mem1: Memory, mem2: Memory) -> Optional[str]:
-        """Analyze temporal relationship between memories."""
+        """Analyze temporal relationship between memories.
+
+        Returns a label only when two memories are genuinely close in time
+        (within 7 days).  Wider gaps do not constitute meaningful temporal
+        proximity for association discovery.
+        """
         if not (mem1.created_at and mem2.created_at):
             return None
         
@@ -248,12 +259,8 @@ class CreativeAssociationEngine(ConsolidationBase):
             return "same_day"
         elif days_diff < 7:
             return "same_week"
-        elif days_diff < 30:
-            return "same_month"
-        elif days_diff < 365:
-            return "same_year"
         else:
-            return "different_years"
+            return None
     
     def _has_similar_structure(self, text1: str, text2: str) -> bool:
         """Check if texts have similar structural patterns."""

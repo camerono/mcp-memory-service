@@ -2,15 +2,15 @@
 Server-Sent Events endpoints for real-time updates.
 """
 
-from fastapi import APIRouter, Request, Depends
+from fastapi import APIRouter, Request, Depends, Query
 from pydantic import BaseModel
-from typing import List
+from typing import List, Optional
 
 # OAuth config no longer needed - auth is always enabled
-from ..sse import create_event_stream, sse_manager
+from ..sse import create_event_stream, sse_manager, parse_store_subscription
 
 # OAuth authentication imports
-from ..oauth.middleware import require_read_access, AuthenticationResult
+from ..oauth.middleware import require_read_access, get_current_user, AuthenticationResult
 
 router = APIRouter()
 
@@ -34,11 +34,22 @@ class SSEStatsResponse(BaseModel):
 @router.get("/events")
 async def events_endpoint(
     request: Request,
-    user: AuthenticationResult = Depends(require_read_access)
+    store: Optional[List[str]] = Query(
+        None,
+        description=(
+            "Restrict the stream to one or more store partitions. Repeat the "
+            "param to select several (e.g. ?store=default or "
+            "?store=a&store=b). Each value is an exact store name. Omit it, or "
+            "pass 'all', for the firehose (every store). System events "
+            "(heartbeat, health, connection lifecycle) are always delivered "
+            "regardless of this filter."
+        ),
+    ),
+    user: AuthenticationResult = Depends(get_current_user)
 ):
     """
     Server-Sent Events endpoint for real-time updates.
-    
+
     Provides a continuous stream of events including:
     - memory_stored: When new memories are added
     - memory_deleted: When memories are removed
@@ -46,7 +57,25 @@ async def events_endpoint(
     - health_update: System status changes
     - heartbeat: Periodic keep-alive signals
     - connection_established: Welcome message
+
+    memory_stored / memory_deleted events carry the store partition they
+    belong to and are filtered with the ``store`` query parameter. The filter
+    is scope-enforced: a caller may subscribe only to stores it has read
+    access to. A caller with a global ``read`` scope may use the firehose
+    (every store); a store-restricted caller (e.g. ``read:projectA``) must name
+    its stores and cannot subscribe to the firehose. System events (heartbeat,
+    health, connection lifecycle) are always delivered.
     """
+    # Enforce read scope against the requested subscription. `store` is also
+    # declared above for OpenAPI; create_event_stream re-reads it off
+    # request.query_params so parsing lives in one place.
+    requested = parse_store_subscription(request.query_params)
+    if requested is None:
+        # Firehose (no store / "all"): spans every partition -> needs global read.
+        user.require_store_scope("read", None)
+    else:
+        for name in requested:
+            user.require_store_scope("read", name)
     return await create_event_stream(request)
 
 

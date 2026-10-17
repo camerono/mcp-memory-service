@@ -21,7 +21,8 @@
 The Knowledge Graph Dashboard provides an interactive visualization of your memory relationships using D3.js v7.9.0. It allows you to explore the connections between memories, understand causal chains, and discover hidden patterns in your knowledge base.
 
 **Key Capabilities:**
-- **Visual Exploration**: Interactive force-directed graph with zoom, pan, and drag
+- **Visual Exploration**: Interactive force-directed and concentric-ring layouts with zoom, pan,
+  drag, and animated re-centering
 - **Typed Relationships**: 6 semantic relationship types for rich knowledge graphs
 - **Analytics**: Bar chart showing distribution of relationship types
 - **Multi-Language**: Full UI localization in 7 languages
@@ -49,6 +50,21 @@ The graph visualization uses D3.js force simulation to automatically layout memo
 - **Pan**: Click and drag background
 - **Drag Nodes**: Click and drag any node to explore connections
 - **Hover Tooltips**: Shows memory details (content, type, created date)
+
+### Concentric Ring Layout
+
+Use the **Force / Rings** control to switch the 2D graph to a stable, node-centered view. Rings
+represent shortest-path distance from the center: direct neighbors occupy the first ring, their
+neighbors the second, and so on. The highest-degree visible node is used initially.
+
+- **Re-center**: Click a node to animate the rings around it without reloading graph data.
+- **Open details**: Double-click a node while using Rings.
+- **Drag**: Drag remains available for temporary positioning; the next re-center restores the
+  calculated layout.
+- **Disconnected nodes**: Nodes outside the center's component are placed on the outermost ring.
+
+Selecting Rings switches the renderer to 2D. Switching back to 3D restores the force-directed
+layout.
 
 ### Relationship Type Distribution Chart
 
@@ -129,11 +145,8 @@ Memories are color-coded by type in the graph:
 The Knowledge Graph Dashboard is part of the HTTP dashboard server:
 
 ```bash
-# Start both MCP and HTTP servers
-./start_all_servers.sh
-
-# Or start HTTP server only
-python scripts/server/run_http_server.py
+# Start the HTTP dashboard server (background)
+memory launch
 ```
 
 **Default URL:** http://localhost:8000
@@ -164,6 +177,11 @@ python scripts/server/run_http_server.py
 - **Release**: Node continues moving with simulation forces
 - **Pin**: Node stays in place while you explore
 
+**Ring Navigation:**
+- Select **Rings** to center the highest-degree visible node
+- Click any node to animate it into the center
+- Double-click a node to open its memory details
+
 **Hover:**
 - **Mouse**: Hover over any node to see tooltip with:
   - Full memory content
@@ -189,6 +207,17 @@ python scripts/server/run_http_server.py
 1. Look for **contradicts** edges (orange lines)
 2. Examine both nodes to understand the conflict
 3. Use this to identify inconsistencies in your knowledge base
+
+### Min Connections vs Min Degree
+
+Both controls filter by how connected a memory is, but they count different things.
+
+- **Min Connections** runs on the server. It counts each memory's distinct linked memories across the whole database (entity links excluded) and loads only those with at least N, up to the node limit. Changing it reloads the graph.
+- **Min Degree** runs in your browser. It counts a node's neighbours within the loaded graph after the memory-type pills (such as `observation` or `decision`) have been applied, so nodes that were not loaded and memory types you have hidden do not count, and a mutual pair counts once. It hides nodes below the value instantly, without a reload. At 1 the filter is off.
+
+Degree is counted once, before any node is hidden by the slider. A node linked to three leaves therefore stays at Min Degree 2 even though the leaves, each with one neighbour, are hidden.
+
+A memory linked to 10 others can show degree 2 if eight of its partners were not loaded or belong to a memory type you have hidden. Min Connections decides which nodes are loaded at all; Min Degree then thins out what is on screen.
 
 ### Relationship Type Chart
 
@@ -295,7 +324,7 @@ curl -H "X-API-Key: your-api-key" \
    ```
 2. **Verify backend**: Graph is SQLite-only in v9.2.0, ensure you're using `sqlite_vec` or `hybrid` backend
 3. **Check migrations**: Run `python scripts/migration/add_relationship_type_column.py` to add `relationship_type` column
-4. **Restart server**: `./scripts/update_and_restart.sh`
+4. **Restart server**: `memory restart`
 
 ### Slow Performance
 

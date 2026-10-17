@@ -28,6 +28,7 @@ Controls how the hooks connect to the MCP Memory Service.
   "protocol": "auto",
   "preferredProtocol": "http",
   "fallbackEnabled": true,
+  "allowSelfSignedCerts": false,
   "http": {
     "endpoint": "http://127.0.0.1:8889",
     "apiKey": "YOUR_API_KEY_HERE",
@@ -50,8 +51,13 @@ Controls how the hooks connect to the MCP Memory Service.
 **Security Considerations:**
 - **HTTP (`http://`)**: Default for local development. Traffic is **unencrypted** - only use for localhost connections.
 - **HTTPS (`https://`)**: Recommended if connecting to remote servers or when encryption-in-transit is required.
-  - For self-signed certificates, your system must trust the certificate authority.
-  - The hooks enforce certificate validation - `rejectUnauthorized` is always enabled for security.
+  - For a properly-issued certificate (or an internally-trusted CA via `NODE_EXTRA_CA_CERTS`), the hooks enforce certificate validation by default — `rejectUnauthorized` is not overridden.
+  - For self-signed certificates, set `memoryService.allowSelfSignedCerts` to `true`. This disables certificate validation and is vulnerable to MITM — use only for local development with self-signed certs. Every hook logs a warning each time this option is actually exercised.
+
+**`allowSelfSignedCerts`** (Boolean): Opt-in to skip TLS certificate validation for HTTPS connections to the memory service.
+- **Default**: `false` — certificate validation is enforced
+- **When to enable**: Only for local development against a memory service using a self-signed certificate your system doesn't already trust
+- **Security**: Leaves the connection vulnerable to MITM attacks. Never enable this against a production or remote memory service.
 
 **`apiKey`** (String): API key for authenticating with the memory service.
 - **Default**: Empty string `""` - the application will validate and prompt for a valid key on startup
@@ -513,7 +519,7 @@ After updating from repository, verify these settings match your preferences:
 - `minRelevanceScore`: Repository default is `0.4` (not `0.25`)
 - `commitLookback`: Repository default is `14` days (not `7`)
 
-**See also:** [CLAUDE.md § Configuration Management](../../CLAUDE.md#configuration-management) for complete troubleshooting guide.
+**See also:** [CLAUDE.md § Configuration](../CLAUDE.md#configuration) and the [troubleshooting directive](../.claude/directives/troubleshooting.md).
 
 ---
 

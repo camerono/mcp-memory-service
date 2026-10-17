@@ -1178,7 +1178,10 @@ class HookInstaller:
                     }
                 ]
 
-            # Add PostToolUse hook for auto-capture if enabled
+            # Add Stop hook for auto-capture if enabled.
+            # Stop fires once per assistant turn, so the hook captures the final
+            # turn exactly once. (It previously ran on PostToolUse, which fires
+            # after every tool call and produced duplicate captures per turn.)
             if install_auto_capture:
                 # Use PowerShell on Windows, Node.js elsewhere
                 if self.platform_name == 'windows':
@@ -1186,9 +1189,8 @@ class HookInstaller:
                 else:
                     auto_capture_command = f'node "{self.claude_hooks_dir}/core/auto-capture-hook.js"'
 
-                hook_config["hooks"]["PostToolUse"] = [
+                hook_config["hooks"]["Stop"] = [
                     {
-                        "matchers": ["Edit", "Write", "Bash"],
                         "hooks": [
                             {
                                 "type": "command",
@@ -1198,7 +1200,7 @@ class HookInstaller:
                         ]
                     }
                 ]
-                self.success("Added PostToolUse hook for Smart Auto-Capture (Edit, Write, Bash)")
+                self.success("Added Stop hook for Smart Auto-Capture (once per turn)")
 
             # Add statusLine configuration for v8.5.7+ (Unix/Linux/macOS only - requires bash)
             statusline_script = self.claude_hooks_dir / 'statusline.sh'
@@ -1264,20 +1266,31 @@ class HookInstaller:
                             # New event type — just add it
                             existing_settings['hooks'][hook_type] = new_hook_groups
                         else:
-                            # Event type already present: append only the groups whose
-                            # commands are not yet registered (idempotent reinstall).
-                            new_commands = set(
-                                hook.get('command', '')
-                                for group in new_hook_groups
-                                for hook in group.get('hooks', [])
-                            )
+                            # Event type already present: append only the individual
+                            # groups whose commands are not yet registered (idempotent
+                            # reinstall). Checked per-group rather than all-or-nothing —
+                            # a hook_type can carry more than one group (PreToolUse can
+                            # hold both permission-request.js and a user's own hook), and
+                            # the previous all-or-nothing check re-appended every group in
+                            # the batch, duplicating any that already existed, as soon as
+                            # even one sibling group in that same batch was new.
                             existing_commands_set = set(
                                 hook.get('command', '')
                                 for group in existing_settings['hooks'][hook_type]
                                 for hook in group.get('hooks', [])
                             )
-                            if not new_commands.issubset(existing_commands_set):
-                                existing_settings['hooks'][hook_type].extend(new_hook_groups)
+                            # existing_commands_set is intentionally computed once, up
+                            # front, rather than updated as groups are appended below —
+                            # new_hook_groups (this installer's own hook_config) never
+                            # contains two groups with identical commands, so there is
+                            # nothing later in the loop that a group appended earlier in
+                            # it could newly duplicate against.
+                            for group in new_hook_groups:
+                                group_commands = set(
+                                    hook.get('command', '') for hook in group.get('hooks', [])
+                                )
+                                if not group_commands.issubset(existing_commands_set):
+                                    existing_settings['hooks'][hook_type].append(group)
 
                     self.info("Merged memory awareness hooks, preserving all existing hooks")
 
@@ -1288,11 +1301,47 @@ class HookInstaller:
                         if key != 'hooks':
                             existing_settings[key] = value
 
-                    # Upgrade path: remove PreToolUse from existing settings when user opted out
-                    # (handles upgrades from v10.17.14 where the hook was auto-installed)
+                    # Upgrade path: remove only the permission-request.js hook when the
+                    # user opted out (handles upgrades from v10.17.14 where the hook was
+                    # auto-installed). Filter at the individual hook level, not the group
+                    # level — a user's own hook can share a matcher group with
+                    # permission-request.js, and group-level filtering would silently
+                    # drop that hook too while claiming "other PreToolUse hooks
+                    # preserved". A group left empty after filtering is removed entirely.
                     if not install_permission_hook and "PreToolUse" in existing_settings.get("hooks", {}):
-                        del existing_settings["hooks"]["PreToolUse"]
-                        self.info("Removed PreToolUse hook from existing settings (permission-request not opted in)")
+                        original = existing_settings["hooks"]["PreToolUse"]
+                        remaining = []
+                        for group in original:
+                            kept = [h for h in group.get('hooks', [])
+                                    if 'permission-request.js' not in h.get('command', '')]
+                            if kept:
+                                remaining.append(group if len(kept) == len(group.get('hooks', []))
+                                                  else {**group, 'hooks': kept})
+                        if remaining != original:
+                            if remaining:
+                                existing_settings["hooks"]["PreToolUse"] = remaining
+                            else:
+                                del existing_settings["hooks"]["PreToolUse"]
+                            self.info("Removed permission-request PreToolUse group (opted out); "
+                                      "other PreToolUse hooks preserved")
+
+                    # Upgrade path: auto-capture moved from PostToolUse (fired per tool
+                    # call -> duplicate captures per turn) to Stop (fires once per turn).
+                    # Strip any legacy PostToolUse auto-capture groups so it does not run
+                    # alongside the new Stop hook after a reinstall.
+                    existing_post = existing_settings.get("hooks", {}).get("PostToolUse")
+                    if existing_post:
+                        cleaned = [
+                            group for group in existing_post
+                            if not any('auto-capture-hook' in hook.get('command', '')
+                                       for hook in group.get('hooks', []))
+                        ]
+                        if len(cleaned) != len(existing_post):
+                            if cleaned:
+                                existing_settings["hooks"]["PostToolUse"] = cleaned
+                            else:
+                                del existing_settings["hooks"]["PostToolUse"]
+                            self.info("Migrated auto-capture from PostToolUse to Stop (removed legacy PostToolUse hook)")
 
                     final_config = existing_settings
                     self.success("Settings merged intelligently, preserving existing configuration")
@@ -1676,7 +1725,7 @@ Features:
         if install_auto_capture:
             installer.info("  - Smart Auto-Capture hooks")
             installer.info("  - Pattern detection for Decision/Error/Learning/Implementation")
-            installer.info("  - PostToolUse hook (Edit, Write, Bash)")
+            installer.info("  - Stop hook (auto-capture, once per turn)")
         if install_permission_hook:
             installer.info("  - Permission Request Hook (global: affects ALL MCP servers)")
         else:
@@ -1731,7 +1780,7 @@ Features:
                 installer.info("  ✅ Session-start and session-end hooks")
                 installer.info("  ✅ Natural Memory Triggers with intelligent pattern detection")
                 installer.info("  ✅ Mid-conversation memory injection")
-                installer.info("  ✅ Smart Auto-Capture (PostToolUse for Edit/Write/Bash)")
+                installer.info("  ✅ Smart Auto-Capture (Stop, once per turn)")
                 installer.info("  ✅ Performance optimization and CLI management")
                 if install_permission_hook:
                     installer.info("  ✅ Permission Request Hook (auto-approves safe MCP operations)")

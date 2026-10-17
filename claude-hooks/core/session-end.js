@@ -5,6 +5,8 @@
 
 const fs = require('fs').promises;
 const path = require('path');
+const { resolveConfigPath } = require('../utilities/config-loader');
+const { applySelfSignedCertsOption } = require('../utilities/tls-options');
 const https = require('https');
 const http = require('http');
 
@@ -19,7 +21,7 @@ const { MemoryClient } = require('../utilities/memory-client');
  */
 async function loadConfig() {
     try {
-        const configPath = path.join(__dirname, '../config.json');
+        const configPath = resolveConfigPath(__dirname);
         const configData = await fs.readFile(configPath, 'utf8');
         return JSON.parse(configData);
     } catch (error) {
@@ -210,10 +212,31 @@ function analyzeConversation(conversationData) {
 }
 
 /**
+ * Decide whether an analyzed session is substantive enough to store.
+ *
+ * Topics and next-steps are keyword-matched on generic vocabulary
+ * ("debugging", "testing", "should", "will") and fire on almost any
+ * conversation, so they are NOT counted as evidence. Only decisions,
+ * insights, and code changes indicate a session worth remembering.
+ * This prevents trivial sessions from producing generic "Session Summary"
+ * memories that score 0.0 on quality.
+ *
+ * The #remember override (forceRemember) bypasses the gate.
+ */
+function isSessionMeaningful(analysis, { forceRemember = false } = {}) {
+    if (forceRemember) return true;
+    if (!analysis) return false;
+    const substantive = (analysis.decisions?.length || 0)
+        + (analysis.insights?.length || 0)
+        + (analysis.codeChanges?.length || 0);
+    return substantive > 0;
+}
+
+/**
  * Trigger quality evaluation for a stored memory (async, non-blocking)
  * This calls the backend's quality scoring system to pre-score the memory
  */
-function triggerQualityEvaluation(endpoint, apiKey, contentHash) {
+function triggerQualityEvaluation(endpoint, apiKey, contentHash, allowSelfSignedCerts = false) {
     return new Promise((resolve, reject) => {
         const url = new URL(`/api/quality/memories/${contentHash}/evaluate`, endpoint);
         const isHttps = url.protocol === 'https:';
@@ -223,7 +246,7 @@ function triggerQualityEvaluation(endpoint, apiKey, contentHash) {
 
         const options = {
             hostname: url.hostname,
-            port: url.port || (isHttps ? 8443 : 8000),
+            port: url.port ? Number(url.port) : (isHttps ? 443 : 80),
             path: url.pathname,
             method: 'POST',
             headers: {
@@ -234,9 +257,7 @@ function triggerQualityEvaluation(endpoint, apiKey, contentHash) {
             timeout: 10000 // 10 second timeout for quality evaluation
         };
 
-        if (isHttps) {
-            options.rejectUnauthorized = false;
-        }
+        applySelfSignedCertsOption(options, isHttps, allowSelfSignedCerts);
 
         const req = requestModule.request(options, (res) => {
             let data = '';
@@ -270,7 +291,7 @@ function triggerQualityEvaluation(endpoint, apiKey, contentHash) {
 /**
  * Store session consolidation to memory service
  */
-async function storeSessionMemory(endpoint, apiKey, content, projectContext, analysis) {
+async function storeSessionMemory(endpoint, apiKey, content, projectContext, analysis, allowSelfSignedCerts = false) {
     // Generate and normalize tags
     const tags = [
         'claude-code-session',
@@ -290,6 +311,7 @@ async function storeSessionMemory(endpoint, apiKey, content, projectContext, ana
         protocol: 'auto',
         preferredProtocol: 'http',
         http: { endpoint, apiKey },
+        allowSelfSignedCerts,
     });
 
     try {
@@ -302,7 +324,11 @@ async function storeSessionMemory(endpoint, apiKey, content, projectContext, ana
     try {
         result = await client.storeMemory(content, {
             tags: uniqueTags,
-            memoryType: 'session-summary',
+            // 'session' is the observation subtype for this; 'session-summary'
+            // is not in the ontology and was coerced to 'observation' (#177).
+            // The 'claude-code-session' and 'session-consolidation' tags above
+            // remain the reliable way to find these.
+            memoryType: 'session',
             metadata: {
                 session_analysis: {
                     topics: analysis.topics,
@@ -384,9 +410,11 @@ async function onSessionEnd(context) {
         // Analyze conversation
         const analysis = analyzeConversation(context.conversation);
 
-        // Bypass confidence check with #remember
-        if (!overrides.forceRemember && analysis.confidence < 0.1) {
-            console.log('[Memory Hook] Session analysis confidence too low, skipping consolidation');
+        // Only store sessions with real substance (decisions/insights/code
+        // changes). Topic- or next-step-only sessions are generic noise.
+        // #remember bypasses this gate.
+        if (!isSessionMeaningful(analysis, { forceRemember: overrides.forceRemember })) {
+            console.log('[Memory Hook] Session not substantive (no decisions/insights/code changes), skipping consolidation');
             return;
         }
         
@@ -405,7 +433,8 @@ async function onSessionEnd(context) {
             apiKey,
             consolidation,
             projectContext,
-            analysis
+            analysis,
+            config.memoryService?.allowSelfSignedCerts === true
         );
         
         const hash = result.content_hash || result.contentHash;
@@ -415,7 +444,7 @@ async function onSessionEnd(context) {
                 console.log(`[Memory Hook] Memory hash: ${hash.substring(0, 8)}...`);
 
                 // Trigger async quality evaluation (non-blocking)
-                triggerQualityEvaluation(endpoint, apiKey, hash)
+                triggerQualityEvaluation(endpoint, apiKey, hash, config.memoryService?.allowSelfSignedCerts === true)
                     .then(evalResult => {
                         if (evalResult.success) {
                             console.log(`[Memory Hook] Quality evaluated: ${evalResult.quality_score?.toFixed(3)} (${evalResult.quality_provider})`);
@@ -453,7 +482,10 @@ module.exports = {
     // Exported for testing
     _internal: {
         parseTranscript: null,  // Will be set after function definition
-        analyzeConversation
+        analyzeConversation,
+        isSessionMeaningful,
+        triggerQualityEvaluation,
+        storeSessionMemory
     }
 };
 

@@ -272,7 +272,8 @@ class DynamicContextUpdater {
                     queryObj.query,
                     {
                         limit: queryObj.limit,
-                        excludeHashes: Array.from(this.loadedMemoryHashes)
+                        excludeHashes: Array.from(this.loadedMemoryHashes),
+                        allowSelfSignedCerts: memoryServiceConfig.allowSelfSignedCerts === true
                     }
                 );
 
@@ -296,9 +297,10 @@ class DynamicContextUpdater {
      */
     async queryMemoryService(endpoint, apiKey, query, options = {}) {
         const https = require('https');
-        
+        const { applySelfSignedCertsOption } = require('./tls-options');
+
         return new Promise((resolve, reject) => {
-            const { limit = 3, excludeHashes = [] } = options;
+            const { limit = 3, excludeHashes = [], allowSelfSignedCerts = false } = options;
 
             const postData = JSON.stringify({
                 jsonrpc: '2.0',
@@ -311,6 +313,7 @@ class DynamicContextUpdater {
             });
 
             const url = new URL('/mcp', endpoint);
+            const isHttps = url.protocol === 'https:';
             const requestOptions = {
                 hostname: url.hostname,
                 port: url.port,
@@ -321,9 +324,10 @@ class DynamicContextUpdater {
                     'Authorization': `Bearer ${apiKey}`,
                     'Content-Length': Buffer.byteLength(postData)
                 },
-                rejectUnauthorized: false,
                 timeout: 5000
             };
+
+            applySelfSignedCertsOption(requestOptions, isHttps, allowSelfSignedCerts, '[Dynamic Context]');
 
             const req = https.request(requestOptions, (res) => {
                 let data = '';

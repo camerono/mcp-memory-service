@@ -20,11 +20,22 @@ Licensed under the MIT License. See LICENSE file in the project root for full li
 import asyncio
 import logging
 from abc import ABC, abstractmethod
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Dict, Any, Sequence, Tuple, Set
 from datetime import datetime, timezone, timedelta, date
+from ..compat import _sanitize_log_value
 from ..models.memory import Memory, MemoryQueryResult
 
 logger = logging.getLogger(__name__)
+
+
+class EmbeddingModelMismatchError(RuntimeError):
+    """Exception raised when embedding models between local and remote storage don't match."""
+
+    def __init__(self, message: str, local_model: Optional[str] = None, remote_model: Optional[str] = None):
+        super().__init__(message)
+        self.local_model = local_model
+        self.remote_model = remote_model
+
 
 class MemoryStorage(ABC):
     """Abstract base class for memory storage implementations."""
@@ -52,19 +63,42 @@ class MemoryStorage(ABC):
         """
         pass
 
+    @property
+    def supports_capacity_monitoring(self) -> bool:
+        """Backend monitors capacity limits (e.g. Cloudflare Vectorize). Default False."""
+        return False
+
+    @property
+    def requires_metadata_normalization(self) -> bool:
+        """Backend needs metadata normalized/compressed before store (e.g. Cloudflare). Default False."""
+        return False
+
+    @property
+    def supports_delete_operations(self) -> bool:
+        """Backend supports bulk date-range delete + drift listing (e.g. Cloudflare). Default False."""
+        return False
+
     @abstractmethod
     async def initialize(self) -> None:
         """Initialize the storage backend."""
         pass
-    
+
     @abstractmethod
-    async def store(self, memory: Memory, skip_semantic_dedup: bool = False) -> Tuple[bool, str]:
+    async def store(self, memory: Memory, skip_semantic_dedup: bool = False, store: Optional[str] = "default") -> Tuple[bool, str]:
         """Store a memory. Returns (success, message).
 
         Args:
             memory: The Memory object to store.
             skip_semantic_dedup: If True, bypass semantic similarity check.
                 Exact hash deduplication is always enforced.
+            store: Target store partition (multi-store, #57 Phase 1). Backends
+                that are not partitioned accept it and ignore it.
+
+        Note: the #57 change added `store` to every concrete backend and to all
+        four call sites (`services/memory_service.py`, `server/handlers/documents.py`,
+        `utils/document_processing.py`) but not to this declaration, so the
+        interface understated its own contract while Milvus drifted the other way
+        (#133).
         """
         pass
 
@@ -99,9 +133,9 @@ class MemoryStorage(ABC):
             else:
                 final_results.append(res)
         return final_results
-    
+
     @abstractmethod
-    async def retrieve(self, query: str, n_results: int = 5, tags: Optional[List[str]] = None, min_confidence: float = 0.0, include_superseded: bool = False) -> List[MemoryQueryResult]:
+    async def retrieve(self, query: str, n_results: int = 5, tags: Optional[List[str]] = None, min_confidence: float = 0.0, include_superseded: bool = False, start_time: Optional[float] = None, end_time: Optional[float] = None, store: Optional[str] = None) -> List[MemoryQueryResult]:
         """Retrieve memories by semantic search.
 
         Args:
@@ -131,7 +165,8 @@ class MemoryStorage(ABC):
         tags: Optional[List[str]] = None,
         quality_boost: Optional[bool] = None,
         quality_weight: Optional[float] = None,
-        include_superseded: bool = False
+        include_superseded: bool = False,
+        store: Optional[str] = "default"
     ) -> List[MemoryQueryResult]:
         """
         Retrieve memories with optional quality-based reranking.
@@ -176,12 +211,12 @@ class MemoryStorage(ABC):
 
         if not quality_boost:
             # Standard retrieval, no reranking
-            return await self.retrieve(query, n_results, tags=tags, include_superseded=include_superseded)
+            return await self.retrieve(query, n_results, tags=tags, include_superseded=include_superseded, store=store)
 
         # Quality-boosted retrieval
         # Step 1: Over-fetch (3x) to have pool for reranking
         oversample_factor = 3
-        candidates = await self.retrieve(query, n_results * oversample_factor, tags=tags, include_superseded=include_superseded)
+        candidates = await self.retrieve(query, n_results * oversample_factor, tags=tags, include_superseded=include_superseded, store=store)
 
         if not candidates:
             return []
@@ -235,7 +270,8 @@ class MemoryStorage(ABC):
         tags: List[str],
         operation: str = "AND",
         time_start: Optional[float] = None,
-        time_end: Optional[float] = None
+        time_end: Optional[float] = None,
+        include_pending: bool = False,
     ) -> List[Memory]:
         """Search memories by tags with AND/OR semantics and time range filtering.
 
@@ -273,11 +309,20 @@ class MemoryStorage(ABC):
             memories = memories[:limit]
 
         return memories
-    
+
     @abstractmethod
-    async def delete(self, content_hash: str) -> Tuple[bool, str]:
-        """Delete a memory by its hash."""
+    async def delete(self, content_hash: str, store: Optional[str] = None) -> Tuple[bool, str]:
+        """Delete a memory by its hash. If store is given, scope deletion to that partition (#1465)."""
         pass
+
+    async def delete_memory(self, content_hash: str) -> bool:
+        """Delete a memory by hash, returning only success.
+
+        The consolidator's storage protocol calls this when applying
+        forgetting results; backends that only implement delete() get it here.
+        """
+        success, _ = await self.delete(content_hash)
+        return success
 
     async def is_deleted(self, content_hash: str) -> bool:
         """
@@ -297,6 +342,40 @@ class MemoryStorage(ABC):
             Override in backends that support tombstones (e.g., sqlite_vec).
         """
         return False
+
+    async def list_content_hashes(self, include_deleted: bool = False) -> "Set[str]":
+        """Return the set of content hashes (RFC #1304 Phase 1). Default delegates
+        to get_all_content_hashes when present; backends without it return empty."""
+        getter = getattr(self, 'get_all_content_hashes', None)
+        if getter is not None:
+            return await getter(include_deleted=include_deleted)
+        return set()
+
+    async def list_content_hashes_page(self, after_id: int = 0, limit: int = 1000, include_deleted: bool = False) -> "List[Tuple[int, str]]":
+        """Cursor-paginated (id-based) list of (id, content_hash). Default returns []
+        for backends without an efficient paginated listing."""
+        return []
+
+    async def health_probe(self) -> bool:
+        """
+        Report whether the backend is responding.
+
+        Args:
+            None
+
+        Returns:
+            True if the backend answered, False otherwise
+
+        Note:
+            The default asks get_stats(), which is fine for a local database but
+            expensive for a remote one. Backends where counting rows costs money
+            or quota should override this with a cheaper probe.
+        """
+        try:
+            stats = await self.get_stats()
+        except Exception:
+            return False
+        return stats.get("status") != "error" if isinstance(stats, dict) else bool(stats)
 
     async def purge_deleted(self, older_than_days: int = 30) -> int:
         """
@@ -345,7 +424,7 @@ class MemoryStorage(ABC):
         raise NotImplementedError("Subclasses must implement delete_before_date")
 
     @abstractmethod
-    async def get_by_exact_content(self, content: str) -> List[Memory]:
+    async def get_by_exact_content(self, content: str, store: Optional[str] = None) -> List[Memory]:
         """
         Retrieve memories by exact content match.
 
@@ -358,7 +437,7 @@ class MemoryStorage(ABC):
         raise NotImplementedError("Subclasses must implement get_by_exact_content")
 
     @abstractmethod
-    async def get_by_hash(self, content_hash: str) -> Optional[Memory]:
+    async def get_by_hash(self, content_hash: str, store: Optional[str] = None) -> Optional[Memory]:
         """
         Get a memory by its content hash using direct O(1) lookup.
 
@@ -375,7 +454,7 @@ class MemoryStorage(ABC):
         """Delete memories by tag. Returns (count_deleted, message)."""
         pass
 
-    async def delete_by_tags(self, tags: List[str]) -> Tuple[int, str, List[str]]:
+    async def delete_by_tags(self, tags: List[str], store: Optional[str] = None) -> Tuple[int, str, List[str]]:
         """
         Delete memories matching ANY of the given tags.
 
@@ -421,7 +500,8 @@ class MemoryStorage(ABC):
         tag_match: str = "any",
         before: Optional[str] = None,
         after: Optional[str] = None,
-        dry_run: bool = False
+        dry_run: bool = False,
+        store: Optional[str] = "default",
     ) -> Dict[str, Any]:
         """
         Unified memory deletion with flexible filtering.
@@ -487,7 +567,7 @@ class MemoryStorage(ABC):
             if content_hash:
                 if dry_run:
                     # Check if memory exists
-                    memory = await self.get_by_hash(content_hash)
+                    memory = await self.get_by_hash(content_hash, store=store)
                     if memory:
                         return {
                             "success": True,
@@ -506,7 +586,7 @@ class MemoryStorage(ABC):
                         }
 
                 # Execute deletion
-                success, message = await self.delete(content_hash)
+                success, message = await self.delete(content_hash, store=store)
                 return {
                     "success": success,
                     "deleted_count": 1 if success else 0,
@@ -535,7 +615,7 @@ class MemoryStorage(ABC):
             if tags and not before and not after and tag_match == "any":
                 # Optimized path: tag-only deletion with ANY match
                 if hasattr(self, 'delete_by_tags') and not dry_run:
-                    count, message, deleted_hashes = await self.delete_by_tags(tags)
+                    count, message, deleted_hashes = await self.delete_by_tags(tags, store=store)
                     return {
                         "success": count > 0,
                         "deleted_count": count,
@@ -552,23 +632,23 @@ class MemoryStorage(ABC):
                 # Optimized path: time-only filtering (no tags)
                 if hasattr(self, 'get_memories_by_time_range'):
                     use_optimized = True
+                    from ..utils.time_parser import parse_boundary  # inline import
                     try:
                         # Convert date strings to timestamps
                         if after:
-                            after_date = datetime.fromisoformat(after)
-                            start_time = after_date.timestamp()
+                            start_time = parse_boundary(after)
                         else:
                             start_time = 0.0
 
                         if before:
-                            before_date = datetime.fromisoformat(before)
-                            end_time = before_date.timestamp()
+                            end_time = parse_boundary(before)
                         else:
-                            end_time = datetime.now().timestamp()
+                            end_time = datetime.now(timezone.utc).timestamp()
 
                         filtered_memories = await self.get_memories_by_time_range(
                             start_time=start_time,
-                            end_time=end_time
+                            end_time=end_time,
+                            store=store
                         )
                     except ValueError as e:
                         return {
@@ -580,8 +660,11 @@ class MemoryStorage(ABC):
                         }
 
             # Fallback: Load all memories and filter in Python (slower but always works)
+            # NOTE: this is the DELETE path — keep the full listing (no exclude_pending).
+            # Deletion must never skip pending rows (they would silently survive and reappear
+            # in search after embedding repair). Pending exclusion belongs on SEARCH paths only.
             if not use_optimized:
-                all_memories = await self.get_all_memories()
+                all_memories = await self.get_all_memories(store=store)
 
                 for memory in all_memories:
                     # Tag filter
@@ -653,7 +736,7 @@ class MemoryStorage(ABC):
 
             for memory in filtered_memories:
                 try:
-                    success, msg = await self.delete(memory.content_hash)
+                    success, msg = await self.delete(memory.content_hash, store=store)
                     if success:
                         deleted_count += 1
                         deleted_hashes.append(memory.content_hash)
@@ -697,7 +780,7 @@ class MemoryStorage(ABC):
     async def cleanup_duplicates(self) -> Tuple[int, str]:
         """Remove duplicate memories. Returns (count_removed, message)."""
         pass
-    
+
     @abstractmethod
     async def update_memory_metadata(self, content_hash: str, updates: Dict[str, Any], preserve_timestamps: bool = True) -> Tuple[bool, str]:
         """
@@ -785,7 +868,7 @@ class MemoryStorage(ABC):
         """
         # Default: no-op. Concrete backends override with real implementation.
         return 0
-    
+
     async def get_stats(self) -> Dict[str, Any]:
         """Get storage statistics. Override for specific implementations."""
         return {
@@ -793,25 +876,56 @@ class MemoryStorage(ABC):
             "storage_backend": self.__class__.__name__,
             "status": "operational"
         }
-    
+
     async def get_all_tags(self) -> List[str]:
         """Get all unique tags in the storage. Override for specific implementations."""
         return []
-    
+
+    async def get_all_tags_with_counts(self, store: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Get all tags with their usage counts, ordered by count descending.
+
+        Returns a list of ``{"tag": str, "count": int}``. Declared here because
+        web/api/memories.py::get_tags calls it without a hasattr guard: while it
+        was only an informal convention, the Milvus backend shipped without it
+        and the Browse tab answered HTTP 501 (issue #213). Override it.
+        """
+        return []
+
+    async def get_largest_memories(self, n: int = 10) -> List[Memory]:
+        """Get the n largest memories by content length. Override for specific implementations."""
+        return []
+
+    async def recall(
+        self,
+        query: Optional[str] = None,
+        n_results: int = 5,
+        start_timestamp: Optional[float] = None,
+        end_timestamp: Optional[float] = None,
+        store: Optional[str] = None,
+    ) -> List[MemoryQueryResult]:
+        """Retrieve memories by time window, optionally ranked by a semantic query.
+
+        The default handles the semantic half only and ignores the time window,
+        so backends that support time filtering must override it.
+        """
+        if not query:
+            return []
+        return await self.retrieve(query, n_results)
+
     async def get_recent_memories(self, n: int = 10) -> List[Memory]:
         """Get n most recent memories. Override for specific implementations."""
         return []
-    
+
     async def recall_memory(self, query: str, n_results: int = 5) -> List[Memory]:
         """Recall memories based on natural language time expression. Override for specific implementations."""
         # Default implementation just uses regular search
         results = await self.retrieve(query, n_results)
         return [r.memory for r in results]
-    
+
     async def search(self, query: str, n_results: int = 5) -> List[MemoryQueryResult]:
         """Search memories. Default implementation uses retrieve."""
         return await self.retrieve(query, n_results)
-    
+
     # NOTE: ``include_embeddings`` is a new kwarg (see #881). The three
     # overriding subclasses (sqlite_vec, hybrid, cloudflare) still carry
     # their pre-#881 signatures and will be updated in the follow-up PR
@@ -829,6 +943,9 @@ class MemoryStorage(ABC):
         tag_match: str = "any",
         stale_days: Optional[int] = None,
         include_embeddings: bool = False,
+        store: Optional[str] = "default",
+        agent_id: Optional[str] = None,
+        exclude_pending: bool = False,
     ) -> List[Memory]:
         """
         Get all memories in storage ordered by creation time (newest first).
@@ -852,8 +969,17 @@ class MemoryStorage(ABC):
             List of Memory objects ordered by created_at DESC, optionally filtered by type and tags
         """
         return []
-    
-    async def count_all_memories(self, memory_type: Optional[str] = None, tags: Optional[List[str]] = None, tag_match: str = "any", stale_days: Optional[int] = None) -> int:
+
+    async def get_stores(self) -> List[str]:
+        """Return the name of every store that holds at least one live memory.
+
+        Backends without named stores keep the default: the single ``default`` store.
+        Callers that need every memory, such as the export, walk this list and call
+        ``get_all_memories(store=...)`` for each name (#1520).
+        """
+        return ["default"]
+
+    async def count_all_memories(self, memory_type: Optional[str] = None, tags: Optional[List[str]] = None, tag_match: str = "any", stale_days: Optional[int] = None, store: Optional[str] = "default", agent_id: Optional[str] = None) -> int:
         """
         Get total count of memories in storage.
 
@@ -887,6 +1013,7 @@ class MemoryStorage(ABC):
         start_time: float,
         end_time: float,
         include_embeddings: bool = False,
+        store: Optional[str] = None,
     ) -> List[Memory]:
         """Get memories within a time range. Override for specific implementations.
 
@@ -902,16 +1029,26 @@ class MemoryStorage(ABC):
             A list of Memory objects within the specified time range.
         """
         return []
-    
+
     async def get_memory_connections(self) -> Dict[str, int]:
         """Get memory connection statistics. Override for specific implementations."""
         return {}
 
-    async def get_access_patterns(self) -> Dict[str, datetime]:
-        """Get memory access pattern statistics. Override for specific implementations."""
+    async def get_access_patterns(
+        self, content_hashes: Optional[Sequence[str]] = None
+    ) -> Dict[str, datetime]:
+        """Get memory access pattern statistics. Override for specific implementations.
+
+        Args:
+            content_hashes: Optional candidate window. When provided, backends should
+                return access times only for these hashes, so consolidation memory use
+                and latency scale with the candidate batch instead of the whole
+                ever-accessed population. When ``None`` the full set is returned
+                (backwards-compatible default).
+        """
         return {}
 
-    async def get_memory_timestamps(self, days: Optional[int] = None) -> List[float]:
+    async def get_memory_timestamps(self, days: Optional[int] = None, store: Optional[str] = None) -> List[float]:
         """
         Get memory creation timestamps only, without loading full memory objects.
 
@@ -951,7 +1088,8 @@ class MemoryStorage(ABC):
     async def get_graph_visualization_data(
         self,
         limit: int = 100,
-        min_connections: int = 1
+        min_connections: int = 1,
+        store: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Get graph data for visualization in D3.js-compatible format.
@@ -986,7 +1124,19 @@ class MemoryStorage(ABC):
                 ]
             }
         """
-        return {"nodes": [], "edges": []}
+        # Includes "meta" because the /api/analytics/graph-visualization
+        # response model requires it — returning only nodes/edges made the
+        # endpoint 500 on every backend that fell through to this default.
+        return {
+            "nodes": [],
+            "edges": [],
+            "meta": {
+                "total_nodes": 0,
+                "total_edges": 0,
+                "min_connections": min_connections,
+                "limit": limit,
+            },
+        }
 
     async def search_memories(
         self,
@@ -1000,7 +1150,10 @@ class MemoryStorage(ABC):
         quality_boost: float = 0.0,
         limit: int = 10,
         include_debug: bool = False,
-        include_superseded: bool = False
+        include_superseded: bool = False,
+        ranking_weights: Optional[Dict[str, float]] = None,
+        store: Optional[str] = "default",
+        agent_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Unified memory search with flexible modes and filters.
@@ -1032,6 +1185,7 @@ class MemoryStorage(ABC):
             - semantic: Vector similarity search (default) - finds conceptually similar content
             - exact: Case-insensitive substring match - finds memories where content contains the query string
             - hybrid: Semantic search with quality-based reranking
+            - ranked: Semantic search with multi-signal reranking (time decay + access frequency + quality)
 
         Time Filters:
             - time_expr: Natural language like "yesterday", "last week", "2 days ago", "last month"
@@ -1083,13 +1237,13 @@ class MemoryStorage(ABC):
         """
         try:
             # Validate mode
-            if mode not in ("semantic", "exact", "hybrid"):
+            if mode not in ("semantic", "exact", "hybrid", "ranked"):
                 return {
                     "memories": [],
                     "total": 0,
                     "query": query,
                     "mode": mode,
-                    "error": f"Invalid mode: {mode}. Must be 'semantic', 'exact', or 'hybrid'"
+                    "error": f"Invalid mode: {mode}. Must be 'semantic', 'exact', 'hybrid', or 'ranked'"
                 }
 
             # Validate quality_boost
@@ -1109,23 +1263,23 @@ class MemoryStorage(ABC):
             # Parse time expression if provided
             if time_expr:
                 try:
-                    from ..utils.time_parser import parse_time_expression
+                    from ..utils.time_parser import parse_time_expression  # inline import
                     # Parse time range from natural language
                     start_timestamp, end_timestamp = parse_time_expression(time_expr)
                     if start_timestamp is not None:
                         start_time = start_timestamp
                     if end_timestamp is not None:
                         end_time = end_timestamp
-                except Exception as e:
+                except Exception:
                     # Continue without time filter rather than failing
                     pass
 
             # Use explicit after/before if no time_expr
             if not time_expr:
+                from ..utils.time_parser import parse_boundary  # inline import
                 if after:
                     try:
-                        after_date = datetime.fromisoformat(after)
-                        start_time = after_date.timestamp()
+                        start_time = parse_boundary(after)
                     except ValueError:
                         return {
                             "memories": [],
@@ -1137,8 +1291,7 @@ class MemoryStorage(ABC):
 
                 if before:
                     try:
-                        before_date = datetime.fromisoformat(before)
-                        end_time = before_date.timestamp()
+                        end_time = parse_boundary(before)
                     except ValueError:
                         return {
                             "memories": [],
@@ -1151,7 +1304,32 @@ class MemoryStorage(ABC):
             # Perform search based on mode
             results = []
 
-            if mode == "exact":
+            if mode == "ranked":
+                # Multi-signal ranked search — feeds into shared post-filter tail
+                if not query:
+                    return {
+                        "memories": [],
+                        "total": 0,
+                        "query": query,
+                        "mode": mode,
+                        "error": "query required for ranked mode"
+                    }
+                from ..reasoning.ranked_search import apply_ranked_rerank, RankedSearchWeights
+                # Over-fetch without pre-filtering: the shared tail applies
+                # tag_match and time filters uniformly (fixes #1028 review).
+                oversample = limit * 5 if (tags or start_time or end_time or agent_id) else limit * 3
+                candidates = await self.retrieve(
+                    query, n_results=oversample,
+                    include_superseded=include_superseded,
+                    store=store,
+                )
+                if candidates:
+                    weights = RankedSearchWeights.from_dict(ranking_weights)
+                    candidates = apply_ranked_rerank(candidates, weights=weights)
+                results = candidates
+                pre_filter_count = len(results)
+
+            elif mode == "exact":
                 # Exact string match
                 if not query:
                     return {
@@ -1163,7 +1341,7 @@ class MemoryStorage(ABC):
                     }
 
                 # Get memories with exact content match
-                matched_memories = await self.get_by_exact_content(query)
+                matched_memories = await self.get_by_exact_content(query, store=store)
                 # Convert to MemoryQueryResult format for consistency
                 results = [
                     MemoryQueryResult(memory=m, relevance_score=1.0, debug_info=None)
@@ -1187,6 +1365,18 @@ class MemoryStorage(ABC):
                     fetch_limit = limit
                     if quality_boost > 0 and mode == "hybrid":
                         fetch_limit = limit * 3
+                    # Over-fetch when time filters are present AND using a path that
+                    # cannot pass start_time/end_time to SQL (hybrid/quality_boost).
+                    # Standard semantic retrieve() already filters at SQL level.
+                    if (start_time is not None or end_time is not None or tags) and (quality_boost > 0 or mode == "hybrid"):
+                        fetch_limit = max(fetch_limit, limit * 5)
+                    # agent_id is NOT passed down to retrieve() (it is applied as an
+                    # in-memory post-filter below), so over-fetch is ALWAYS required
+                    # when it is set — including in plain semantic mode. Otherwise
+                    # higher-ranked memories from other agents fill the limit slots
+                    # and matching memories are truncated before the filter runs.
+                    if agent_id is not None:
+                        fetch_limit = max(fetch_limit, limit * 5)
 
                     # Choose search method based on mode and available features
                     if mode == "hybrid" and hasattr(self, 'retrieve_hybrid'):
@@ -1196,7 +1386,8 @@ class MemoryStorage(ABC):
                             results = await self.retrieve_hybrid(
                                 query,
                                 n_results=fetch_limit,
-                                include_superseded=include_superseded
+                                include_superseded=include_superseded,
+                                store=store
                             )
                         else:
                             # Fall back to semantic if hybrid disabled in config
@@ -1208,10 +1399,11 @@ class MemoryStorage(ABC):
                                     tags=tags,
                                     quality_boost=True,
                                     quality_weight=quality_boost,
-                                    include_superseded=include_superseded
+                                    include_superseded=include_superseded,
+                                    store=store
                                 )
                             else:
-                                results = await self.retrieve(query, n_results=fetch_limit, tags=tags, include_superseded=include_superseded)
+                                results = await self.retrieve(query, n_results=fetch_limit, tags=tags, include_superseded=include_superseded, start_time=start_time, end_time=end_time, store=store)
                     elif quality_boost > 0:
                         # Use quality-boosted retrieval
                         results = await self.retrieve_with_quality_boost(
@@ -1220,11 +1412,12 @@ class MemoryStorage(ABC):
                             tags=tags,
                             quality_boost=True,
                             quality_weight=quality_boost,
-                            include_superseded=include_superseded
+                            include_superseded=include_superseded,
+                            store=store
                         )
                     else:
                         # Standard semantic search
-                        results = await self.retrieve(query, n_results=fetch_limit, tags=tags, include_superseded=include_superseded)
+                        results = await self.retrieve(query, n_results=fetch_limit, tags=tags, include_superseded=include_superseded, start_time=start_time, end_time=end_time, store=store)
 
                     pre_filter_count = len(results)
                 else:
@@ -1237,7 +1430,7 @@ class MemoryStorage(ABC):
                             use_optimized_search = True
                             st = start_time if start_time is not None else 0.0
                             et = end_time if end_time is not None else datetime.now().timestamp()
-                            memories = await self.get_memories_by_time_range(st, et)
+                            memories = await self.get_memories_by_time_range(st, et, exclude_pending=True, store=store)
                             results = [
                                 MemoryQueryResult(memory=m, relevance_score=0.5, debug_info=None)
                                 for m in memories
@@ -1246,7 +1439,7 @@ class MemoryStorage(ABC):
 
                     # Fallback: load all memories then filter
                     if not use_optimized_search:
-                        all_memories = await self.get_all_memories()
+                        all_memories = await self.get_all_memories(exclude_pending=True, store=store)
                         results = [
                             MemoryQueryResult(memory=m, relevance_score=0.5, debug_info=None)
                             for m in all_memories
@@ -1285,6 +1478,16 @@ class MemoryStorage(ABC):
                         # Match ANY tag (OR) — default
                         if any(tag in result.memory.tags for tag in tags):
                             filtered_results.append(result)
+                results = filtered_results
+
+            # Apply agent_id filter (unified metadata.agent_id OR tag agent:<id>)
+            if agent_id is not None:
+                filtered_results = []
+                for result in results:
+                    # Check metadata.agent_id or agent:<id> tag
+                    if (result.memory.agent_id == agent_id or
+                        f"agent:{agent_id}" in (result.memory.tags or [])):
+                        filtered_results.append(result)
                 results = filtered_results
 
             # Limit results
@@ -1328,7 +1531,7 @@ class MemoryStorage(ABC):
             return response
 
         except Exception as e:
-            logger.error(f"Search operation failed: {e}")
+            logger.error("Search operation failed: %s", _sanitize_log_value(str(e)))
             return {
                 "memories": [],
                 "total": 0,

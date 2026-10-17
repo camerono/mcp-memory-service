@@ -158,6 +158,9 @@ class HTTPMCPBridge {
         this.apiKey = process.env.MCP_MEMORY_API_KEY;
         this.autoDiscover = process.env.MCP_MEMORY_AUTO_DISCOVER === 'true';
         this.preferHttps = process.env.MCP_MEMORY_PREFER_HTTPS !== 'false';
+        // Off by default. This file is an example, and examples get copied.
+        this.allowSelfSignedCerts = process.env.MCP_MEMORY_ALLOW_SELF_SIGNED_CERTS === 'true'
+            || process.env.MCP_MEMORY_ALLOW_SELF_SIGNED_CERTS === '1';
         this.requestId = 0;
         this.discovery = new MDNSDiscovery();
         this.discoveredEndpoint = null;
@@ -312,16 +315,28 @@ class HTTPMCPBridge {
                 keepAlive: false
             };
 
-            // For HTTPS, create custom agent for self-signed certificates with TLS 1.3
+            // Certificate verification stays on unless MCP_MEMORY_ALLOW_SELF_SIGNED_CERTS
+            // opts out. This block used to disable it unconditionally, and went
+            // further than that: requestCert is a server-side option and did nothing
+            // here, and checkServerIdentity: () => undefined turned off hostname
+            // checking too — redundant while rejectUnauthorized is false, but it
+            // would have survived someone re-enabling verification. Both are gone.
+            //
+            // The agent is still constructed either way so socket behaviour
+            // (keepAlive: false, one connection per request) does not change with
+            // the flag; only verification does.
             if (url.protocol === 'https:') {
-                const agent = new https.Agent({
-                    rejectUnauthorized: false,
-                    requestCert: false,
-                    checkServerIdentity: () => undefined,
+                options.agent = new https.Agent({
+                    rejectUnauthorized: !this.allowSelfSignedCerts,
                     keepAlive: false
                 });
-                options.agent = agent;
-                console.error(`[${requestId}] Using custom HTTPS agent with default TLS settings`);
+                if (this.allowSelfSignedCerts) {
+                    console.error(
+                        `[${requestId}] TLS certificate validation DISABLED ` +
+                        `(MCP_MEMORY_ALLOW_SELF_SIGNED_CERTS). This leaves the connection ` +
+                        `vulnerable to MITM — use only for local development with self-signed certs.`
+                    );
+                }
             }
 
             if (this.apiKey) {

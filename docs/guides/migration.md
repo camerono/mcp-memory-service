@@ -140,7 +140,7 @@ export MCP_HTTP_ENABLED=true
 export MCP_HTTP_PORT=8000
 
 # Start HTTP server
-python scripts/run_http_server.py
+memory launch
 
 # Open browser to http://localhost:8000
 ```
@@ -270,20 +270,14 @@ python scripts/validate_migration.py --compare --chroma-path ~/.mcp_memory_chrom
 
 If migration failed or corrupted data:
 
-1. **Restore from backup:**
-   ```bash
-   # If you created a backup
-   python scripts/restore_memories.py migration_backup.json
-   ```
-
-2. **Rollback to ChromaDB:**
+1. **Rollback to ChromaDB:**
    ```bash
    # Temporarily switch back
    export MCP_MEMORY_STORAGE_BACKEND=chroma
    # Your ChromaDB data is unchanged
    ```
 
-3. **Re-migrate with enhanced script:**
+2. **Re-migrate with enhanced script:**
    ```bash
    # Clean the target database
    rm /path/to/sqlite_vec.db

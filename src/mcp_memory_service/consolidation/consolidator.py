@@ -14,33 +14,58 @@
 
 """Main dream-inspired consolidation orchestrator."""
 
-from typing import List, Dict, Any, Optional, Protocol, Tuple
+import inspect
+from typing import List, Dict, Any, Optional, Protocol, Sequence, Tuple
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 import asyncio
 import logging
 import time
 
 from .base import ConsolidationConfig, ConsolidationReport, ConsolidationError
-from .decay import ExponentialDecayCalculator
+from .decay import ExponentialDecayCalculator, RelevanceScore
 from .associations import CreativeAssociationEngine
 from .clustering import SemanticClusteringEngine
 from .compression import SemanticCompressionEngine
 from .forgetting import ControlledForgettingEngine
 from .health import ConsolidationHealthMonitor
-from ..models.memory import Memory
+from ..models.memory import Memory, MemoryQueryResult
 from ..storage.graph import GraphStorage
-from ..config import GRAPH_STORAGE_MODE, CONSOLIDATION_STORE_ASSOCIATIONS, TYPED_EDGES_ENABLED
-from .relationship_inference import RelationshipInferenceEngine
+from ..config import (
+    GRAPH_STORAGE_MODE,
+    CONSOLIDATION_AUTO_SUPERSEDE,
+    CONSOLIDATION_STORE_ASSOCIATIONS,
+    TYPED_EDGES_ENABLED,
+)
+from .relationship_inference import RelationshipInferenceEngine, apply_review_band
+from .run_tracker import RunTracker
+from ..compat import _sanitize_log_value
 
 logger = logging.getLogger(__name__)
 
 
 # Protocol for storage backend interface
 class StorageProtocol(Protocol):
-    async def get_all_memories(self) -> List[Memory]: pass
+    async def get_all_memories(
+        self, memory_type: Optional[str] = None
+    ) -> List[Memory]: pass
     async def get_memories_by_time_range(
-        self, start_time: float, end_time: float
+        self, start_time: float, end_time: float, include_embeddings: bool = False
     ) -> List[Memory]:
+        pass
+
+    async def get_by_hash(self, content_hash: str) -> Optional[Memory]:
+        pass
+
+    async def count_all_memories(
+        self,
+        memory_type: Optional[str] = None,
+        tags: Optional[List[str]] = None,
+        tag_match: str = "any",
+        stale_days: Optional[int] = None,
+        store: Optional[str] = "default",
+        agent_id: Optional[str] = None,
+    ) -> int:
         pass
 
     async def search_by_tag(
@@ -48,19 +73,79 @@ class StorageProtocol(Protocol):
     ) -> List[Memory]:
         pass
 
-    async def store(self, memory: Memory) -> Tuple[bool, str]:
+    async def store(
+        self, memory: Memory, skip_semantic_dedup: bool = False
+    ) -> Tuple[bool, str]:
+        pass
+
+    async def store_batch(self, memories: List[Memory]) -> List[Tuple[bool, str]]:
+        pass
+
+    async def retrieve(
+        self,
+        query: str,
+        n_results: int = 5,
+        tags: Optional[List[str]] = None,
+        min_confidence: float = 0.0,
+        include_superseded: bool = False,
+        start_time: Optional[float] = None,
+        end_time: Optional[float] = None,
+    ) -> List[MemoryQueryResult]:
+        pass
+
+    async def search_memories(
+        self,
+        query: Optional[str] = None,
+        mode: str = "semantic",
+        time_expr: Optional[str] = None,
+        after: Optional[str] = None,
+        before: Optional[str] = None,
+        tags: Optional[List[str]] = None,
+        tag_match: str = "any",
+        quality_boost: float = 0.0,
+        limit: int = 10,
+        include_debug: bool = False,
+        include_superseded: bool = False,
+        ranking_weights: Optional[Dict[str, float]] = None,
+        store: Optional[str] = "default",
+        agent_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         pass
 
     async def update_memory(self, memory: Memory) -> bool:
         pass
 
+    async def update_memories_batch(
+        self, memories: List[Memory], preserve_timestamps: bool = False
+    ) -> List[bool]:
+        pass
+
+    async def update_memory_metadata(
+        self,
+        content_hash: str,
+        updates: Dict[str, Any],
+        preserve_timestamps: bool = True,
+    ) -> Tuple[bool, str]:
+        pass
+
+    async def mark_superseded_batch(self, pairs: List[Tuple[str, str]]) -> int:
+        pass
+
+    async def get_stats(self) -> Dict[str, Any]:
+        pass
+
     async def delete_memory(self, content_hash: str) -> bool:
+        pass
+
+    async def delete(self, content_hash: str) -> Tuple[bool, str]:
         pass
 
     async def get_memory_connections(self) -> Dict[str, int]:
         pass
 
-    async def get_access_patterns(self) -> Dict[str, datetime]:
+    async def get_access_patterns(
+        self, content_hashes: Optional[Sequence[str]] = None
+    ) -> Dict[str, datetime]:
         pass
 
 
@@ -88,7 +173,7 @@ class SyncPauseContext:
                 self.logger.info("Resuming hybrid backend sync after consolidation")
                 await self.storage.resume_sync()
             except Exception as e:
-                self.logger.error(f"Failed to resume sync: {e}", exc_info=True)
+                self.logger.error("Failed to resume sync: %s", _sanitize_log_value(e), exc_info=True)
 
 
 def check_horizon_requirements(
@@ -108,33 +193,21 @@ def check_horizon_requirements(
     return time_horizon in applicable_horizons
 
 
-# Horizon configuration
+# Horizon configuration.
+#
+# `window` is how far back a horizon reaches: a run considers memories created
+# within the last `window`, which is what the `memory_consolidate` tool
+# description promises for every horizon. `incremental` carries a window too,
+# but only as the bootstrap span for its first run -- afterwards it advances a
+# cursor from the last recorded run.
 HORIZON_CONFIGS = {
-    "daily": {"delta": timedelta(days=1), "cutoff_days": 2},
-    "weekly": {"delta": timedelta(days=7), "cutoff_days": None},
-    "monthly": {"delta": timedelta(days=30), "cutoff_days": None},
-    "quarterly": {"delta": timedelta(days=90), "cutoff_days": 90},
-    "yearly": {"delta": timedelta(days=365), "cutoff_days": 365},
+    "daily": {"window": timedelta(days=1)},
+    "weekly": {"window": timedelta(days=7)},
+    "monthly": {"window": timedelta(days=30)},
+    "quarterly": {"window": timedelta(days=90)},
+    "yearly": {"window": timedelta(days=365)},
+    "incremental": {"window": timedelta(days=1)},
 }
-
-
-def filter_memories_by_age(
-    memories: List[Memory], cutoff_date: datetime
-) -> List[Memory]:
-    """Filter memories created before the cutoff date.
-
-    Args:
-        memories: List of Memory objects
-        cutoff_date: Only keep memories older than this
-
-    Returns:
-        Filtered list of memories
-    """
-    return [
-        m
-        for m in memories
-        if m.created_at and datetime.fromtimestamp(m.created_at, tz=timezone.utc) < cutoff_date
-    ]
 
 
 class DreamInspiredConsolidator:
@@ -150,9 +223,9 @@ class DreamInspiredConsolidator:
 
     # Phase enablement configuration
     ENABLED_PHASES = {
-        "clustering": ["weekly", "monthly", "quarterly"],
-        "associations": ["weekly", "monthly"],
-        "compression": ["weekly", "monthly", "quarterly"],
+        "clustering": ["weekly", "monthly", "quarterly", "incremental"],
+        "associations": ["weekly", "monthly", "incremental"],
+        "compression": ["weekly", "monthly", "quarterly", "incremental"],
         "forgetting": ["monthly", "quarterly", "yearly"],
     }
 
@@ -173,8 +246,11 @@ class DreamInspiredConsolidator:
             typed_edges_enabled=TYPED_EDGES_ENABLED,
         )
 
-        # Initialize health monitoring
-        self.health_monitor = ConsolidationHealthMonitor(config)
+        # Initialize health monitoring (pass self so checks inspect live components)
+        self.health_monitor = ConsolidationHealthMonitor(config, consolidator=self)
+
+        # Initialize run tracker for incremental consolidation
+        self.run_tracker: Optional[RunTracker] = None
 
         # Graph storage initialized lazily in consolidate() to avoid
         # blocking I/O in __init__ (Milvus backend needs async init).
@@ -248,11 +324,43 @@ class DreamInspiredConsolidator:
                 self.graph_storage = None
                 return
 
-            self.logger.info(f"Graph storage mode: {GRAPH_STORAGE_MODE}")
+            self.logger.info("Graph storage mode: %s", GRAPH_STORAGE_MODE)
 
         except Exception as e:
-            self.logger.warning(f"Failed to initialize graph storage: {e}")
+            self.logger.warning("Failed to initialize graph storage: %s", _sanitize_log_value(e))
             self.graph_storage = None
+
+    def _resolve_tracker_db_path(self) -> Optional[Path]:
+        """Resolve path for the run tracker SQLite DB (next to main memory DB).
+
+        The tracker is always SQLite regardless of the memory backend — it only
+        records run watermarks. Returning None disables it, which silently
+        pins incremental consolidation to its 24h bootstrap window forever, so
+        every backend needs a resolvable location.
+        """
+        db_path = None
+        if hasattr(self.storage, "primary") and hasattr(self.storage.primary, "db_path"):
+            db_path = getattr(self.storage.primary, "db_path", None)
+        if not isinstance(db_path, (str, Path)) and hasattr(self.storage, "db_path"):
+            db_path = getattr(self.storage, "db_path", None)
+        if isinstance(db_path, (str, Path)):
+            return Path(db_path).parent / "consolidation_runs.db"
+
+        # Milvus Lite: co-locate with the local Milvus file.
+        lite_path = getattr(self.storage, "lite_db_path", None)
+        if isinstance(lite_path, (str, Path)):
+            return Path(lite_path).parent / "consolidation_runs.db"
+
+        # Remote backends (Milvus server, Zilliz, Cloudflare) have no local
+        # data file — fall back to the configured base directory so the
+        # watermark still persists across runs.
+        try:
+            from ..config import BASE_DIR
+            if BASE_DIR:
+                return Path(BASE_DIR) / "consolidation_runs.db"
+        except Exception:  # noqa: BLE001
+            self.logger.debug("BASE_DIR unavailable for consolidation run tracker")
+        return None
 
     async def consolidate(self, time_horizon: str, **kwargs) -> ConsolidationReport:
         """
@@ -273,178 +381,260 @@ class DreamInspiredConsolidator:
             memories_processed=0,
         )
 
+        is_incremental = time_horizon == "incremental"
+
         try:
             self.logger.info(
-                f"Starting {time_horizon} consolidation - this may take several minutes depending on memory count..."
+                "Starting %s consolidation - this may take several minutes depending on memory count...",
+                _sanitize_log_value(time_horizon)
             )
 
-            # Lazy graph storage init (avoids blocking I/O in __init__).
-            # Lock prevents double-init when two consolidate() calls race.
-            async with self._graph_storage_lock:
-                if not self._graph_storage_initialized:
-                    await self._init_graph_storage()
-                    self._graph_storage_initialized = True
+            # Incremental: initialize run_tracker, concurrency guard, timeout
+            if await self._acquire_incremental_slot(time_horizon):
+                self.logger.info("Incremental consolidation already in flight, skipping")
+                return self._finalize_report(report, ["Skipped: concurrent run in flight"])
+
+            await self._ensure_graph_storage()
 
             # Use context manager for sync pause/resume
             async with SyncPauseContext(self.storage, self.logger):
-                # 1. Retrieve memories for processing
-                memories = await self._get_memories_for_horizon(time_horizon, **kwargs)
-                report.memories_processed = len(memories)
-
-                if not memories:
-                    self.logger.info(
-                        f"No memories to process for {time_horizon} consolidation"
-                    )
-                    return self._finalize_report(report, [])
-
-                self.logger.info(f"✓ Found {len(memories)} memories to process")
-
-                # 2. Calculate/update relevance scores
-                self.logger.info(
-                    f"📊 Phase 1/6: Calculating relevance scores for {len(memories)} memories..."
+                return await self._run_consolidation_pass(
+                    report, time_horizon, is_incremental, **kwargs
                 )
-                performance_start = time.time()
-                relevance_scores = await self._update_relevance_scores(
-                    memories, time_horizon
-                )
-                self.logger.info(
-                    f"✓ Relevance scoring completed in {time.time() - performance_start:.1f}s"
-                )
-
-                # 3. Cluster by semantic similarity (if enabled and appropriate)
-                clusters = []
-                if self.config.clustering_enabled and check_horizon_requirements(
-                    time_horizon, "clustering", self.ENABLED_PHASES
-                ):
-                    self.logger.info(
-                        f"🔗 Phase 2/6: Clustering memories by semantic similarity..."
-                    )
-                    performance_start = time.time()
-                    clusters = await self.clustering_engine.process(memories)
-                    report.clusters_created = len(clusters)
-                    self.logger.info(
-                        f"✓ Clustering completed in {time.time() - performance_start:.1f}s, created {len(clusters)} clusters"
-                    )
-
-                # 4. Run creative associations (if enabled and appropriate)
-                associations = []
-                if self.config.associations_enabled and check_horizon_requirements(
-                    time_horizon, "associations", self.ENABLED_PHASES
-                ):
-                    self.logger.info(
-                        f"🧠 Phase 3/6: Discovering creative associations..."
-                    )
-                    performance_start = time.time()
-                    existing_associations = await self._get_existing_associations()
-                    associations = await self.association_engine.process(
-                        memories, existing_associations=existing_associations
-                    )
-                    report.associations_discovered = len(associations)
-                    self.logger.info(
-                        f"✓ Association discovery completed in {time.time() - performance_start:.1f}s, found {len(associations)} associations"
-                    )
-
-                    # Store new associations
-                    await self._store_associations(associations)
-
-                # 5. Compress clusters (if enabled and clusters exist)
-                compression_results = []
-                if (
-                    self.config.compression_enabled
-                    and clusters
-                    and check_horizon_requirements(
-                        time_horizon, "compression", self.ENABLED_PHASES
-                    )
-                ):
-                    self.logger.info(f"🗜️ Phase 4/6: Compressing memory clusters...")
-                    performance_start = time.time()
-                    compression_results = await self.compression_engine.process(
-                        clusters, memories
-                    )
-                    report.memories_compressed = len(compression_results)
-                    self.logger.info(
-                        f"✓ Compression completed in {time.time() - performance_start:.1f}s, compressed {len(compression_results)} clusters"
-                    )
-
-                    # Store compressed memories and update originals
-                    await self._handle_compression_results(compression_results)
-
-                # 6. Controlled forgetting (if enabled and appropriate)
-                forgetting_results = []
-                if self.config.forgetting_enabled and check_horizon_requirements(
-                    time_horizon, "forgetting", self.ENABLED_PHASES
-                ):
-                    self.logger.info(f"🗂️ Phase 5/6: Applying controlled forgetting...")
-                    performance_start = time.time()
-                    access_patterns = await self._get_access_patterns()
-                    forgetting_results = await self.forgetting_engine.process(
-                        memories,
-                        relevance_scores,
-                        access_patterns=access_patterns,
-                        time_horizon=time_horizon,
-                    )
-                    report.memories_archived = len(
-                        [
-                            r
-                            for r in forgetting_results
-                            if r.action_taken in ["archived", "deleted"]
-                        ]
-                    )
-                    self.logger.info(
-                        f"✓ Forgetting completed in {time.time() - performance_start:.1f}s, processed {len(forgetting_results)} candidates"
-                    )
-
-                    # Apply forgetting results to storage
-                    await self._apply_forgetting_results(forgetting_results)
-
-                # 6b. Prune orphaned graph edges (#632)
-                orphaned = await self._prune_orphaned_graph_edges()
-                if orphaned > 0:
-                    self.logger.info(f"🧹 Pruned {orphaned} orphaned graph edges")
-
-                # 7. Update consolidation statistics
-                self._update_consolidation_stats(report)
-
-                # 8. Track consolidation timestamp for incremental mode
-                if self.config.incremental_mode:
-                    await self._update_consolidation_timestamps(memories)
-
-                # 9. Finalize report
-                report = self._finalize_report(report, [])
-                if self.plugin_registry:
-                    await self.plugin_registry.fire('on_consolidate', {
-                        **report.performance_metrics,
-                        'time_horizon': report.time_horizon,
-                        'memories_processed': report.memories_processed,
-                        'associations_discovered': report.associations_discovered,
-                        'clusters_created': report.clusters_created,
-                    })
-                return report
 
         except ConsolidationError as e:
             # Re-raise configuration and validation errors
             self.logger.error(
-                f"Configuration error during {time_horizon} consolidation: {e}"
+                "Configuration error during %s consolidation: %s",
+                _sanitize_log_value(time_horizon), _sanitize_log_value(e)
             )
             self.health_monitor.record_error(
                 "consolidator", e, {"time_horizon": time_horizon}
             )
             raise
         except Exception as e:
-            self.logger.error(f"Error during {time_horizon} consolidation: {e}")
+            self.logger.error("Error during %s consolidation: %s", _sanitize_log_value(time_horizon), _sanitize_log_value(e))
             self.health_monitor.record_error(
                 "consolidator", e, {"time_horizon": time_horizon}
             )
             report.errors.append(str(e))
             return self._finalize_report(report, [str(e)])
+        finally:
+            if is_incremental and self.run_tracker:
+                self.run_tracker.release("incremental")
+
+    async def _run_relevance_phase(
+        self, memories: List[Memory], time_horizon: str
+    ) -> List[RelevanceScore]:
+        """Phase 1/6: score memories by relevance and persist the scores.
+
+        Skipped when decay is disabled (#1354). The flag is checked here rather
+        than in :meth:`_run_phase_schedule` to keep that method's complexity down.
+        """
+        if not self.config.decay_enabled:
+            self.logger.info("Decay disabled, skipping Phase 1/6 (relevance scoring)")
+            return []
+        self.logger.info(
+            "📊 Phase 1/6: Calculating relevance scores for %s memories...",
+            len(memories),
+        )
+        performance_start = time.time()
+        relevance_scores = await self._update_relevance_scores(
+            memories, time_horizon
+        )
+        self.logger.info(
+            "✓ Relevance scoring completed in %.1fs",
+            time.time() - performance_start,
+        )
+        return relevance_scores
+
+    async def _run_clustering_phase(
+        self, memories: List[Memory], time_horizon: str
+    ) -> List:
+        """Phase 2/6: cluster memories by semantic similarity."""
+        self.logger.info("🔗 Phase 2/6: Clustering memories by semantic similarity...")
+        performance_start = time.time()
+        clusters = await self.clustering_engine.process(memories)
+        self.logger.info(
+            "✓ Clustering completed in %.1fs, created %s clusters",
+            time.time() - performance_start,
+            len(clusters),
+        )
+        return clusters
+
+    async def _run_associations_phase(
+        self, memories: List[Memory], time_horizon: str
+    ) -> List:
+        """Phase 3/6: discover and store creative associations."""
+        self.logger.info("🧠 Phase 3/6: Discovering creative associations...")
+        performance_start = time.time()
+        existing_associations = await self._get_existing_associations()
+        associations = await self.association_engine.process(
+            memories, existing_associations=existing_associations
+        )
+        self.logger.info(
+            "✓ Association discovery completed in %.1fs, found %s associations",
+            time.time() - performance_start,
+            len(associations),
+        )
+        await self._store_associations(associations)
+        return associations
+
+    async def _run_compression_phase(
+        self, clusters: List, memories: List[Memory]
+    ) -> List:
+        """Phase 4/6: compress clusters and store compressed results."""
+        self.logger.info("🗜️ Phase 4/6: Compressing memory clusters...")
+        performance_start = time.time()
+        compression_results = await self.compression_engine.process(
+            clusters, memories
+        )
+        self.logger.info(
+            "✓ Compression completed in %.1fs, compressed %s clusters",
+            time.time() - performance_start,
+            len(compression_results),
+        )
+        await self._handle_compression_results(compression_results)
+        return compression_results
+
+    async def _run_consolidation_pass(
+        self,
+        report: ConsolidationReport,
+        time_horizon: str,
+        is_incremental: bool,
+        **kwargs,
+    ) -> ConsolidationReport:
+        """Run one full pipeline pass inside the sync-pause context."""
+        memories = await self._get_memories_for_horizon(time_horizon, **kwargs)
+        report.memories_processed = len(memories)
+
+        if not memories:
+            self.logger.info(
+                "No memories to process for %s consolidation",
+                _sanitize_log_value(time_horizon)
+            )
+            # Record run even on 0 memories to advance timestamp
+            if is_incremental and self.run_tracker:
+                await self.run_tracker.record_run("incremental", 0)
+            return self._finalize_report(report, [])
+
+        self.logger.info("✓ Found %s memories to process", len(memories))
+
+        # 2-6. Run the conditional consolidation phases
+        await self._run_phase_schedule(memories, time_horizon, report)
+
+        return await self._finalize_consolidation(
+            report, memories, is_incremental
+        )
+
+    async def _acquire_incremental_slot(self, time_horizon: str) -> bool:
+        """Initialize the run tracker and acquire the incremental slot.
+
+        Returns True when the run should be skipped (another run is in flight).
+        """
+        if time_horizon != "incremental":
+            return False
+        if self.run_tracker is None:
+            db_path = self._resolve_tracker_db_path()
+            db_path = Path(str(db_path)) if db_path else None
+            if db_path:
+                self.run_tracker = RunTracker(db_path)
+        if self.run_tracker and not self.run_tracker.try_acquire("incremental"):
+            return True
+        return False
+
+    async def _ensure_graph_storage(self) -> None:
+        """Lazily initialize graph storage under the double-init lock."""
+        async with self._graph_storage_lock:
+            if not self._graph_storage_initialized:
+                await self._init_graph_storage()
+                self._graph_storage_initialized = True
+
+    async def _run_phase_schedule(
+        self,
+        memories: List[Memory],
+        time_horizon: str,
+        report: ConsolidationReport,
+    ) -> None:
+        """Run the conditional consolidation phases (1-6) and update *report*."""
+        await self._run_relevance_phase(memories, time_horizon)
+
+        clusters: list = []
+        if self.config.clustering_enabled and check_horizon_requirements(
+            time_horizon, "clustering", self.ENABLED_PHASES
+        ):
+            clusters = await self._run_clustering_phase(memories, time_horizon)
+            report.clusters_created = len(clusters)
+
+        if self.config.associations_enabled and check_horizon_requirements(
+            time_horizon, "associations", self.ENABLED_PHASES
+        ):
+            associations = await self._run_associations_phase(
+                memories, time_horizon
+            )
+            report.associations_discovered = len(associations)
+
+        if (
+            self.config.compression_enabled
+            and clusters
+            and check_horizon_requirements(
+                time_horizon, "compression", self.ENABLED_PHASES
+            )
+        ):
+            compression_results = await self._run_compression_phase(
+                clusters, memories
+            )
+            report.memories_compressed = len(compression_results)
+
+        # Forgetting gets its own candidate selector that reaches beyond the
+        # horizon window into the stale tail (Codeberg #325).
+        if self.config.forgetting_enabled and check_horizon_requirements(
+            time_horizon, "forgetting", self.ENABLED_PHASES
+        ):
+            await self._run_forgetting_phase(time_horizon, report)
+
+    async def _finalize_consolidation(
+        self,
+        report: ConsolidationReport,
+        memories: List[Memory],
+        is_incremental: bool,
+    ) -> ConsolidationReport:
+        """Post-phase bookkeeping: prune, stats, timestamps, events, report."""
+        orphaned = await self._prune_orphaned_graph_edges()
+        if orphaned > 0:
+            self.logger.info("🧹 Pruned %s orphaned graph edges", orphaned)
+
+        self._update_consolidation_stats(report)
+
+        if self.config.incremental_mode:
+            await self._update_consolidation_timestamps(memories)
+
+        report = self._finalize_report(report, [])
+
+        if is_incremental and self.run_tracker:
+            await self.run_tracker.record_run(
+                "incremental", report.memories_processed
+            )
+
+        if self.plugin_registry:
+            await self.plugin_registry.fire('on_consolidate', {
+                **report.performance_metrics,
+                'time_horizon': report.time_horizon,
+                'memories_processed': report.memories_processed,
+                'associations_discovered': report.associations_discovered,
+                'clusters_created': report.clusters_created,
+            })
+        return report
 
     async def _get_memories_for_horizon(
         self, time_horizon: str, **kwargs
     ) -> List[Memory]:
-        """Get memories appropriate for the given time horizon.
+        """Get the memories a horizon may touch: those created inside its window.
 
-        With incremental mode enabled, returns oldest-first batch of memories
-        that haven't been recently consolidated.
+        Every horizon reaches back exactly as far as its documented window
+        (`daily` one day, `weekly` seven, and so on). With incremental mode
+        enabled the window is then narrowed to the oldest `batch_size` memories
+        inside it, so a run stays bounded on a large store.
         """
         now = datetime.now(timezone.utc)
 
@@ -452,63 +642,154 @@ class DreamInspiredConsolidator:
         if time_horizon not in HORIZON_CONFIGS:
             raise ConsolidationError(f"Unknown time horizon: {time_horizon}")
 
-        config = HORIZON_CONFIGS[time_horizon]
+        window = HORIZON_CONFIGS[time_horizon]["window"]
 
-        # For daily processing, get recent memories (no change - already efficient)
-        if time_horizon == "daily":
-            cutoff_days = config.get("cutoff_days", 2)
-            start_time = (now - timedelta(days=cutoff_days)).timestamp()
+        # Incremental: only memories created since last run
+        if time_horizon == "incremental":
+            last_run = None
+            if self.run_tracker:
+                last_run = await self.run_tracker.get_last_run_at("incremental")
+            # Bootstrap: use the configured window on first run
+            if last_run is None:
+                last_run = (now - window).timestamp()
             end_time = now.timestamp()
             memories = await self.storage.get_memories_by_time_range(
-                start_time, end_time, include_embeddings=True,
+                last_run, end_time, include_embeddings=True,
             )
-        else:
-            # For longer horizons: incremental oldest-first processing
-            memories = await self.storage.get_all_memories(include_embeddings=True)
+            return memories
 
-            # Filter by relevance to time horizon (quarterly/yearly still focus on old memories)
-            cutoff_days = config.get("cutoff_days")
-            if cutoff_days is not None:
-                cutoff_date = now - timedelta(days=cutoff_days)
-                memories = filter_memories_by_age(memories, cutoff_date)
+        memories = await self.storage.get_memories_by_time_range(
+            (now - window).timestamp(), now.timestamp(), include_embeddings=True,
+        )
 
-            # Incremental mode: Sort oldest-first and batch
-            if self.config.incremental_mode:
-                # Sort by last_consolidated_at (oldest first), fallback to created_at
-                def get_consolidation_sort_key(memory: Memory) -> float:
-                    # Check metadata for last consolidation timestamp
-                    if memory.metadata and "last_consolidated_at" in memory.metadata:
-                        return float(memory.metadata["last_consolidated_at"])
-                    # Fall back to created_at (treat never-consolidated as oldest)
-                    return memory.created_at if memory.created_at else 0.0
-
-                memories.sort(key=get_consolidation_sort_key)
-
-                # Limit to batch size
-                batch_size = self.config.batch_size
-                if len(memories) > batch_size:
-                    self.logger.info(
-                        f"Incremental mode: Processing {batch_size} oldest memories (out of {len(memories)} total)"
-                    )
-                    memories = memories[:batch_size]
+        if self.config.incremental_mode:
+            memories = self._take_oldest_batch(memories)
 
         return memories
 
+    async def _get_forgetting_candidates(
+        self, time_horizon: str
+    ) -> List[Memory]:
+        """Get forgetting candidates that reach beyond the horizon window.
+
+        Codeberg #325: every horizon means its documented window, so nothing
+        younger than the floor enters the forgetting phase.  This method
+        queries everything older than ``forgetting_min_age_days`` (default 365),
+        then bounds the read to ``batch_size`` so a run stays finite.
+
+        The ``forgetting_min_age_days`` config acts as a floor:
+        nothing younger than that is considered stale enough for archival.
+        Set via ``MCP_FORGETTING_MIN_AGE_DAYS`` env var.
+        """
+        now = datetime.now(timezone.utc)
+
+        window = HORIZON_CONFIGS[time_horizon]["window"]
+        min_age_days = max(self.config.forgetting_min_age_days, window.days)
+        min_age_cutoff = (now - timedelta(days=min_age_days)).timestamp()
+
+        # Query everything older than the floor (the stale tail)
+        candidates = await self.storage.get_memories_by_time_range(
+            0.0, min_age_cutoff, include_embeddings=True,
+        )
+
+        # Always bound the read so a deployment with thousands of stale
+        # memories does not load them all into one run.
+        if len(candidates) > self.config.batch_size:
+            candidates = self._take_oldest_batch(candidates)
+
+        self.logger.info(
+            "Forgetting candidates: %s memories older than %sd",
+            len(candidates),
+            min_age_days,
+        )
+        return candidates
+
+    async def _run_forgetting_phase(
+        self, time_horizon: str, report: ConsolidationReport
+    ) -> list:
+        """Run the controlled-forgetting phase and update *report* in place.
+
+        Extracted from :meth:`consolidate` to keep that method's cyclomatic
+        complexity under the pre-commit gate.
+        """
+        self.logger.info("🗂️ Phase 5/6: Applying controlled forgetting...")
+        performance_start = time.time()
+        forgetting_candidates = await self._get_forgetting_candidates(time_horizon)
+
+        if not forgetting_candidates:
+            self.logger.info("No stale-tail candidates for forgetting")
+            return []
+
+        # Forgetting needs scores even with decay off; it just must not persist them (#1354).
+        forgetting_scores = await self._update_relevance_scores(
+            forgetting_candidates, time_horizon, persist=self.config.decay_enabled
+        )
+        access_patterns = await self._get_access_patterns(
+            [m.content_hash for m in forgetting_candidates]
+        )
+        forgetting_results = await self.forgetting_engine.process(
+            forgetting_candidates,
+            forgetting_scores,
+            access_patterns=access_patterns,
+            time_horizon=time_horizon,
+        )
+
+        report.memories_archived = len(
+            [r for r in forgetting_results if r.action_taken in ["archived", "deleted"]]
+        )
+        self.logger.info(
+            f"✓ Forgetting completed in {time.time() - performance_start:.1f}s, "
+            f"processed {len(forgetting_results)} candidates"
+        )
+
+        # Retained rows must sort behind candidates not processed yet.
+        await self._update_consolidation_timestamps(forgetting_candidates)
+        await self._apply_forgetting_results(forgetting_results)
+        return forgetting_results
+
+    def _take_oldest_batch(self, memories: List[Memory]) -> List[Memory]:
+        """Narrow a window to the oldest `batch_size` memories in it.
+
+        Least-recently-consolidated first, so repeated runs work through the
+        window instead of re-processing the same head every time.
+        """
+        def sort_key(memory: Memory) -> float:
+            # Check metadata for last consolidation timestamp
+            if memory.metadata and "last_consolidated_at" in memory.metadata:
+                return float(memory.metadata["last_consolidated_at"])
+            # Fall back to created_at (treat never-consolidated as oldest)
+            return memory.created_at if memory.created_at else 0.0
+
+        memories = sorted(memories, key=sort_key)
+
+        batch_size = self.config.batch_size
+        if len(memories) > batch_size:
+            self.logger.info(
+                f"Processing {batch_size} oldest memories "
+                f"(out of {len(memories)} in the window)"
+            )
+            memories = memories[:batch_size]
+        return memories
+
     async def _update_relevance_scores(
-        self, memories: List[Memory], time_horizon: str
-    ) -> List:
-        """Calculate and update relevance scores for memories."""
+        self, memories: List[Memory], time_horizon: str, persist: bool = True
+    ) -> List[RelevanceScore]:
+        """Calculate relevance scores; write them to memory metadata when *persist*."""
         # Get connection and access data
         connections = await self._get_memory_connections()
-        access_patterns = await self._get_access_patterns()
+        access_patterns = await self._get_access_patterns(
+            [m.content_hash for m in memories]
+        )
 
         # Calculate relevance scores
         relevance_scores = await self.decay_calculator.process(
             memories,
             connections=connections,
             access_patterns=access_patterns,
-            reference_time=datetime.now(),
+            reference_time=datetime.now(timezone.utc),
         )
+        if not persist:
+            return relevance_scores
 
         # Update memory metadata with relevance scores (v8.47.1 - batch optimization)
         # Collect all memories to update, then use single batch operation for 50-100x speedup
@@ -541,16 +822,78 @@ class DreamInspiredConsolidator:
             self.logger.warning("Storage backend doesn't support connection tracking")
             return {}
 
-    async def _get_access_patterns(self) -> Dict[str, datetime]:
-        """Get memory access patterns from storage."""
+    async def _get_access_patterns(
+        self, content_hashes: Optional[Sequence[str]] = None
+    ) -> Dict[str, datetime]:
+        """Get memory access patterns from storage, scoped to the candidate window.
+
+        Consumers (decay boost, forgetting) only look up hashes that are in the current
+        batch, so passing the window keeps per-run memory and latency proportional to
+        the batch instead of the whole ever-accessed population.
+
+        Backends that predate the ``content_hashes`` parameter (including third-party
+        implementations of the storage protocol) are detected by signature and called
+        with no arguments, so they keep working unchanged.
+        """
         try:
-            return await self.storage.get_access_patterns()
+            getter = self.storage.get_access_patterns
         except AttributeError:
             # Fallback if storage doesn't implement access tracking
             self.logger.warning(
                 "Storage backend doesn't support access pattern tracking"
             )
             return {}
+        try:
+            style = (
+                None if content_hashes is None
+                else self._access_window_call_style(getter)
+            )
+            if style == "keyword":
+                return await getter(content_hashes=content_hashes)
+            if style == "positional":
+                return await getter(content_hashes)
+            return await getter()
+        except AttributeError:
+            self.logger.warning(
+                "Storage backend doesn't support access pattern tracking"
+            )
+            return {}
+
+    @staticmethod
+    def _access_window_call_style(getter) -> Optional[str]:
+        """How to hand the candidate window to a backend's ``get_access_patterns``.
+
+        Returns ``"keyword"`` or ``"positional"`` when the signature can take the
+        window, and ``None`` for a backend that predates the parameter (it is then
+        called with no arguments).
+
+        Checked by signature rather than by catching ``TypeError``, so a genuine
+        ``TypeError`` raised *inside* a backend is not silently downgraded to a
+        full-population query. Accepting the window and passing it are decided
+        together: a ``**kwargs`` forwarder or a keyword-only ``content_hashes``
+        accepts it only by name, a ``*args`` forwarder or a positional-only
+        parameter only by position. Keyword is preferred whenever it binds, because
+        it cannot land on an unrelated first parameter the way a positional value can.
+        """
+        try:
+            params = inspect.signature(getter).parameters
+        except (TypeError, ValueError):
+            return None
+        named = params.get("content_hashes")
+        if named is not None:
+            if named.kind is inspect.Parameter.POSITIONAL_ONLY:
+                return "positional"
+            if named.kind in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            ):
+                return "keyword"
+        kinds = {p.kind for p in params.values()}
+        if inspect.Parameter.VAR_KEYWORD in kinds:
+            return "keyword"
+        if inspect.Parameter.VAR_POSITIONAL in kinds:
+            return "positional"
+        return None
 
     async def _get_existing_associations(self) -> set:
         """Get existing memory associations to avoid duplicates."""
@@ -569,7 +912,7 @@ class DreamInspiredConsolidator:
             return associations
 
         except Exception as e:
-            self.logger.warning(f"Error getting existing associations: {e}")
+            self.logger.warning("Error getting existing associations: %s", _sanitize_log_value(e))
             return set()
 
     async def _store_associations(self, associations) -> None:
@@ -714,6 +1057,7 @@ class DreamInspiredConsolidator:
                             target_timestamp=target_memory.created_at,
                             source_tags=source_memory.tags,
                             target_tags=target_memory.tags,
+                            similarity=association.similarity_score,
                         )
                         if inferred_rel != "related":
                             relationship_type = inferred_rel
@@ -726,11 +1070,18 @@ class DreamInspiredConsolidator:
                             f"Failed to infer relationship type for {source_hash[:8]} <-> {target_hash[:8]}: {e}"
                         )
 
-                # Prepare metadata
+                relationship_type, needs_review = apply_review_band(
+                    relationship_type, confidence
+                )
+
+                # Inference owns these fields, even when discovery metadata
+                # contains stale confidence or review values.
                 metadata = {
                     "discovery_method": association.discovery_method,
                     "discovery_date": association.discovery_date.isoformat(),
                     **association.metadata,
+                    "relationship_confidence": round(confidence, 3),
+                    "needs_review": needs_review,
                 }
 
                 # Store in graph table with inferred relationship type
@@ -746,10 +1097,11 @@ class DreamInspiredConsolidator:
                 if success:
                     stored_count += 1
 
-                    # Collect contradiction pairs for batch superseding (#732)
+                    # Only the top band is eligible for opt-in superseding.
+                    # Keyword-only contradictions remain review candidates.
                     if (
                         relationship_type == "contradicts"
-                        and confidence >= 0.75
+                        and not needs_review
                         and source_memory
                         and target_memory
                     ):
@@ -764,22 +1116,37 @@ class DreamInspiredConsolidator:
 
             except Exception as e:
                 failed_count += 1
-                self.logger.warning(f"Failed to store association in graph table: {e}")
+                self.logger.warning("Failed to store association in graph table: %s", _sanitize_log_value(e))
 
-        # Batch-mark superseded memories in a single transaction (#732)
-        if supersede_pairs:
-            storage = getattr(self.storage, "primary_storage", None) or self.storage
-            if hasattr(storage, 'mark_superseded_batch'):
-                marked = await storage.mark_superseded_batch(supersede_pairs)
-                self.logger.info(
-                    f"Auto-superseded {marked} memories on contradiction detection"
-                )
+        await self._auto_supersede(supersede_pairs)
 
         self.logger.info(
             f"Stored {stored_count} associations in graph table ({failed_count} failed)"
             if failed_count > 0
             else f"Stored {stored_count} associations in graph table"
         )
+
+    async def _auto_supersede(self, supersede_pairs) -> None:
+        """Batch-mark older memories from eligible top-band contradictions.
+
+        Disabled by default (MCP_CONSOLIDATION_AUTO_SUPERSEDE=false); the contradicts
+        edges are already stored at this point either way.
+        """
+        if not supersede_pairs:
+            return
+        if not CONSOLIDATION_AUTO_SUPERSEDE:
+            self.logger.info(
+                "Auto-supersede disabled: left %s contradicts pairs visible",
+                _sanitize_log_value(len(supersede_pairs)),
+            )
+            return
+        storage = getattr(self.storage, "primary_storage", None) or self.storage
+        if hasattr(storage, 'mark_superseded_batch'):
+            marked = await storage.mark_superseded_batch(supersede_pairs)
+            self.logger.info(
+                "Auto-superseded %s memories on contradiction detection",
+                _sanitize_log_value(marked),
+            )
 
     async def _handle_compression_results(self, compression_results) -> None:
         """Handle storage of compressed memories — batched for efficiency."""
@@ -819,7 +1186,13 @@ class DreamInspiredConsolidator:
             # 'archived' memories are handled by the forgetting engine
 
     async def _prune_orphaned_graph_edges(self) -> int:
-        """Remove graph edges referencing deleted or non-existent memories (#632)."""
+        """Remove graph edges referencing deleted or non-existent memories (#632).
+
+        Note: has_entity edges use target_hash for entity *names* (not content
+        hashes), so the target-existence check must exclude them. Source-orphan
+        pruning still applies to has_entity (if the memory is deleted, its
+        entity links should go too).
+        """
         try:
             conn = getattr(self.storage, 'conn', None)
             # For hybrid backend, access the primary (sqlite) storage
@@ -837,16 +1210,19 @@ class DreamInspiredConsolidator:
                     WHERE m.content_hash = memory_graph.source_hash
                     AND m.deleted_at IS NULL
                 )
-                OR NOT EXISTS (
-                    SELECT 1 FROM memories m
-                    WHERE m.content_hash = memory_graph.target_hash
-                    AND m.deleted_at IS NULL
+                OR (
+                    memory_graph.relationship_type != 'has_entity'
+                    AND NOT EXISTS (
+                        SELECT 1 FROM memories m
+                        WHERE m.content_hash = memory_graph.target_hash
+                        AND m.deleted_at IS NULL
+                    )
                 )
             """)
             conn.commit()
             return cursor.rowcount
         except Exception as e:
-            self.logger.warning(f"Failed to prune orphaned graph edges: {e}")
+            self.logger.warning("Failed to prune orphaned graph edges: %s", _sanitize_log_value(e))
             return 0
 
     async def _update_consolidation_timestamps(self, memories: List[Memory]) -> None:
@@ -878,7 +1254,7 @@ class DreamInspiredConsolidator:
                 )
 
         except Exception as e:
-            self.logger.error(f"Batch timestamp update failed: {e}")
+            self.logger.error("Batch timestamp update failed: %s", _sanitize_log_value(e))
             # Fallback to individual updates if batch fails
             self.logger.info("Falling back to individual timestamp updates")
             success_count = 0
@@ -961,7 +1337,12 @@ class DreamInspiredConsolidator:
 
     async def health_check(self) -> Dict[str, Any]:
         """Perform health check on the consolidation system."""
-        return await self.health_monitor.check_overall_health()
+        health = await self.health_monitor.check_overall_health()
+        # check_overall_health() always returns an empty 'statistics' dict —
+        # it has no reference to this consolidator's run counters. Merge them
+        # in here so `memory_consolidate status` reports real totals.
+        health['statistics'] = dict(self.consolidation_stats)
+        return health
 
     async def get_health_summary(self) -> Dict[str, Any]:
         """Get a summary of consolidation system health."""

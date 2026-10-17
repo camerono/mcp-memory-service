@@ -12,7 +12,7 @@
     "fallbackEnabled": true,
     "http": {
       "endpoint": "http://127.0.0.1:8000",
-      "apiKey": "VhOGAoUOE5_BMzu-phDORdyXHNMcDRBxvndK_Uop",
+      "apiKey": "auto-detect",
       "healthCheckTimeout": 3000,
       "useDetailedHealthCheck": true
     },
@@ -25,7 +25,7 @@
         "-s",
         "hybrid"
       ],
-      "serverWorkingDir": "/home/hkr/repositories/mcp-memory-service",
+      "serverWorkingDir": null,
       "connectionTimeout": 2000,
       "toolCallTimeout": 3000
     },
@@ -41,7 +41,8 @@
     "recentTimeWindow": "last week",
     "fallbackTimeWindow": "last 2 weeks",
     "showStorageSource": true,
-    "sourceDisplayMode": "brief"
+    "sourceDisplayMode": "brief",
+    "allowSelfSignedCerts": false
   },
   "projectDetection": {
     "gitRepository": true,
@@ -114,6 +115,11 @@
       "enabled": true,
       "timeout": 15000,
       "priority": "normal"
+    },
+    "sessionEndHarvest": {
+      "enabled": false,
+      "timeout": 7000,
+      "priority": "low"
     },
     "topicChange": {
       "enabled": false,
@@ -211,6 +217,20 @@
     "enableDebug": true,
     "logToFile": true,
     "logFilePath": "./claude-hooks.log"
+  },
+  "sessionHarvest": {
+    "enabled": false,
+    "dryRun": true,
+    "dryRunOnFirstUse": true,
+    "minSessionMessages": 10,
+    "sessions": 1,
+    "useLlm": false,
+    "minConfidence": 0.6,
+    "types": ["decision", "bug", "convention", "learning", "context"],
+    "endpoint": "http://127.0.0.1:8000",
+    "apiKey": null,
+    "timeoutMs": 5000,
+    "allowSelfSignedCerts": false
   },
   "permissionRequest": {
     "enabled": true,

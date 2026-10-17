@@ -4,9 +4,12 @@ Unit tests for Memory Type Ontology
 Tests the formal ontology layer for memory classification and type validation.
 """
 
+import importlib.util
+import json
+import os
 import sys
 from pathlib import Path
-import importlib.util
+
 import pytest
 
 # Load ontology module directly without importing the package
@@ -24,6 +27,20 @@ get_all_types = ontology.get_all_types
 validate_relationship = ontology.validate_relationship
 is_symmetric_relationship = ontology.is_symmetric_relationship
 MemoryTypeOntology = ontology.MemoryTypeOntology
+
+
+@pytest.fixture(autouse=True)
+def _isolate_custom_memory_types(monkeypatch):
+    """Keep ontology tests hermetic against an ambient custom-type config.
+
+    ``get_all_types()`` merges ``MCP_CUSTOM_MEMORY_TYPES`` at call time, so a
+    developer who exports custom types (e.g. in a local ``.env``) would
+    otherwise see the built-in count/consistency assertions fail with spurious
+    counts. Clear it before every test; the cases in
+    ``TestBurst21CustomMemoryTypeConfiguration`` set it explicitly, which still
+    wins because they call ``monkeypatch.setenv`` inside the test body.
+    """
+    monkeypatch.delenv('MCP_CUSTOM_MEMORY_TYPES', raising=False)
 
 
 class TestBurst11BaseMemoryTypes:
@@ -116,9 +133,18 @@ class TestBurst12TaxonomyHierarchy:
 class TestBurst13RelationshipTypes:
     """Tests for Burst 1.3: Relationship Types Definition"""
 
-    def test_six_relationship_types_defined(self):
-        """Should have exactly 6 relationship types"""
-        expected_types = {"causes", "fixes", "contradicts", "supports", "follows", "related"}
+    def test_relationship_types_defined(self):
+        """Should include core Burst 1.3 types plus derived_from (auto-capture / insights)."""
+        expected_types = {
+            "causes",
+            "fixes",
+            "contradicts",
+            "supports",
+            "follows",
+            "related",
+            "derived_from",
+            "shares_entity",
+        }
         actual_types = set(RELATIONSHIPS.keys())
         assert actual_types == expected_types
 
@@ -165,7 +191,11 @@ class TestBurst14MemoryTypeValidation:
         assert validate_memory_type("invalid_type") is False
         assert validate_memory_type("not_a_type") is False
         assert validate_memory_type("") is False
-        assert validate_memory_type("ObSeRvAtIoN") is False  # Case sensitive
+        # Capitalization is no longer a rejection reason (issue #176): the
+        # bundled hooks send `Decision`/`Error`/`Learning` and every one of
+        # those was being coerced to 'observation'. See
+        # TestBurst21CustomMemoryTypeConfiguration for the case-folding cases.
+        assert validate_memory_type("ObSeRvAtIoN") is True
 
 
 class TestBurst15GetParentType:
@@ -425,30 +455,24 @@ class TestBurst20NewProjectManagementTypes:
         src/mcp_memory_service/models/ontology.py gains or loses a type.
         """
         all_types = get_all_types()
-        assert len(all_types) == 78, f"Expected 78 types, got {len(all_types)}"
+        assert len(all_types) == 81, f"Expected 81 types, got {len(all_types)}"
 
 
 class TestBurst21CustomMemoryTypeConfiguration:
     """Test configurable memory types via MCP_CUSTOM_MEMORY_TYPES."""
 
     def setup_method(self):
-        """Clear caches and environment before each test."""
-        import os
-        # Remove any custom types from environment to ensure clean state
+        """Clear caches and environment before each test."""        # Remove any custom types from environment to ensure clean state
         os.environ.pop('MCP_CUSTOM_MEMORY_TYPES', None)
         ontology.clear_ontology_caches()
 
     def teardown_method(self):
-        """Clear caches and environment after each test."""
-        import os
-        # Remove any custom types from environment
+        """Clear caches and environment after each test."""        # Remove any custom types from environment
         os.environ.pop('MCP_CUSTOM_MEMORY_TYPES', None)
         ontology.clear_ontology_caches()
 
     def test_load_custom_types_json(self, monkeypatch):
         """Test loading custom types from JSON environment variable."""
-        import json
-
         # Set custom types
         custom_config = json.dumps({
             "legal": ["contract", "clause", "obligation"],
@@ -472,8 +496,6 @@ class TestBurst21CustomMemoryTypeConfiguration:
 
     def test_merge_with_builtin_types(self, monkeypatch):
         """Test that custom types merge with (not replace) built-in types."""
-        import json
-
         custom_config = json.dumps({"meeting": ["board_meeting"]})
         monkeypatch.setenv('MCP_CUSTOM_MEMORY_TYPES', custom_config)
 
@@ -508,8 +530,6 @@ class TestBurst21CustomMemoryTypeConfiguration:
         dropped, so the bare custom type never reached the validator and
         kept getting coerced to 'observation'.
         """
-        import json
-
         monkeypatch.setenv('MCP_CUSTOM_MEMORY_TYPES', json.dumps({"foo": []}))
         ontology.clear_ontology_caches()
 
@@ -521,8 +541,6 @@ class TestBurst21CustomMemoryTypeConfiguration:
 
     def test_custom_type_with_only_invalid_subtypes_still_registers_base(self, monkeypatch):
         """If every subtype is filtered out, the base type must still register."""
-        import json
-
         # `@@bad` fails the `replace('_','').isalnum()` check
         monkeypatch.setenv('MCP_CUSTOM_MEMORY_TYPES', json.dumps({"foo": ["@@bad"]}))
         ontology.clear_ontology_caches()
@@ -531,10 +549,66 @@ class TestBurst21CustomMemoryTypeConfiguration:
         assert "foo" in all_types
         assert "@@bad" not in all_types
 
+    def test_builtin_type_validation_is_case_insensitive(self, monkeypatch):
+        """Issue #176: clients disagree on capitalization.
+
+        The bundled hooks send `Decision`, `Error`, `Learning`; the REST and
+        MCP examples use lowercase. Both must resolve to the same type instead
+        of the capitalized spelling being coerced to 'observation'.
+        """
+        monkeypatch.delenv('MCP_CUSTOM_MEMORY_TYPES', raising=False)
+        ontology.clear_ontology_caches()
+
+        for spelling in ("Decision", "DECISION", " decision "):
+            assert ontology.validate_memory_type(spelling) is True, spelling
+            assert ontology.get_parent_type(spelling) == "decision"
+
+    def test_custom_type_registers_regardless_of_case(self, monkeypatch):
+        """Issue #176: registration lowercased the key while validation did not.
+
+        A custom type spelled with capitals could therefore never be registered
+        — it landed in the taxonomy lowercased and the incoming capitalized
+        string still failed validation.
+        """
+        monkeypatch.setenv('MCP_CUSTOM_MEMORY_TYPES', json.dumps({"Convention": []}))
+        ontology.clear_ontology_caches()
+
+        assert ontology.validate_memory_type("Convention") is True
+        assert ontology.validate_memory_type("convention") is True
+        assert "convention" in ontology.get_all_types()
+        # Canonical form is what gets stored
+        assert "Convention" not in ontology.get_all_types()
+
+    def test_custom_type_name_may_contain_hyphens(self, monkeypatch):
+        """Issue #176: `isidentifier()` rejected every hyphenated name.
+
+        `session-summary` is what `claude-hooks/core/session-end.js` sends, and
+        it could not be registered at all.
+        """
+        monkeypatch.setenv('MCP_CUSTOM_MEMORY_TYPES', json.dumps({"session-summary": ["daily-digest"]}))
+        ontology.clear_ontology_caches()
+
+        all_types = ontology.get_all_types()
+        assert "session-summary" in all_types
+        assert "daily-digest" in all_types
+        assert ontology.validate_memory_type("session-summary") is True
+        assert ontology.get_parent_type("daily-digest") == "session-summary"
+
+    def test_custom_type_name_rejects_unsafe_characters(self, monkeypatch):
+        """Relaxing `isidentifier()` must not accept arbitrary strings."""
+        monkeypatch.setenv(
+            'MCP_CUSTOM_MEMORY_TYPES',
+            json.dumps({"bad type": [], "9leading": [], "with/slash": [], "ok-type": []}),
+        )
+        ontology.clear_ontology_caches()
+
+        all_types = ontology.get_all_types()
+        assert "ok-type" in all_types
+        for rejected in ("bad type", "9leading", "with/slash"):
+            assert rejected not in all_types
+
     def test_no_custom_types_default_behavior(self, monkeypatch):
         """Test default behavior when no custom types configured."""
-        import os
-
         # Ensure env var is not set - must be done BEFORE clearing caches
         # Use both monkeypatch AND direct removal to ensure clean state
         monkeypatch.delenv('MCP_CUSTOM_MEMORY_TYPES', raising=False)

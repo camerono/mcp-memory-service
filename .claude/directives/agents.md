@@ -6,7 +6,7 @@ Workflow automation agents using Gemini CLI, Groq API, and Amp CLI.
 
 | Agent | Tool | Purpose | Priority | Usage |
 |-------|------|---------|----------|-------|
-| **github-release-manager** | GitHub CLI | Complete release workflow | Production | Proactive on feature completion |
+| **github-release-manager** | GitHub API / `gh` | Complete release workflow | Production | Proactive on feature completion |
 | **amp-automation** | Amp CLI | Coding tasks + PR quality analysis | Production | File-based prompts |
 | **code-quality-guard** | Gemini CLI / Groq API | Fast code quality analysis | Active | Pre-commit, pre-PR |
 | **gemini-pr-automator** | Gemini CLI | Automated PR review loops | Active | Post-PR creation |
@@ -20,8 +20,8 @@ Workflow automation agents using Gemini CLI, Groq API, and Amp CLI.
 - **CHANGELOG Management**: Format guidelines, conflict resolution
 - **Documentation Matrix**: Automatic CHANGELOG, CLAUDE.md, README.md updates
 - **Issue Tracking**: Auto-detects "fixes #", suggests closures with smart comments
-- **Release Procedure**: Merge → Tag → Push → Verify workflows
-- **Environment Detection** 🆕: Adapts workflow for local vs GitHub execution
+- **Release Procedure**: Merge (`gh`) → Tag → Push → GitHub release → Verify
+- **Platform**: GitHub REST API via `gh` (already authenticated as doobidoo)
 
 **Usage:**
 ```bash
@@ -34,7 +34,7 @@ Workflow automation agents using Gemini CLI, Groq API, and Amp CLI.
 
 **Post-Release Workflow**: Retrieves issues from release, suggests closures with PR links and CHANGELOG entries.
 
-See [`.claude/agents/github-release-manager.md`](../.claude/agents/github-release-manager.md) for complete workflows.
+The agent definition ships with the harness, not in this repo.
 
 ## code-quality-guard
 
@@ -67,7 +67,7 @@ ln -s ../../scripts/hooks/pre-commit .git/hooks/pre-commit
 2. **Gemini CLI** (Fallback) - 2-3s, OAuth may interrupt commits
 3. **Skip checks** - If neither available
 
-See [`.claude/agents/code-quality-guard.md`](../.claude/agents/code-quality-guard.md) for quality standards.
+See `.claude/agents/code-quality-guard.md` (local developer config, untracked since 00995fe7) for quality standards.
 
 ## gemini-pr-automator
 
@@ -96,7 +96,7 @@ bash scripts/pr/detect_breaking_changes.sh main <BRANCH>
 
 **Time Savings**: ~10-30 minutes per PR vs manual iteration.
 
-See [`.claude/agents/gemini-pr-automator.md`](../.claude/agents/gemini-pr-automator.md) for workflows.
+See `.claude/agents/gemini-pr-automator.md` (local developer config, untracked since 00995fe7) for workflows.
 
 ## amp-automation
 
@@ -108,7 +108,7 @@ See [`.claude/agents/gemini-pr-automator.md`](../.claude/agents/gemini-pr-automa
 
 **Use cases**: Focused refactorings, pre-PR quality checks, parallel analysis (no OAuth needed).
 
-See [`.claude/agents/amp-automation.md`](../.claude/agents/amp-automation.md) for details.
+See `.claude/agents/amp-automation.md` (local developer config, untracked since 00995fe7) for details.
 
 ## Claude Branch Automation 🆕
 

@@ -16,6 +16,7 @@
 
 const fs = require('fs').promises;
 const path = require('path');
+const { resolveConfigPath } = require('../utilities/config-loader');
 const { MemoryClient } = require('../utilities/memory-client');
 
 // Import pattern detection
@@ -34,7 +35,7 @@ const {
  */
 async function loadConfig() {
     try {
-        const configPath = path.join(__dirname, '../config.json');
+        const configPath = resolveConfigPath(__dirname);
         const configData = await fs.readFile(configPath, 'utf8');
         const config = JSON.parse(configData);
 
@@ -102,28 +103,66 @@ async function readStdin() {
 async function parseTranscript(transcriptPath) {
     try {
         const content = await fs.readFile(transcriptPath, 'utf8');
-        const transcript = JSON.parse(content);
 
-        if (!Array.isArray(transcript) || transcript.length === 0) {
+        // Claude Code writes transcripts as JSONL (newline-delimited JSON),
+        // one message envelope per line. Tolerate trailing whitespace and skip
+        // malformed lines instead of failing the whole hook.
+        const transcript = [];
+        for (const line of content.split(/\r?\n/)) {
+            const trimmed = line.trim();
+            if (!trimmed) continue;
+            try {
+                const parsed = JSON.parse(trimmed);
+                const items = Array.isArray(parsed) ? parsed : [parsed];
+                for (const item of items) {
+                    if (item && typeof item === 'object') transcript.push(item);
+                }
+            } catch {
+                // skip malformed line
+            }
+        }
+
+        if (transcript.length === 0) {
             return null;
         }
 
-        // Find last user and assistant messages
-        let lastUser = null;
+        // Pair the last assistant turn with the user message that precedes it.
+        // Two independent backward scans can mis-pair when the user already typed
+        // their next prompt before the Stop hook reads the transcript (Q2 + A1).
+        let assistantIndex = -1;
         let lastAssistant = null;
 
         for (let i = transcript.length - 1; i >= 0; i--) {
             const msg = transcript[i];
-            const role = msg.role || msg.type;
+            // Claude Code envelope nests the actual message under `message`;
+            // fall back to flat shape for compatibility with older formats.
+            const role = msg.message?.role || msg.role || msg.type;
+            const content = msg.message?.content ?? msg.content;
 
-            if (!lastAssistant && role === 'assistant') {
-                lastAssistant = extractTextContent(msg.content);
+            if (role === 'assistant') {
+                const text = extractTextContent(content);
+                if (text) {
+                    lastAssistant = text;
+                    assistantIndex = i;
+                    break;
+                }
             }
-            if (!lastUser && role === 'user') {
-                lastUser = extractTextContent(msg.content);
-            }
+        }
 
-            if (lastUser && lastAssistant) break;
+        let lastUser = null;
+        if (assistantIndex > 0) {
+            for (let i = assistantIndex - 1; i >= 0; i--) {
+                const msg = transcript[i];
+                const role = msg.message?.role || msg.role || msg.type;
+                const content = msg.message?.content ?? msg.content;
+
+                if (role !== 'user') continue;
+                // Claude Code stores tool results under the user role; skip those.
+                if (isToolResultOnly(content)) continue;
+
+                lastUser = extractTextContent(content);
+                if (lastUser) break;
+            }
         }
 
         return {
@@ -135,6 +174,14 @@ async function parseTranscript(transcriptPath) {
         console.error('[auto-capture] Failed to parse transcript:', error.message);
         return null;
     }
+}
+
+/**
+ * True when a user-role envelope is only tool_result blocks (no real prompt text).
+ */
+function isToolResultOnly(content) {
+    if (!Array.isArray(content) || content.length === 0) return false;
+    return content.every(block => block && block.type === 'tool_result');
 }
 
 /**
@@ -166,6 +213,7 @@ async function storeMemory(config, content, memoryType, tags) {
             endpoint: config.memoryService.http.endpoint,
             apiKey: config.memoryService.http.apiKey,
         },
+        allowSelfSignedCerts: config.memoryService.allowSelfSignedCerts === true,
     });
 
     try {
@@ -261,7 +309,8 @@ async function main() {
         if (overrides.forceRemember) {
             detection = {
                 isValuable: true,
-                memoryType: 'Context',
+                // Canonical ontology type; 'Context' was coerced away on store (#177)
+                memoryType: 'note',
                 matchedPattern: 'user-override',
                 confidence: 1.0
             };

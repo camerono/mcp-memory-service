@@ -1,6 +1,6 @@
 # Lightweight Docker image optimized for sqlite-vec + ONNX (CPU-only)
 # Eliminates PyTorch and CUDA dependencies for ~90% size reduction
-FROM python:3.10-slim
+FROM python:3.12-slim
 
 # Build arguments for conditional features
 ARG SKIP_MODEL_DOWNLOAD=false
@@ -9,7 +9,7 @@ ARG SKIP_MODEL_DOWNLOAD=false
 ENV PYTHONUNBUFFERED=1 \
     MCP_MEMORY_STORAGE_BACKEND=sqlite_vec \
     MCP_MEMORY_USE_ONNX=1 \
-    MCP_MEMORY_SQLITE_PATH=/app/sqlite_db \
+    MCP_MEMORY_SQLITE_PATH=/app/sqlite_db/memory.db \
     MCP_MEMORY_BACKUPS_PATH=/app/backups \
     PYTHONPATH=/app/src \
     DOCKER_CONTAINER=1 \
@@ -44,6 +44,12 @@ COPY run_server.py ./
 COPY scripts/utils/uv_wrapper.py ./uv_wrapper.py
 COPY scripts/utils/memory_wrapper_uv.py ./memory_wrapper_uv.py
 
+# Administrative scripts. Without these, re-embedding or repairing a database
+# means copying files into a running container by hand (#188). They import
+# src.mcp_memory_service relative to /app, so run them from WORKDIR.
+COPY scripts/maintenance/ /app/scripts/maintenance/
+COPY scripts/migration/ /app/scripts/migration/
+
 # Copy Docker entrypoint scripts
 COPY tools/docker/docker-entrypoint.sh /usr/local/bin/
 COPY tools/docker/docker-entrypoint-persistent.sh /usr/local/bin/
@@ -54,7 +60,7 @@ COPY tools/docker/docker-entrypoint-unified.sh /usr/local/bin/
 # but MUST stay in sync with pyproject.toml `dependencies` for everything else.
 # See issue #811: missing aiosqlite/apscheduler/authlib/etc broke runtime in slim images.
 RUN python -m uv pip install \
-    "mcp>=1.8.0,<2.0.0" \
+    "mcp>=1.9.2,<2.0.0" \
     "sqlite-vec>=0.1.0" \
     "onnxruntime>=1.15.0" \
     "tokenizers>=0.22.2" \

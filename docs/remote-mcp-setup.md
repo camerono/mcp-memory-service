@@ -114,6 +114,21 @@ https://random-name.trycloudflare.com
 
 > **Note:** Temporary Cloudflare Tunnels change URL on restart. For persistent access, create a [named tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/get-started/).
 
+### 6. Connect in ChatGPT (Developer Mode)
+
+ChatGPT speaks MCP too, so the same endpoint serves it — nothing extra to run on the
+server side.
+
+1. Enable **Developer Mode** in ChatGPT settings
+2. Add a connector pointing at the same `https://<your-host>/mcp` URL
+3. Complete the OAuth flow
+
+The server-side requirements are the same as for claude.ai: a public HTTPS endpoint
+(self-signed certificates are rejected) and OAuth enabled. The one difference is the
+firewall — a ChatGPT connector arrives from OpenAI's addresses, not Anthropic's, so an
+allowlist built for claude.ai alone will block it. See
+[Firewall & IP Allowlisting](#firewall--ip-allowlisting).
+
 ---
 
 ## Production Setup
@@ -268,9 +283,12 @@ mcp-memory-service supports token expiry and refresh out of the box. claude.ai w
 
 ## Firewall & IP Allowlisting
 
-If your server is behind a firewall, you must allowlist Claude's IP addresses for inbound connections.
+If your server is behind a firewall, you must allowlist the inbound addresses of every
+client you connect. For claude.ai that is Anthropic's published ranges; a ChatGPT
+connector comes from OpenAI's, so an allowlist built for Claude alone blocks it.
 
-**Reference:** https://docs.claude.com/en/api/ip-addresses
+**Reference:** https://docs.claude.com/en/api/ip-addresses (Anthropic). For ChatGPT, use
+OpenAI's published egress ranges for connectors.
 
 > **Important:** IP allowlisting alone is NOT recommended as a security measure. Always use OAuth 2.0 for authentication.
 
@@ -415,7 +433,7 @@ Remote MCP adds network latency (~50-200ms depending on location) but enables br
 
 ## References
 
-- [Claude Help: Building Custom Connectors via Remote MCP Servers](https://support.claude.com/en/articles/11503834-building-custom-connectors-via-remote-mcp-servers)
-- [Claude Help: Remote MCP Server Submission Guide](https://support.claude.com/en/articles/12922490-remote-mcp-server-submission-guide)
+- [Claude Help: Get started with custom connectors using remote MCP](https://support.claude.com/en/articles/11175166-get-started-with-custom-connectors-using-remote-mcp)
+- [Claude Docs: Build an MCP server for Claude](https://claude.com/docs/connectors/building) (hosting, authentication, limits, distribution)
 - [Claude IP Addresses](https://docs.claude.com/en/api/ip-addresses)
 - [MCP Specification: Streamable HTTP Transport](https://modelcontextprotocol.io/specification/2025-03-26/basic/transports#streamable-http)

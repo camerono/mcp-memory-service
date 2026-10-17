@@ -5,6 +5,7 @@ Tests the threshold-based fallback approach where DeBERTa is primary
 and MS-MARCO rescues technical content that DeBERTa undervalues.
 """
 
+import time
 import pytest
 from pathlib import Path
 from mcp_memory_service.quality.onnx_ranker import get_onnx_ranker_model
@@ -20,13 +21,7 @@ from mcp_memory_service.quality.metadata_codec import (
 )
 from mcp_memory_service.models.memory import Memory
 
-# Check if ONNX models are available
-DEBERTA_AVAILABLE = Path.home().joinpath(
-    ".cache/mcp_memory/onnx_models/nvidia-quality-classifier-deberta/model.onnx"
-).exists()
-MS_MARCO_AVAILABLE = Path.home().joinpath(
-    ".cache/mcp_memory/onnx_models/ms-marco-MiniLM-L-6-v2/model.onnx"
-).exists()
+from tests.quality_model_availability import DEBERTA_AVAILABLE, MS_MARCO_AVAILABLE
 
 
 class TestFallbackConfiguration:
@@ -368,7 +363,6 @@ class TestFallbackPerformance:
 
     def test_deberta_only_path_is_fast(self):
         """Test DeBERTa-only path completes quickly (no MS-MARCO overhead)."""
-        import time
 
         config = QualityConfig(
             ai_provider='local',
@@ -401,7 +395,6 @@ class TestFallbackPerformance:
 
     def test_fallback_path_acceptable(self):
         """Test full fallback path (both models) completes in acceptable time."""
-        import time
 
         config = QualityConfig(
             ai_provider='local',

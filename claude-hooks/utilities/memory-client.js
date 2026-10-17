@@ -6,6 +6,7 @@
 const https = require('https');
 const http = require('http');
 const { MCPClient } = require('./mcp-client');
+const { applySelfSignedCertsOption } = require('./tls-options');
 
 // TODO: Follow-up — extract shared HTTP helper. _attemptHealthCheck, _performApiPost,
 // storeMemoryHTTP, and queryMemoriesHTTP duplicate request construction. See Gemini
@@ -19,6 +20,7 @@ class MemoryClient {
         this.fallbackEnabled = config.fallbackEnabled !== false;
         this.httpConfig = config.http || {};
         this.mcpConfig = config.mcp || {};
+        this.allowSelfSignedCerts = config.allowSelfSignedCerts === true;
 
         // Connection state
         this.activeProtocol = null;
@@ -28,6 +30,14 @@ class MemoryClient {
 
         // Cache successful connections
         this.connectionCache = new Map();
+    }
+
+    /**
+     * Gate TLS verification bypass behind explicit opt-in, warning every time.
+     * @private
+     */
+    _applySelfSignedCertsOption(requestOptions, isHttps) {
+        applySelfSignedCertsOption(requestOptions, isHttps, this.allowSelfSignedCerts);
     }
 
     /**
@@ -167,7 +177,7 @@ class MemoryClient {
 
                 const requestOptions = {
                     hostname: url.hostname,
-                    port: url.port || (url.protocol === 'https:' ? 8443 : 8000),
+                    port: url.port ? Number(url.port) : (url.protocol === 'https:' ? 443 : 80),
                     path: url.pathname,
                     method: 'GET',
                     headers: {
@@ -176,9 +186,9 @@ class MemoryClient {
                         'Connection': 'close'
                     },
                     timeout: this.httpConfig.healthCheckTimeout || 3000,
-                    rejectUnauthorized: false,  // Allow self-signed certificates
                     agent: false  // Disable keepAlive — hook is one-shot, reused sockets race uvicorn close (ECONNRESET / socket hang up)
                 };
+                this._applySelfSignedCertsOption(requestOptions, url.protocol === 'https:');
 
                 const protocol = url.protocol === 'https:' ? https : http;
                 const req = protocol.request(requestOptions, (res) => {
@@ -280,7 +290,7 @@ class MemoryClient {
 
             const options = {
                 hostname: url.hostname,
-                port: url.port || (isHttps ? 8443 : 8000),
+                port: url.port ? Number(url.port) : (isHttps ? 443 : 80),
                 path: url.pathname,
                 method: 'POST',
                 headers: {
@@ -292,10 +302,7 @@ class MemoryClient {
                 timeout: 5000,
                 agent: false,  // Disable keepAlive — one-shot CLI, avoids ECONNRESET from reused sockets
             };
-
-            if (isHttps) {
-                options.rejectUnauthorized = false;
-            }
+            this._applySelfSignedCertsOption(options, isHttps);
 
             const requestModule = isHttps ? https : http;
             const req = requestModule.request(options, (res) => {
@@ -363,7 +370,7 @@ class MemoryClient {
 
             const options = {
                 hostname: url.hostname,
-                port: url.port || (url.protocol === 'https:' ? 8443 : 8000),
+                port: url.port ? Number(url.port) : (url.protocol === 'https:' ? 443 : 80),
                 path: url.pathname,
                 method: 'POST',
                 headers: {
@@ -376,9 +383,9 @@ class MemoryClient {
                 // /api/search/by-tag. Larger than storeMemoryHTTP (5s) and _attemptHealthCheck (3s)
                 // because search queries run embedding + vector scan, not a simple write/ping.
                 timeout: 10000,
-                rejectUnauthorized: false,  // Allow self-signed certificates
                 agent: false  // Disable keepAlive — hook is one-shot, reused sockets race uvicorn close (ECONNRESET / socket hang up)
             };
+            this._applySelfSignedCertsOption(options, url.protocol === 'https:');
 
             const protocol = url.protocol === 'https:' ? https : http;
             const req = protocol.request(options, (res) => {

@@ -20,12 +20,14 @@ Implements OAuth 2.1 authorization code flow and token endpoints.
 
 import html
 import time
+import json
+import hashlib
 import logging
 import base64
 import secrets
 from typing import Optional, Tuple
-from urllib.parse import urlencode, urlparse, ParseResult
-from fastapi import APIRouter, HTTPException, status, Form, Query, Request
+from urllib.parse import urlencode
+from fastapi import APIRouter, Depends, HTTPException, status, Form, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 import jwt
 
@@ -40,6 +42,24 @@ from ...config import (
 )
 from .models import TokenResponse
 from .storage import get_oauth_storage
+from .rate_limit import auth_rate_limit
+from .redirect import (
+    build_redirect_url as _build_redirect_url,
+    resolve_registered_redirect_uri,
+)
+from .limits import (
+    PKCE_CODE_VERIFIER_MIN_LEN,
+    PKCE_CODE_VERIFIER_MAX_LEN,
+    PKCE_CODE_CHALLENGE_MIN_LEN,
+    PKCE_CODE_CHALLENGE_MAX_LEN,
+    SUPPORTED_CODE_CHALLENGE_METHODS,
+    MAX_AUTHORIZATION_CODE_LEN,
+    MAX_CLIENT_SECRET_LEN,
+    MAX_REFRESH_TOKEN_LEN,
+    MAX_SCOPE_LEN,
+    MAX_STATE_LEN,
+    reject_if_too_long,
+)
 
 OFFLINE_ACCESS_SCOPE = "offline_access"
 
@@ -47,81 +67,10 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
-
 
 def _sanitize_log_value(value: object) -> str:
     """Sanitize a user-provided value for safe inclusion in log messages."""
     return str(value).replace("\n", "\\n").replace("\r", "\\r").replace("\x1b", "\\x1b")
-
-
-
-
-def _is_loopback_http_redirect(parsed: ParseResult) -> bool:
-    """Return True when the parsed URI is an HTTP loopback redirect."""
-    return (
-        parsed.scheme.lower() == "http"
-        and (parsed.hostname or "").lower() in _LOOPBACK_HOSTS
-    )
-
-
-def _loopback_redirect_matches(registered_uri: str, requested_uri: str) -> bool:
-    """
-    Match native-app loopback redirects while allowing runtime-assigned ports.
-
-    RFC 8252 recommends loopback redirects for native apps and requires OAuth
-    servers to tolerate ephemeral localhost ports. Keep scheme/path strict while
-    allowing host aliases inside the loopback set and any runtime port.
-    """
-    registered = urlparse(registered_uri)
-    requested = urlparse(requested_uri)
-
-    if not (
-        _is_loopback_http_redirect(registered) and _is_loopback_http_redirect(requested)
-    ):
-        return False
-
-    return (
-        registered.path == requested.path
-        and registered.params == requested.params
-        and registered.query == requested.query
-        and registered.fragment == requested.fragment
-    )
-
-
-_DANGEROUS_REDIRECT_SCHEMES = frozenset({
-    "javascript",
-    "data",
-    "vbscript",
-    "file",
-    "about",
-    "blob",
-})
-
-
-def _build_redirect_url(redirect_uri: str, params: dict[str, str]) -> str:
-    """Build a redirect URL from a previously validated redirect URI.
-
-    Callers must pass a URI that has already been allowlisted by
-    ``validate_redirect_uri``. This function adds a belt-and-braces check
-    that rejects browser-executable or script-capable schemes (``javascript:``,
-    ``data:``, ``vbscript:``, ``file:``, ``about:``, ``blob:``), even if one
-    somehow slipped past the allowlist.
-
-    Per RFC 8252 §7.1, native apps may legitimately register custom URI
-    schemes (e.g. ``myapp://callback``), so we **denylist** dangerous schemes
-    rather than allowlisting http(s) only.
-    """
-    scheme = urlparse(redirect_uri).scheme.lower()
-    if scheme in _DANGEROUS_REDIRECT_SCHEMES:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={
-                "error": "invalid_redirect_uri",
-                "error_description": "redirect_uri uses a disallowed scheme",
-            },
-        )
-    return f"{redirect_uri}?{urlencode(params)}"
 
 
 def parse_basic_auth(
@@ -247,7 +196,7 @@ async def create_refresh_token(
 
 
 async def validate_redirect_uri(client_id: str, redirect_uri: Optional[str]) -> str:
-    """Validate redirect URI against registered client."""
+    """Validate redirect URI against registered client and return the trusted value."""
     client = await get_oauth_storage().get_client(client_id)
     if not client:
         raise HTTPException(
@@ -258,44 +207,97 @@ async def validate_redirect_uri(client_id: str, redirect_uri: Optional[str]) -> 
             },
         )
 
-    # If no redirect_uri provided, use the first registered one
-    if not redirect_uri:
-        if not client.redirect_uris:
+    return resolve_registered_redirect_uri(client.redirect_uris, redirect_uri)
+
+
+async def _validate_pkce_authorize_params(
+    client_id: str,
+    code_challenge: Optional[str],
+    code_challenge_method: Optional[str],
+) -> None:
+    """
+    Enforce PKCE policy at the authorization endpoint.
+
+    * ``code_challenge_method`` (when supplied) must be S256 — "plain" and any
+      other method are rejected (OAuth 2.1 §7.5.2).
+    * ``code_challenge`` (when supplied) must be a sane length.
+    * Public clients (token_endpoint_auth_method=none) MUST supply a
+      code_challenge — PKCE is mandatory for them (OAuth 2.1 §7.5.2).
+    """
+    if code_challenge_method is not None and code_challenge_method not in SUPPORTED_CODE_CHALLENGE_METHODS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error": "invalid_request",
+                "error_description": "Unsupported code_challenge_method; only S256 is supported",
+            },
+        )
+
+    if code_challenge is not None:
+        if not (PKCE_CODE_CHALLENGE_MIN_LEN <= len(code_challenge) <= PKCE_CODE_CHALLENGE_MAX_LEN):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail={
                     "error": "invalid_request",
-                    "error_description": "redirect_uri is required when client has no registered redirect URIs",
+                    "error_description": (
+                        f"code_challenge must be {PKCE_CODE_CHALLENGE_MIN_LEN}-"
+                        f"{PKCE_CODE_CHALLENGE_MAX_LEN} characters"
+                    ),
                 },
             )
-        return client.redirect_uris[0]
 
-    # Validate that the redirect_uri is registered; return the stored (trusted) value
-    for registered_uri in client.redirect_uris:
-        if registered_uri == redirect_uri:
-            return registered_uri  # Return the stored value, not the user-supplied one
+    if code_challenge is None:
+        client = await get_oauth_storage().get_client(client_id)
+        if client and client.token_endpoint_auth_method == "none":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "error": "invalid_request",
+                    "error_description": "code_challenge is required for public clients (PKCE)",
+                },
+            )
 
-    # Native-app loopback redirects use runtime-assigned ports. After validating
-    # that the request matches a registered loopback callback path, preserve the
-    # runtime URI so the browser lands on the port the client actually opened.
-    for registered_uri in client.redirect_uris:
-        if _loopback_redirect_matches(registered_uri, redirect_uri):
-            return redirect_uri
 
-    raise HTTPException(
-        status_code=status.HTTP_400_BAD_REQUEST,
-        detail={
-            "error": "invalid_redirect_uri",
-            "error_description": "redirect_uri not registered for this client",
-        },
-    )
+def _authorize_form_query(
+    response_type: str,
+    client_id: str,
+    redirect_uri: Optional[str],
+    scope: Optional[str],
+    state: Optional[str],
+    code_challenge: Optional[str],
+    code_challenge_method: Optional[str],
+) -> str:
+    """Build the POST form-action query string from validated parameters only.
+
+    The raw inbound query string is NEVER reflected back into the page — it is
+    attacker-controlled and reflecting it caused a reflected-XSS sink. Instead we
+    re-serialize the known, server-parsed parameters via ``urlencode`` and
+    HTML-escape the result for the attribute context.
+    """
+    params = {"response_type": response_type, "client_id": client_id}
+    if redirect_uri:
+        params["redirect_uri"] = redirect_uri
+    if scope:
+        params["scope"] = scope
+    if state:
+        params["state"] = state
+    if code_challenge:
+        params["code_challenge"] = code_challenge
+    if code_challenge_method:
+        params["code_challenge_method"] = code_challenge_method
+    return html.escape(urlencode(params), quote=True)
 
 
 def _build_authorize_page(query_string: str, error: Optional[str] = None) -> str:
-    """Build the HTML authorization/login page."""
+    """Build the HTML authorization/login page.
+
+    ``query_string`` MUST already be HTML-attribute-safe (see
+    ``_authorize_form_query``). ``error`` is HTML-escaped here defensively.
+    """
     error_html = ""
     if error:
-        error_html = f'<div style="color:#ef4444;background:#fef2f2;border:1px solid #fecaca;padding:12px;border-radius:8px;margin-bottom:16px;font-size:14px;">{error}</div>'
+        safe_error = html.escape(error, quote=True)
+        error_html = f'<div style="color:#ef4444;background:#fef2f2;border:1px solid #fecaca;padding:12px;border-radius:8px;margin-bottom:16px;font-size:14px;">{safe_error}</div>'
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -320,7 +322,7 @@ def _build_authorize_page(query_string: str, error: Optional[str] = None) -> str
   <h1>MCP Memory Service</h1>
   <p>Enter your API key to authorize this connection.</p>
   {error_html}
-  <form method="POST" action="/oauth/authorize?{query_string}">
+  <form method="POST" action="authorize?{query_string}">
     <label for="api_key">API Key</label>
     <input type="password" id="api_key" name="api_key" required autofocus autocomplete="current-password">
     <button type="submit">Authorize</button>
@@ -330,7 +332,15 @@ def _build_authorize_page(query_string: str, error: Optional[str] = None) -> str
 </html>"""
 
 
-@router.get("/authorize")
+def _validate_authorize_param_lengths(
+    scope: Optional[str], state: Optional[str]
+) -> None:
+    """Bound the free-form authorize parameters that get echoed/stored."""
+    reject_if_too_long(scope, MAX_SCOPE_LEN, "scope")
+    reject_if_too_long(state, MAX_STATE_LEN, "state")
+
+
+@router.get("/authorize", dependencies=[Depends(auth_rate_limit)])
 async def authorize_get(
     request: Request,
     response_type: str = Query(..., description="OAuth response type"),
@@ -351,6 +361,8 @@ async def authorize_get(
     """
     logger.info("Authorization page requested")
 
+    _validate_authorize_param_lengths(scope, state)
+
     # Validate client and redirect_uri before showing the form
     if redirect_uri:
         await validate_redirect_uri(client_id, redirect_uri)
@@ -364,11 +376,17 @@ async def authorize_get(
             },
         )
 
-    # Show login form — pass all query params through so the POST can use them
-    return HTMLResponse(_build_authorize_page(str(request.url.query)))
+    await _validate_pkce_authorize_params(client_id, code_challenge, code_challenge_method)
+
+    # Show login form — re-serialize the validated params (never reflect the raw query)
+    form_query = _authorize_form_query(
+        response_type, client_id, redirect_uri, scope, state,
+        code_challenge, code_challenge_method,
+    )
+    return HTMLResponse(_build_authorize_page(form_query))
 
 
-@router.post("/authorize")
+@router.post("/authorize", dependencies=[Depends(auth_rate_limit)])
 async def authorize_post(
     request: Request,
     response_type: str = Query(..., description="OAuth response type"),
@@ -389,12 +407,20 @@ async def authorize_post(
     """
     logger.info("Authorization form submitted")
 
+    _validate_authorize_param_lengths(scope, state)
+    await _validate_pkce_authorize_params(client_id, code_challenge, code_challenge_method)
+
+    form_query = _authorize_form_query(
+        response_type, client_id, redirect_uri, scope, state,
+        code_challenge, code_challenge_method,
+    )
+
     # Validate API key
     if not API_KEY or not secrets.compare_digest(api_key.encode(), API_KEY.encode()):
         logger.warning("Authorization denied: invalid API key")
         return HTMLResponse(
             _build_authorize_page(
-                str(request.url.query), error="Invalid API key. Please try again."
+                form_query, error="Invalid API key. Please try again."
             ),
             status_code=403,
         )
@@ -422,11 +448,10 @@ async def authorize_post(
             redirect_params["state"] = state
 
         redirect_url = _build_redirect_url(validated_redirect_uri, redirect_params)
-        logger.info(f"Authorization granted, redirecting to callback")
+        logger.info("Authorization granted, redirecting to callback")
         # Use HTML meta-refresh + JS redirect for maximum popup compatibility.
         # Some OAuth clients (Claude.ai) use popups where HTTP 302 from a
         # form POST can be unreliable across cross-origin boundaries.
-        import json
 
         # HTML-attribute-escape the URL for the meta refresh tag.
         # For the <script> context, json.dumps() produces a valid JS string
@@ -477,6 +502,22 @@ async def _handle_authorization_code_grant(
             detail={
                 "error": "invalid_request",
                 "error_description": "Missing required parameter: code",
+            },
+        )
+
+    # RFC 7636 §4.1: code_verifier must be 43-128 characters. Validate before
+    # any hashing so a caller cannot push unbounded input into hashlib.sha256.
+    if code_verifier is not None and not (
+        PKCE_CODE_VERIFIER_MIN_LEN <= len(code_verifier) <= PKCE_CODE_VERIFIER_MAX_LEN
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error": "invalid_grant",
+                "error_description": (
+                    f"code_verifier must be {PKCE_CODE_VERIFIER_MIN_LEN}-"
+                    f"{PKCE_CODE_VERIFIER_MAX_LEN} characters"
+                ),
             },
         )
 
@@ -566,7 +607,6 @@ async def _handle_authorization_code_grant(
                     "error_description": "code_verifier required for PKCE",
                 },
             )
-        import hashlib
 
         computed = (
             base64.urlsafe_b64encode(
@@ -773,10 +813,62 @@ async def _handle_refresh_token_grant(
     )
 
 
+def _client_credentials_scope(requested_scope: Optional[str]) -> str:
+    """Resolve the scope granted to a client_credentials token.
+
+    No request -> the historical default "read write". A requested scope is
+    honored verbatim (so a client can self-restrict to a store-scoped grant
+    such as "read:projectA"), except that "admin" may never be obtained this
+    way -> HTTP 400 invalid_scope.
+    """
+    if requested_scope and requested_scope.strip():
+        if "admin" in requested_scope.split():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "error": "invalid_scope",
+                    "error_description": "The client_credentials grant cannot issue 'admin' scope",
+                },
+            )
+        return requested_scope.strip()
+    return "read write"
+
+
 async def _handle_client_credentials_grant(
-    final_client_id: str, final_client_secret: str
+    final_client_id: str, final_client_secret: str, requested_scope: Optional[str] = None
 ) -> TokenResponse:
-    """Handle OAuth client_credentials grant type."""
+    """Handle OAuth client_credentials grant type.
+
+    When the client requests a ``scope``, it is honored so machine-to-machine
+    clients can mint store-restricted tokens (e.g. ``read:projectA``). The
+    request may only narrow, never escalate: ``admin`` cannot be obtained this
+    way. With no requested scope the grant keeps its historical default of
+    ``read write``.
+    """
+    # Registration gates the grant, not just at registration time. Refusing
+    # only in /oauth/register would leave every client that registered while
+    # DCR was open still holding the grant, and those are exactly the
+    # self-service registrations GHSA-6mvm-q4j3-27qg describes. If this
+    # deployment cannot say who registered a client, it cannot honour a
+    # machine-to-machine grant from one.
+    from ...config import DCR_REGISTRATION_KEY
+    if not DCR_REGISTRATION_KEY:
+        logger.warning(
+            "Refused client_credentials: registration is open, so a registered "
+            "client is not evidence of owner consent"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error": "unauthorized_client",
+                "error_description": (
+                    "The client_credentials grant is disabled while Dynamic Client "
+                    "Registration is open. Set MCP_DCR_REGISTRATION_KEY, or use "
+                    "authorization_code with PKCE."
+                ),
+            },
+        )
+
     if not final_client_id or not final_client_secret:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -798,14 +890,53 @@ async def _handle_client_credentials_grant(
             },
         )
 
+    # Authentication is not authorization. Two properties of the registration
+    # have to hold before this grant may issue a token, and both are read off the
+    # stored client rather than taken from the request — the same rule the
+    # authorization_code grant already follows.
+    client = await get_oauth_storage().get_client(final_client_id)
+    if not client:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={
+                "error": "invalid_client",
+                "error_description": "Client authentication failed",
+            },
+        )
+
+    # A public client authenticates with PKCE, never with a secret. Accepting one
+    # here let a client registered as public act as a confidential one.
+    if client.token_endpoint_auth_method == "none":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={
+                "error": "invalid_client",
+                "error_description": "Client authentication failed",
+            },
+        )
+
+    # RFC 6749 section 4.4: the grant must be one the client registered for.
+    if "client_credentials" not in client.grant_types:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error": "unauthorized_client",
+                "error_description": "Client is not authorized to use this grant type",
+            },
+        )
+
+    # Resolve the granted scope (default "read write"; a request may narrow it,
+    # including to store-scoped grants, but never escalate to "admin").
+    granted_scope = _client_credentials_scope(requested_scope)
+
     # Create access token
-    access_token, expires_in = create_access_token(final_client_id, "read write")
+    access_token, expires_in = create_access_token(final_client_id, granted_scope)
 
     # Store access token
     await get_oauth_storage().store_access_token(
         token=access_token,
         client_id=final_client_id,
-        scope="read write",
+        scope=granted_scope,
         expires_in=expires_in,
     )
 
@@ -814,11 +945,11 @@ async def _handle_client_credentials_grant(
         access_token=access_token,
         token_type="Bearer",
         expires_in=expires_in,
-        scope="read write",
+        scope=granted_scope,
     )
 
 
-@router.post("/token", response_model=TokenResponse)
+@router.post("/token", response_model=TokenResponse, dependencies=[Depends(auth_rate_limit)])
 async def token(
     request: Request,
     grant_type: str = Form(..., description="OAuth grant type"),
@@ -838,6 +969,12 @@ async def token(
     refresh_token grant types. Accepts both client_secret_post (form data)
     and client_secret_basic (HTTP Basic auth).
     """
+    # Bound opaque inputs so a caller cannot force unbounded parsing/hashing.
+    reject_if_too_long(code, MAX_AUTHORIZATION_CODE_LEN, "code")
+    reject_if_too_long(client_secret, MAX_CLIENT_SECRET_LEN, "client_secret")
+    reject_if_too_long(refresh_token, MAX_REFRESH_TOKEN_LEN, "refresh_token")
+    reject_if_too_long(scope, MAX_SCOPE_LEN, "scope")
+
     # Extract client credentials from either HTTP Basic auth or form data
     auth_header = request.headers.get("authorization")
     basic_client_id, basic_client_secret = parse_basic_auth(auth_header)
@@ -855,7 +992,7 @@ async def token(
             )
         elif grant_type == "client_credentials":
             return await _handle_client_credentials_grant(
-                final_client_id, final_client_secret
+                final_client_id, final_client_secret, scope
             )
         elif grant_type == "refresh_token":
             return await _handle_refresh_token_grant(

@@ -1,17 +1,26 @@
-name: Cleanup Old Docker Images
+# Docker Hub image cleanup.
+#
+# The GHCR job that the pre-Codeberg version of this workflow carried stays dropped.
+# GHCR has not been published to since the lockout, and reviving it would mean a second
+# registry to keep in sync for no benefit. Docker Hub is the only registry this project
+# publishes to; if GHCR is ever wanted back it should be a deliberate decision, not a
+# side effect of the forge move.
+#
+# Multi-arch safe: deletes by TAG NAME via the Docker Hub API, never by manifest digest,
+# so it cannot strip per-platform children of a multi-arch index (the issue #1044 class of
+# bug that hit GHCR does not apply here).
+#
+# Retention: keeps `latest/slim/main/stable` always, the last N patch versions and their
+# variants (-slim, -quality-cpu, …), the last M minor floaters, and ALL "other" tags
+# (major floaters, sha, buildcache, etc). Use `force_delete_tags` to nuke specific tags.
+#
+# Secrets: DOCKER_USERNAME, DOCKER_PASSWORD (Docker Hub access token).
+
+name: Cleanup Docker Images
 
 on:
-  # Run after successful releases
-  workflow_run:
-    workflows: ["Main CI/CD Pipeline", "Docker Publish (Tags)", "Publish and Test (Tags)"]
-    types:
-      - completed
-  
-  # Run weekly on Sunday at 2 AM UTC
   schedule:
-    - cron: '0 2 * * 0'
-  
-  # Allow manual trigger with options
+    - cron: '0 2 * * 0'   # weekly, Sunday 02:00 UTC
   workflow_dispatch:
     inputs:
       dry_run:
@@ -20,384 +29,210 @@ on:
         type: boolean
         default: true
       keep_versions:
-        description: 'Number of patch versions to keep (e.g. 10.57.3)'
+        description: 'Number of patch versions to keep (e.g. 10.70.3)'
         required: false
         type: string
         default: '5'
       keep_minor_floaters:
-        description: 'Number of major.minor floating tags to keep (e.g. 10.57, 10.57-slim)'
+        description: 'Number of major.minor floating tags to keep (e.g. 10.70, 10.70-slim)'
         required: false
         type: string
         default: '3'
-      delete_untagged:
-        description: 'Delete untagged images'
+      force_delete_tags:
+        description: 'Comma-separated exact tag names to force-delete regardless of policy (e.g. citest,citest-slim)'
         required: false
-        type: boolean
-        default: true
-
-env:
-  DOCKER_IMAGE: doobidoo/mcp-memory-service
-  GHCR_IMAGE: ghcr.io/doobidoo/mcp-memory-service
+        type: string
+        default: ''
 
 jobs:
-  # Cleanup GitHub Container Registry images
-  cleanup-ghcr:
-    runs-on: ubuntu-latest
-    name: Cleanup GHCR Images
-    permissions:
-      packages: write
-      contents: read
-    
-    steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
-    
-    - name: Delete untagged images from GHCR
-      if: github.event.inputs.delete_untagged != 'false'
-      uses: actions/delete-package-versions@v4
-      continue-on-error: true
-      with:
-        package-name: 'mcp-memory-service'
-        package-type: 'container'
-        token: ${{ secrets.GITHUB_TOKEN }}
-        min-versions-to-keep: 0
-        delete-only-untagged-versions: 'true'
-    
-    - name: Clean old GHCR versions (keep last N)
-      uses: actions/delete-package-versions@v4
-      continue-on-error: true
-      with:
-        package-name: 'mcp-memory-service'
-        package-type: 'container'
-        token: ${{ secrets.GITHUB_TOKEN }}
-        min-versions-to-keep: ${{ github.event.inputs.keep_versions || '5' }}
-        ignore-versions: '^(latest|slim|main|v[0-9]+\.[0-9]+\.[0-9]+)$'
-        delete-only-pre-release-versions: 'false'
-    
-    - name: Clean buildcache tags older than 7 days
-      uses: snok/container-retention-policy@v1
-      continue-on-error: true
-      with:
-        image-names: mcp-memory-service
-        cut-off: 7 days ago UTC
-        account-type: personal
-        token: ${{ secrets.GITHUB_TOKEN }}
-        filter-tags: 'buildcache-*'
-        filter-include-untagged: false
-        skip-tags: latest,slim,main
-        dry-run: ${{ github.event.inputs.dry_run || 'false' }}
-
-  # Cleanup Docker Hub images
   cleanup-dockerhub:
-    runs-on: ubuntu-latest
     name: Cleanup Docker Hub Images
-    if: github.event_name != 'pull_request'
-    
-    steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
-    
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.11'
-        cache: 'pip'
-        cache-dependency-path: '**/pyproject.toml'
-    
-    - name: Install dependencies
-      run: |
-        pip install requests python-dateutil
-    
-    - name: Validate Docker Hub credentials
-      run: |
-        if [ -z "${{ secrets.DOCKER_USERNAME }}" ] || [ -z "${{ secrets.DOCKER_PASSWORD }}" ]; then
-          echo "⚠️  Docker Hub credentials not available, skipping Docker Hub cleanup"
-          echo "SKIP_DOCKER_CLEANUP=true" >> $GITHUB_ENV
-        else
-          echo "✓ Docker Hub credentials available"
-          echo "SKIP_DOCKER_CLEANUP=false" >> $GITHUB_ENV
-        fi
-    
-    - name: Create cleanup script
-      run: |
-        cat > cleanup_docker_hub.py << 'EOF'
-        #!/usr/bin/env python3
-        """Docker Hub image cleanup — version-aware retention policy."""
-        import os
-        import sys
-        import re
-        import requests
-        from datetime import datetime, timedelta, timezone
-        from dateutil import parser
-
-        # Tags that are never deleted.
-        PROTECTED = {"latest", "slim", "main", "stable"}
-
-        # Regex helpers
-        RE_PATCH        = re.compile(r'^(v?\d+\.\d+\.\d+)$')           # 10.57.3
-        RE_PATCH_VAR    = re.compile(r'^(v?\d+\.\d+\.\d+)(-.+)$')      # 10.57.3-slim
-        RE_MINOR        = re.compile(r'^(v?\d+\.\d+)$')                 # 10.57
-        RE_MINOR_VAR    = re.compile(r'^(v?\d+\.\d+)(-.+)$')           # 10.57-slim
-        RE_MAJOR        = re.compile(r'^(v?\d+)$')                      # 10
-        RE_MAJOR_VAR    = re.compile(r'^(v?\d+)(-.+)$')                 # 10-slim
-
-        def semver_key(tag_name):
-            """Return (major, minor, patch) for sorting, or None if not a patch tag."""
-            m = RE_PATCH.match(tag_name) or RE_PATCH_VAR.match(tag_name)
-            if m:
-                parts = re.findall(r'\d+', m.group(1))
-                if len(parts) >= 3:
-                    return tuple(int(p) for p in parts[:3])
-            return None
-
-        def minor_key(tag_name):
-            """Return (major, minor) for sorting, or None."""
-            m = RE_MINOR.match(tag_name) or RE_MINOR_VAR.match(tag_name)
-            if m:
-                parts = re.findall(r'\d+', m.group(1))
-                if len(parts) >= 2:
-                    return tuple(int(p) for p in parts[:2])
-            return None
-
-
-        class DockerHubCleaner:
-            def __init__(self, username, password, repository):
-                self.username = username
-                self.password = password
-                self.repository = repository
-                self.token = None
-                self.api_base = "https://hub.docker.com/v2"
-
-            def authenticate(self):
-                url = f"{self.api_base}/users/login/"
-                try:
-                    r = requests.post(url, json={"username": self.username, "password": self.password})
-                    r.raise_for_status()
-                    self.token = r.json()["token"]
-                    print("✓ Authenticated with Docker Hub")
-                    return True
-                except Exception as e:
-                    print(f"✗ Authentication failed: {e}")
-                    return False
-
-            def get_tags(self):
-                url = f"{self.api_base}/repositories/{self.repository}/tags"
-                headers = {"Authorization": f"Bearer {self.token}"}
-                tags = []
-                while url:
-                    try:
-                        r = requests.get(url, headers=headers, params={"page_size": 100})
-                        r.raise_for_status()
-                        data = r.json()
-                        tags.extend(data["results"])
-                        url = data.get("next")
-                    except Exception as e:
-                        print(f"✗ Failed to get tags: {e}")
-                        break
-                print(f"✓ Found {len(tags)} tags in repository")
-                return tags
-
-            def delete_tag(self, tag_name, dry_run=False):
-                if dry_run:
-                    print(f"  [DRY RUN] Would delete: {tag_name}")
-                    return True
-                url = f"{self.api_base}/repositories/{self.repository}/tags/{tag_name}/"
-                headers = {"Authorization": f"Bearer {self.token}"}
-                try:
-                    r = requests.delete(url, headers=headers)
-                    r.raise_for_status()
-                    print(f"  ✓ Deleted: {tag_name}")
-                    return True
-                except Exception as e:
-                    print(f"  ✗ Failed to delete {tag_name}: {e}")
-                    return False
-
-            def cleanup(self, keep_versions=5, keep_minor_floaters=3, dry_run=False):
-                if not self.authenticate():
-                    return False
-
-                tags = self.get_tags()
-                if not tags:
-                    return False
-
-                # ── Classify every tag ──────────────────────────────────────
-                patch_tags      = {}   # base_str → tag dict  (10.57.3)
-                patch_var_tags  = {}   # base_str → [tag dicts]  (10.57.3-slim)
-                minor_tags      = {}   # base_str → tag dict  (10.57)
-                minor_var_tags  = {}   # base_str → [tag dicts]  (10.57-slim)
-                rest_tags       = []   # everything else (major, buildcache, sha, …)
-
-                for t in tags:
-                    n = t["name"]
-                    if n in PROTECTED:
-                        continue
-                    m = RE_PATCH.match(n)
-                    if m:
-                        patch_tags[m.group(1)] = t
-                        continue
-                    m = RE_PATCH_VAR.match(n)
-                    if m:
-                        patch_var_tags.setdefault(m.group(1), []).append(t)
-                        continue
-                    m = RE_MINOR.match(n)
-                    if m:
-                        minor_tags[m.group(1)] = t
-                        continue
-                    m = RE_MINOR_VAR.match(n)
-                    if m:
-                        minor_var_tags.setdefault(m.group(1), []).append(t)
-                        continue
-                    rest_tags.append(t)
-
-                # ── Decide which patch bases to keep ────────────────────────
-                sorted_patches = sorted(patch_tags.keys(),
-                                        key=lambda s: semver_key(s) or (0, 0, 0),
-                                        reverse=True)
-                keep_patch_bases = set(sorted_patches[:keep_versions])
-
-                # ── Decide which minor bases to keep ────────────────────────
-                all_minor_bases = sorted(
-                    set(minor_tags.keys()) | set(minor_var_tags.keys()),
-                    key=lambda s: minor_key(s) or (0, 0),
-                    reverse=True,
-                )
-                keep_minor_bases = set(all_minor_bases[:keep_minor_floaters])
-
-                print(f"\n📊 Repository Statistics:")
-                print(f"  - Patch version tags: {len(patch_tags)}  (keeping {len(keep_patch_bases)})")
-                print(f"  - Patch variant tags: {sum(len(v) for v in patch_var_tags.values())}")
-                print(f"  - Minor floater tags: {len(minor_tags) + sum(len(v) for v in minor_var_tags.values())}  (keeping {len(keep_minor_bases)} minor bases)")
-                print(f"  - Other tags: {len(rest_tags)}")
-                print(f"  - Dry run: {dry_run}")
-                print(f"  - Keep patch versions: {sorted_patches[:keep_versions]}")
-                print(f"  - Keep minor bases:    {sorted(keep_minor_bases, key=lambda s: minor_key(s) or (0,0), reverse=True)}")
-
-                deleted_count = 0
-                kept_count = 0
-
-                print(f"\n🔍 Analyzing tags…")
-
-                # Protected tags
-                for t in tags:
-                    if t["name"] in PROTECTED:
-                        print(f"  ✓ Keep {t['name']} (Protected)")
-                        kept_count += 1
-
-                # Patch versions
-                for base, t in patch_tags.items():
-                    if base in keep_patch_bases:
-                        print(f"  ✓ Keep {t['name']} (recent patch)")
-                        kept_count += 1
-                    else:
-                        print(f"  ✗ Delete {t['name']} (old patch)")
-                        if self.delete_tag(t["name"], dry_run):
-                            deleted_count += 1
-
-                # Patch variants (10.57.3-slim, 10.57.3-quality-cpu, …)
-                for base, tlist in patch_var_tags.items():
-                    for t in tlist:
-                        if base in keep_patch_bases:
-                            print(f"  ✓ Keep {t['name']} (recent patch variant)")
-                            kept_count += 1
-                        else:
-                            print(f"  ✗ Delete {t['name']} (old patch variant)")
-                            if self.delete_tag(t["name"], dry_run):
-                                deleted_count += 1
-
-                # Minor floaters (10.57)
-                for base, t in minor_tags.items():
-                    if base in keep_minor_bases:
-                        print(f"  ✓ Keep {t['name']} (recent minor floater)")
-                        kept_count += 1
-                    else:
-                        print(f"  ✗ Delete {t['name']} (old minor floater)")
-                        if self.delete_tag(t["name"], dry_run):
-                            deleted_count += 1
-
-                # Minor variants (10.57-slim, 10.57-quality-cpu)
-                for base, tlist in minor_var_tags.items():
-                    for t in tlist:
-                        if base in keep_minor_bases:
-                            print(f"  ✓ Keep {t['name']} (recent minor variant)")
-                            kept_count += 1
-                        else:
-                            print(f"  ✗ Delete {t['name']} (old minor variant)")
-                            if self.delete_tag(t["name"], dry_run):
-                                deleted_count += 1
-
-                # Major floaters and everything else: always keep
-                for t in rest_tags:
-                    print(f"  ✓ Keep {t['name']} (major/other)")
-                    kept_count += 1
-
-                print(f"\n📈 Summary:")
-                print(f"  - Kept: {kept_count} tags")
-                print(f"  - Deleted: {deleted_count} tags")
-                return True
-
-
-        def main():
-            username   = os.environ.get("DOCKER_USERNAME")
-            password   = os.environ.get("DOCKER_PASSWORD")
-            repository = os.environ.get("DOCKER_REPOSITORY", "doobidoo/mcp-memory-service")
-            dry_run    = os.environ.get("DRY_RUN", "false").lower() == "true"
-            keep_versions       = int(os.environ.get("KEEP_VERSIONS", "5"))
-            keep_minor_floaters = int(os.environ.get("KEEP_MINOR_FLOATERS", "3"))
-
-            if not username or not password:
-                print("✗ Missing DOCKER_USERNAME or DOCKER_PASSWORD")
-                sys.exit(1)
-
-            print(f"🐳 Docker Hub Cleanup for {repository}")
-            print("=" * 50)
-
-            cleaner = DockerHubCleaner(username, password, repository)
-            success = cleaner.cleanup(keep_versions, keep_minor_floaters, dry_run)
-            sys.exit(0 if success else 1)
-
-
-        if __name__ == "__main__":
-            main()
-        EOF
-    
-    - name: Run Docker Hub cleanup
-      if: env.SKIP_DOCKER_CLEANUP != 'true'
-      env:
-        DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
-        DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
-        DOCKER_REPOSITORY: doobidoo/mcp-memory-service
-        DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
-        KEEP_VERSIONS: ${{ github.event.inputs.keep_versions || '5' }}
-        KEEP_MINOR_FLOATERS: ${{ github.event.inputs.keep_minor_floaters || '3' }}
-      run: python cleanup_docker_hub.py
-    
-    - name: Docker Hub cleanup skipped
-      if: env.SKIP_DOCKER_CLEANUP == 'true'
-      run: echo "⚠️ Docker Hub cleanup was skipped due to missing credentials"
-
-  # Report cleanup results
-  report:
-    needs: [cleanup-ghcr, cleanup-dockerhub]
     runs-on: ubuntu-latest
-    if: always()
-    name: Cleanup Report
-    
     steps:
-    - name: Generate cleanup report
-      run: |
-        echo "## 🧹 Docker Image Cleanup Report" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "**Run Type**: ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
-        echo "**Dry Run**: ${{ github.event.inputs.dry_run || 'false' }}" >> $GITHUB_STEP_SUMMARY
-        echo "**Keep Versions**: ${{ github.event.inputs.keep_versions || '5' }}" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "### Results" >> $GITHUB_STEP_SUMMARY
-        echo "- GHCR Cleanup: ${{ needs.cleanup-ghcr.result }}" >> $GITHUB_STEP_SUMMARY
-        echo "- Docker Hub Cleanup: ${{ needs.cleanup-dockerhub.result }}" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "### Retention Policy" >> $GITHUB_STEP_SUMMARY
-        echo "- **Protected tags**: latest, slim, main, stable" >> $GITHUB_STEP_SUMMARY
-        echo "- **Version tags**: Keep last ${{ github.event.inputs.keep_versions || '5' }} versions" >> $GITHUB_STEP_SUMMARY
-        echo "- **Build cache**: Delete after 7 days" >> $GITHUB_STEP_SUMMARY
-        echo "- **Test/dev tags**: Delete after 30 days" >> $GITHUB_STEP_SUMMARY
-        echo "- **Untagged images**: Delete immediately" >> $GITHUB_STEP_SUMMARY
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Validate Docker Hub credentials
+        run: |
+          if [ -z "${{ secrets.DOCKER_USERNAME }}" ] || [ -z "${{ secrets.DOCKER_PASSWORD }}" ]; then
+            echo "Docker Hub credentials not available, skipping"
+            echo "SKIP_DOCKER_CLEANUP=true" >> "$GITHUB_ENV"
+          else
+            echo "Docker Hub credentials available"
+            echo "SKIP_DOCKER_CLEANUP=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Install deps
+        if: env.SKIP_DOCKER_CLEANUP != 'true'
+        run: python3 -m pip install --upgrade pip requests python-dateutil
+
+      - name: Create cleanup script
+        if: env.SKIP_DOCKER_CLEANUP != 'true'
+        run: |
+          cat > cleanup_docker_hub.py << 'EOF'
+          #!/usr/bin/env python3
+          """Docker Hub image cleanup — version-aware retention policy."""
+          import os
+          import sys
+          import re
+          import requests
+
+          PROTECTED = {"latest", "slim", "main", "stable"}
+
+          RE_PATCH     = re.compile(r'^(v?\d+\.\d+\.\d+)$')
+          RE_PATCH_VAR = re.compile(r'^(v?\d+\.\d+\.\d+)(-.+)$')
+          RE_MINOR     = re.compile(r'^(v?\d+\.\d+)$')
+          RE_MINOR_VAR = re.compile(r'^(v?\d+\.\d+)(-.+)$')
+
+          def semver_key(s):
+              m = RE_PATCH.match(s) or RE_PATCH_VAR.match(s)
+              if m:
+                  parts = re.findall(r'\d+', m.group(1))
+                  if len(parts) >= 3:
+                      return tuple(int(p) for p in parts[:3])
+              return None
+
+          def minor_key(s):
+              m = RE_MINOR.match(s) or RE_MINOR_VAR.match(s)
+              if m:
+                  parts = re.findall(r'\d+', m.group(1))
+                  if len(parts) >= 2:
+                      return tuple(int(p) for p in parts[:2])
+              return None
+
+          class DockerHubCleaner:
+              def __init__(self, username, password, repository):
+                  self.username = username
+                  self.password = password
+                  self.repository = repository
+                  self.token = None
+                  self.api_base = "https://hub.docker.com/v2"
+
+              def authenticate(self):
+                  r = requests.post(f"{self.api_base}/users/login/",
+                                    json={"username": self.username, "password": self.password})
+                  r.raise_for_status()
+                  self.token = r.json()["token"]
+                  print("Authenticated with Docker Hub")
+                  return True
+
+              def get_tags(self):
+                  url = f"{self.api_base}/repositories/{self.repository}/tags"
+                  headers = {"Authorization": f"Bearer {self.token}"}
+                  tags = []
+                  while url:
+                      r = requests.get(url, headers=headers, params={"page_size": 100})
+                      r.raise_for_status()
+                      data = r.json()
+                      tags.extend(data["results"])
+                      url = data.get("next")
+                  print(f"Found {len(tags)} tags")
+                  return tags
+
+              def delete_tag(self, name, dry_run=False):
+                  if dry_run:
+                      print(f"  [DRY RUN] would delete: {name}")
+                      return True
+                  url = f"{self.api_base}/repositories/{self.repository}/tags/{name}/"
+                  r = requests.delete(url, headers={"Authorization": f"Bearer {self.token}"})
+                  if r.status_code in (200, 202, 204):
+                      print(f"  deleted: {name}")
+                      return True
+                  print(f"  failed to delete {name}: HTTP {r.status_code}")
+                  return False
+
+              def cleanup(self, keep_versions, keep_minor_floaters, dry_run, force_delete):
+                  self.authenticate()
+                  tags = self.get_tags()
+                  names = {t["name"] for t in tags}
+                  failed = 0
+
+                  # Force-delete explicit tags first (escape hatch / test cleanup).
+                  for name in force_delete:
+                      if name and name in names:
+                          print(f"  force-delete requested: {name}")
+                          if not self.delete_tag(name, dry_run):
+                              failed += 1
+                      elif name:
+                          print(f"  force-delete: {name} not present, skipping")
+
+                  patch_tags, patch_var_tags = {}, {}
+                  minor_tags, minor_var_tags = {}, {}
+                  rest = []
+                  for t in tags:
+                      n = t["name"]
+                      if n in PROTECTED or n in force_delete:
+                          continue
+                      if RE_PATCH.match(n):
+                          patch_tags[RE_PATCH.match(n).group(1)] = t; continue
+                      if RE_PATCH_VAR.match(n):
+                          patch_var_tags.setdefault(RE_PATCH_VAR.match(n).group(1), []).append(t); continue
+                      if RE_MINOR.match(n):
+                          minor_tags[RE_MINOR.match(n).group(1)] = t; continue
+                      if RE_MINOR_VAR.match(n):
+                          minor_var_tags.setdefault(RE_MINOR_VAR.match(n).group(1), []).append(t); continue
+                      rest.append(t)
+
+                  keep_patch = set(sorted(patch_tags, key=lambda s: semver_key(s) or (0,0,0), reverse=True)[:keep_versions])
+                  keep_minor = set(sorted(set(minor_tags) | set(minor_var_tags),
+                                          key=lambda s: minor_key(s) or (0,0), reverse=True)[:keep_minor_floaters])
+
+                  print(f"\nKeep patch bases: {sorted(keep_patch, reverse=True)}")
+                  print(f"Keep minor bases: {sorted(keep_minor, reverse=True)}")
+                  deleted = kept = 0
+
+                  def _del(name):
+                      nonlocal deleted, failed
+                      if self.delete_tag(name, dry_run): deleted += 1
+                      else: failed += 1
+
+                  for base, t in patch_tags.items():
+                      if base in keep_patch: kept += 1
+                      else: _del(t["name"])
+                  for base, tl in patch_var_tags.items():
+                      for t in tl:
+                          if base in keep_patch: kept += 1
+                          else: _del(t["name"])
+                  for base, t in minor_tags.items():
+                      if base in keep_minor: kept += 1
+                      else: _del(t["name"])
+                  for base, tl in minor_var_tags.items():
+                      for t in tl:
+                          if base in keep_minor: kept += 1
+                          else: _del(t["name"])
+                  for t in rest:
+                      print(f"  keep {t['name']} (major/other)")
+                      kept += 1
+
+                  print(f"\nSummary: kept {kept}, deleted {deleted}, failed {failed} (dry_run={dry_run})")
+                  return failed
+
+          def main():
+              username = os.environ.get("DOCKER_USERNAME")
+              password = os.environ.get("DOCKER_PASSWORD")
+              repo = os.environ.get("DOCKER_REPOSITORY", "doobidoo/mcp-memory-service")
+              dry_run = os.environ.get("DRY_RUN", "false").lower() == "true"
+              keep_versions = int(os.environ.get("KEEP_VERSIONS", "5"))
+              keep_minor = int(os.environ.get("KEEP_MINOR_FLOATERS", "3"))
+              force_delete = [s.strip() for s in os.environ.get("FORCE_DELETE_TAGS", "").split(",") if s.strip()]
+              if not username or not password:
+                  print("Missing DOCKER_USERNAME or DOCKER_PASSWORD"); sys.exit(1)
+              print(f"Docker Hub cleanup for {repo}\n" + "=" * 50)
+              failed = DockerHubCleaner(username, password, repo).cleanup(keep_versions, keep_minor, dry_run, force_delete)
+              if failed:
+                  print(f"\nERROR: {failed} tag deletion(s) failed (e.g. token lacks Delete scope?)")
+                  sys.exit(1)
+          if __name__ == "__main__":
+              main()
+          EOF
+
+      - name: Run Docker Hub cleanup
+        if: env.SKIP_DOCKER_CLEANUP != 'true'
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+          DOCKER_REPOSITORY: doobidoo/mcp-memory-service
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          KEEP_VERSIONS: ${{ github.event.inputs.keep_versions || '5' }}
+          KEEP_MINOR_FLOATERS: ${{ github.event.inputs.keep_minor_floaters || '3' }}
+          FORCE_DELETE_TAGS: ${{ github.event.inputs.force_delete_tags || '' }}
+        run: python3 cleanup_docker_hub.py

@@ -39,6 +39,16 @@ class MockCloudflareWithLimits:
         self.initialized = False
         self.fail_on_limit = True
 
+    @property
+    def supports_capacity_monitoring(self) -> bool:
+        """Mock Cloudflare storage supports capacity monitoring."""
+        return True
+
+    @property
+    def requires_metadata_normalization(self) -> bool:
+        """Mock Cloudflare storage requires metadata normalization."""
+        return True
+
     async def initialize(self):
         self.initialized = True
 
@@ -301,6 +311,10 @@ class TestIntegrationScenarios:
                 metadata={"index": i}
             )
             memories.append(memory)
+            stored, message = await hybrid_with_limits.primary.store(
+                memory, skip_semantic_dedup=True
+            )
+            assert stored, message
 
         # Process memories
         successful = 0
@@ -324,12 +338,17 @@ class TestIntegrationScenarios:
         # Should stop at or before the limit
         assert successful <= 100
         assert failed >= 5  # At least 5 should fail due to limit
+        assert hybrid_with_limits.sync_service.secondary.vector_count == 100
 
     @pytest.mark.asyncio
     async def test_periodic_capacity_check(self, hybrid_with_limits):
-        """Test that periodic sync checks capacity."""
+        """Test that periodic sync checks capacity once its interval is due."""
         # Set up near-limit scenario in the mock backend
         hybrid_with_limits.sync_service.secondary.vector_count = 85
+
+        # Capacity monitoring counts rows on the secondary, so it runs on its own
+        # interval rather than every cycle. Startup already used up the first slot.
+        hybrid_with_limits.sync_service.cloudflare_stats['last_capacity_check'] = 0
 
         # Run periodic sync
         await hybrid_with_limits.sync_service._periodic_sync()

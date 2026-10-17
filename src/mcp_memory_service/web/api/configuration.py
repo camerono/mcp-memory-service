@@ -30,6 +30,7 @@ from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 
 from ..oauth.middleware import require_read_access, require_admin_access
+from ...compat import _sanitize_log_value
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +71,7 @@ PARAM_DESCRIPTIONS = {
     "MCP_MEMORY_STORAGE_BACKEND": "Storage backend to use: sqlite_vec (local), cloudflare (cloud), hybrid (best of both), or milvus (Milvus Lite / self-hosted / Zilliz Cloud)",
     "MCP_HTTP_PORT": "Port for the HTTP server (default: 8000)",
     "MCP_HTTP_HOST": "Host address for HTTP server (default: 127.0.0.1; set to 0.0.0.0 for network access)",
+    "MCP_HTTP_ROOT_PATH": "External URL path prefix when a reverse proxy strips the prefix before forwarding (for example, /memory)",
     "MCP_HTTP_ENABLED": "Enable the HTTP/HTTPS web interface",
     "MCP_HTTPS_ENABLED": "Enable HTTPS with automatic or custom certificate",
     "MCP_SSL_CERT_FILE": "Path to SSL certificate file for HTTPS",
@@ -118,8 +120,10 @@ PARAM_DESCRIPTIONS = {
     "MCP_QUALITY_LOCAL_DEVICE": "Device for local inference: auto, cpu, cuda, mps, directml",
     "MCP_QUALITY_BATCH_SIZE": "Maximum items per ONNX inference batch (default: 32, higher = faster on GPU)",
     "MCP_QUALITY_MIN_GPU_BATCH": "Minimum batch size for GPU batched inference (default: 16)",
-    "MCP_QUALITY_BOOST_ENABLED": "Enable quality-boosted search (default: false)",
+    "MCP_QUALITY_BOOST_ENABLED": "Enable quality-boosted search reranking (default: false)",
     "MCP_QUALITY_BOOST_WEIGHT": "Quality weight for boosted search (0.0-1.0, default: 0.3)",
+    "MCP_QUALITY_IMPLICIT_BLEND_ENABLED": "Blend implicit signals into the stored quality score (default: follows MCP_QUALITY_BOOST_ENABLED)",
+    "MCP_QUALITY_IMPLICIT_WEIGHT": "Implicit-signal share of the stored score (0.0-1.0, default: follows MCP_QUALITY_BOOST_WEIGHT). Higher means less weight on the classifier",
     "MCP_QUALITY_RETENTION_HIGH": "Retention period for high quality memories (days)",
     "MCP_QUALITY_RETENTION_MEDIUM": "Retention period for medium quality memories (days)",
     "MCP_QUALITY_RETENTION_LOW_MIN": "Minimum retention for low quality memories (days)",
@@ -164,7 +168,12 @@ PARAM_DESCRIPTIONS = {
     # Consolidation
     "MCP_CONSOLIDATION_ENABLED": "Enable dream-inspired memory consolidation",
     "MCP_CONSOLIDATION_ARCHIVE_PATH": "Path for consolidation archive",
-    "MCP_DECAY_ENABLED": "Enable quality decay over time",
+    "MCP_DECAY_ENABLED": "Enable relevance/decay scoring during consolidation",
+    "MCP_RETENTION_DECISION": "Retention for decision memories (days)",
+    "MCP_RETENTION_LEARNING": "Retention for learning memories (days)",
+    "MCP_RETENTION_PATTERN": "Retention for pattern memories (days)",
+    "MCP_RETENTION_ERROR": "Retention for error memories (days)",
+    "MCP_RETENTION_OBSERVATION": "Retention for observation memories (days)",
     "MCP_RETENTION_CRITICAL": "Retention for critical memories (days)",
     "MCP_RETENTION_REFERENCE": "Retention for reference memories (days)",
     "MCP_RETENTION_STANDARD": "Retention for standard memories (days)",
@@ -175,7 +184,7 @@ PARAM_DESCRIPTIONS = {
     "MCP_ASSOCIATION_MAX_PAIRS": "Maximum association pairs per run",
     "MCP_CLUSTERING_ENABLED": "Enable memory clustering",
     "MCP_CLUSTERING_MIN_SIZE": "Minimum cluster size",
-    "MCP_CLUSTERING_ALGORITHM": "Clustering algorithm: dbscan, hierarchical, simple",
+    "MCP_CLUSTERING_ALGORITHM": "Clustering algorithm: auto (best available), dbscan, hierarchical, simple",
     "MCP_COMPRESSION_ENABLED": "Enable memory compression",
     "MCP_COMPRESSION_MAX_LENGTH": "Maximum summary length for compression",
     "MCP_COMPRESSION_PRESERVE_ORIGINALS": "Preserve original memories after compression",
@@ -236,6 +245,7 @@ ENV_CATEGORIES = {
             ("MCP_HTTP_ENABLED", "boolean", None, False),
             ("MCP_HTTP_PORT", "integer", None, False),
             ("MCP_HTTP_HOST", "string", None, False),
+            ("MCP_HTTP_ROOT_PATH", "string", None, False),
             ("MCP_HTTPS_ENABLED", "boolean", None, False),
             ("MCP_SSL_CERT_FILE", "string", None, False),
             ("MCP_SSL_KEY_FILE", "string", None, False),
@@ -301,6 +311,8 @@ ENV_CATEGORIES = {
             ("MCP_QUALITY_MIN_GPU_BATCH", "integer", None, False),
             ("MCP_QUALITY_BOOST_ENABLED", "boolean", None, False),
             ("MCP_QUALITY_BOOST_WEIGHT", "float", None, False),
+            ("MCP_QUALITY_IMPLICIT_BLEND_ENABLED", "boolean", None, False),
+            ("MCP_QUALITY_IMPLICIT_WEIGHT", "float", None, False),
             ("MCP_QUALITY_RETENTION_HIGH", "integer", None, False),
             ("MCP_QUALITY_RETENTION_MEDIUM", "integer", None, False),
             ("MCP_QUALITY_RETENTION_LOW_MIN", "integer", None, False),
@@ -368,6 +380,11 @@ ENV_CATEGORIES = {
             ("MCP_CONSOLIDATION_ENABLED", "boolean", None, False),
             ("MCP_CONSOLIDATION_ARCHIVE_PATH", "string", None, False),
             ("MCP_DECAY_ENABLED", "boolean", None, False),
+            ("MCP_RETENTION_DECISION", "integer", None, False),
+            ("MCP_RETENTION_LEARNING", "integer", None, False),
+            ("MCP_RETENTION_PATTERN", "integer", None, False),
+            ("MCP_RETENTION_ERROR", "integer", None, False),
+            ("MCP_RETENTION_OBSERVATION", "integer", None, False),
             ("MCP_RETENTION_CRITICAL", "integer", None, False),
             ("MCP_RETENTION_REFERENCE", "integer", None, False),
             ("MCP_RETENTION_STANDARD", "integer", None, False),
@@ -378,7 +395,7 @@ ENV_CATEGORIES = {
             ("MCP_ASSOCIATION_MAX_PAIRS", "integer", None, False),
             ("MCP_CLUSTERING_ENABLED", "boolean", None, False),
             ("MCP_CLUSTERING_MIN_SIZE", "integer", None, False),
-            ("MCP_CLUSTERING_ALGORITHM", "choice", ["dbscan", "hierarchical", "simple"], False),
+            ("MCP_CLUSTERING_ALGORITHM", "choice", ["auto", "dbscan", "hierarchical", "simple"], False),
             ("MCP_COMPRESSION_ENABLED", "boolean", None, False),
             ("MCP_COMPRESSION_MAX_LENGTH", "integer", None, False),
             ("MCP_COMPRESSION_PRESERVE_ORIGINALS", "boolean", None, False),
@@ -457,7 +474,7 @@ async def get_env_configuration(user = Depends(require_read_access)):
             # Get file modification time
             last_modified = env_path.stat().st_mtime
         except Exception as e:
-            logger.error(f"Error reading .env file: {e}")
+            logger.error("Error reading .env file: %s", _sanitize_log_value(e))
 
     # Build categories
     categories = []
@@ -579,7 +596,7 @@ def _read_env_file_dict(env_path: Path) -> dict:
                         v = v[1:-1]
                     result[key.strip()] = v
     except Exception as e:
-        logger.error(f"Error reading .env file: {e}")
+        logger.error("Error reading .env file: %s", _sanitize_log_value(e))
     return result
 
 
@@ -743,7 +760,7 @@ async def save_credentials(
         }.items():
             _write_credential_to_env(env_path, key, value)
     except Exception as e:
-        logger.error(f"Failed to write credentials to .env: {e}")
+        logger.error("Failed to write credentials to .env: %s", _sanitize_log_value(e))
         raise HTTPException(status_code=500, detail=f"Failed to write .env: {e}")
 
     logger.warning(

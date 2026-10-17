@@ -7,7 +7,19 @@ Filters discussions by:
 - Either zero comments OR last comment >= STALE_DAYS old AND last commenter not in MAINTAINERS
 
 Outputs Markdown for posting to a triage issue (--issue) or stdout (default).
-Designed to run from a GitHub Action with a GITHUB_TOKEN.
+
+RUN THIS BY HAND. It has no scheduler: the GitHub Action that used to invoke it was
+removed with the other 21 workflows during the Codeberg era, and nothing replaced it.
+Re-wiring it is a decision, not a restoration, so it stays manual until someone makes
+that decision. `gh` and the GitHub GraphQL API are the right target: Discussions live
+on GitHub, and so does everything else again since 2026-09-05.
+
+Be careful reading its output as current state. The digest it writes is a snapshot: a
+thread answered an hour later still shows as stale, and the ages are measured from the
+run date, so they keep looking like live counters long after they stop being true. The
+GitHub-era digest went obsolete three days after it was written and then sat unchanged
+for three months across the account suspension. Re-check each thread before acting on
+a line of it.
 """
 from __future__ import annotations
 

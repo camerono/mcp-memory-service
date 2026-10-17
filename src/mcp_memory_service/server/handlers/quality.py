@@ -38,6 +38,28 @@ from ...config import (
 logger = logging.getLogger(__name__)
 
 
+def _as_tag_list(value: object) -> List[str]:
+    """Coerce a tag value to a list, splitting a comma-separated string.
+
+    Tags reach entity extraction from two places and either can be a string:
+    the `Memory.tags` attribute, and a caller-supplied `metadata["tags"]` that
+    older HTTP clients wrote as `"seo,ciod,error"`. Unpacking a string yields one
+    entity per character, which is how the graph filled up with `e`, `o` and `,`
+    nodes (Issue #253). Case is left alone — entity names are not lowercased
+    elsewhere in this path.
+    """
+    if isinstance(value, str):
+        return [t.strip() for t in value.split(',') if t.strip()]
+    if not value:
+        return []
+    return list(value)
+
+
+def _sanitize_log_value(value: object) -> str:
+    """Sanitize a user-provided value for safe inclusion in log messages."""
+    return str(value).replace("\n", "\\n").replace("\r", "\\r").replace("\x1b", "\\x1b")
+
+
 async def handle_memory_quality(server, arguments: dict) -> List[types.TextContent]:
     """Unified handler for quality management operations."""
     action = arguments.get("action")
@@ -93,8 +115,8 @@ async def handle_memory_quality(server, arguments: dict) -> List[types.TextConte
             return [types.TextContent(type="text", text=f"Error: Unknown action '{action}'")]
 
     except Exception as e:
-        error_msg = f"Error in memory_quality action '{action}': {str(e)}"
-        logger.error(f"{error_msg}\n{traceback.format_exc()}")
+        error_msg = f"Error in memory_quality action '{_sanitize_log_value(action)}': {str(e)}"
+        logger.error("%s\n%s", error_msg, traceback.format_exc())
         return [types.TextContent(type="text", text=error_msg)]
 
 
@@ -132,21 +154,25 @@ async def handle_rate_memory(server, arguments: dict) -> List[types.TextContent]
             return [types.TextContent(type="text", text=f"Error retrieving memory: {str(e)}")]
 
         # Update metadata with user rating
-        import time
         memory.metadata['user_rating'] = rating
         memory.metadata['user_feedback'] = feedback
         memory.metadata['user_rating_timestamp'] = time.time()
 
-        # Recalculate quality score with user rating weighted higher
-        # User rating: 0.6 weight, AI/implicit: 0.4 weight
-        user_score = (rating + 1) / 2.0  # Convert -1,0,1 to 0.0,0.5,1.0
+        # Quality model split (#1312): keep computed_quality (machine) separate from
+        # user_rating (human). Preserve any existing computed_quality (seed it from the
+        # current quality_score the first time, so a pre-split memory keeps its machine
+        # value), then materialize the effective quality_score from both origins.
+        from ...quality.config import effective_quality
+        computed = memory.metadata.get('computed_quality')
+        if computed is None:
+            computed = memory.metadata.get('quality_score', 0.5)
+            memory.metadata['computed_quality'] = computed
         existing_score = memory.metadata.get('quality_score', 0.5)
-
-        # Combine scores
-        new_quality_score = 0.6 * user_score + 0.4 * existing_score
+        new_quality_score = effective_quality(computed=computed, user_rating=rating)
         memory.metadata['quality_score'] = new_quality_score
 
-        # Track historical ratings
+        # Track historical ratings (capped; rating_history is not codec-compressed
+        # and can push metadata past the 9.5KB Cloudflare sync limit — #1312).
         rating_history = memory.metadata.get('rating_history', [])
         rating_history.append({
             'rating': rating,
@@ -161,6 +187,7 @@ async def handle_rate_memory(server, arguments: dict) -> List[types.TextContent]
         try:
             quality_updates = {
                 'quality_score': memory.metadata['quality_score'],
+                'computed_quality': memory.metadata['computed_quality'],
                 'user_rating': memory.metadata['user_rating'],
                 'user_feedback': memory.metadata['user_feedback'],
                 'user_rating_timestamp': memory.metadata['user_rating_timestamp'],
@@ -191,7 +218,7 @@ async def handle_rate_memory(server, arguments: dict) -> List[types.TextContent]
         return [types.TextContent(type="text", text="\n".join(response))]
 
     except Exception as e:
-        logger.error(f"Error in rate_memory: {str(e)}\n{traceback.format_exc()}")
+        logger.error("Error in rate_memory: %s\n%s", _sanitize_log_value(e), traceback.format_exc())
         return [types.TextContent(type="text", text=f"Error rating memory: {str(e)}")]
 
 
@@ -262,7 +289,7 @@ async def handle_get_memory_quality(server, arguments: dict) -> List[types.TextC
         return [types.TextContent(type="text", text="\n".join(response_lines))]
 
     except Exception as e:
-        logger.error(f"Error in get_memory_quality: {str(e)}\n{traceback.format_exc()}")
+        logger.error("Error in get_memory_quality: %s\n%s", _sanitize_log_value(e), traceback.format_exc())
         return [types.TextContent(type="text", text=f"Error getting memory quality: {str(e)}")]
 
 
@@ -285,7 +312,7 @@ async def handle_analyze_quality_distribution(server, arguments: dict) -> List[t
         try:
             all_memories = await storage.get_all_memories()
         except Exception as e:
-            logger.error(f"Error retrieving all memories: {str(e)}\n{traceback.format_exc()}")
+            logger.error("Error retrieving all memories: %s\n%s", _sanitize_log_value(e), traceback.format_exc())
             return [types.TextContent(type="text", text=f"Error: Unable to retrieve all memories from storage backend: {str(e)}")]
 
         if not all_memories:
@@ -327,7 +354,7 @@ async def handle_analyze_quality_distribution(server, arguments: dict) -> List[t
         return [types.TextContent(type="text", text="\n".join(response_lines))]
 
     except Exception as e:
-        logger.error(f"Error in analyze_quality_distribution: {str(e)}\n{traceback.format_exc()}")
+        logger.error("Error in analyze_quality_distribution: %s\n%s", _sanitize_log_value(e), traceback.format_exc())
         return [types.TextContent(type="text", text=f"Error analyzing quality distribution: {str(e)}")]
 
 
@@ -496,7 +523,7 @@ async def handle_maintain(server, arguments: dict) -> List[types.TextContent]:
     try:
         from ...config import MAINTAIN_SCAN_LIMIT, MCP_INSIGHT_CARDS_ENABLED
     except ImportError:
-        import os
+        import os  # inline import: only needed on the config-import fallback path
         # Fallback: MCP_MAINTAIN_SCAN_LIMIT limits items scanned to prevent memory exhaustion.
         # High values risk performance degradation; 0 means unlimited.
         raw_limit = os.environ.get('MCP_MAINTAIN_SCAN_LIMIT', '2000') or '2000'
@@ -513,7 +540,9 @@ async def handle_maintain(server, arguments: dict) -> List[types.TextContent]:
         from mcp_memory_service.reasoning.entities import EntityExtractor
         from .graph import get_graph_storage
 
-        extractor = EntityExtractor()
+        extractor = EntityExtractor(
+            domain_extractors=EntityExtractor.get_domain_extractors()
+        )
         total_entities = 0
         linked = 0
 
@@ -529,7 +558,20 @@ async def handle_maintain(server, arguments: dict) -> List[types.TextContent]:
                 except Exception:
                     metadata = {}
 
-            entities = extractor.extract_entities(content, metadata)
+            # `tags` is a top-level Memory attribute; `metadata` is the separate
+            # custom-key dict and is empty on a normally-stored memory. Passing
+            # metadata alone left the extractor's metadata-tag branch dead, so
+            # every tag entity was silently dropped (Issue #218). Merge rather
+            # than substitute: a caller-supplied metadata["tags"] stays valid.
+            # Both sides can arrive as a comma-separated string, so normalize
+            # each before unpacking — see _as_tag_list and Issue #253.
+            merged_tags = list(dict.fromkeys([
+                *_as_tag_list(metadata.get('tags')),
+                *_as_tag_list(getattr(mem, 'tags', None)),
+            ]))
+            extraction_input = {**metadata, 'tags': merged_tags} if merged_tags else metadata
+
+            entities = extractor.extract_entities(content, extraction_input)
             total_entities += len(entities)
 
             if graph:
@@ -583,7 +625,9 @@ async def handle_maintain(server, arguments: dict) -> List[types.TextContent]:
                     "types": {t: sum(1 for i in insights if i.insight_type == t) for t in ("pattern", "trend", "gap")},
                 }
             else:
-                stored = await store_insights(insights, storage)
+                from .graph import get_graph_storage
+                insight_graph = await get_graph_storage()
+                stored = await store_insights(insights, storage, graph=insight_graph)
                 report["steps"]["insights"] = {
                     "generated": len(insights),
                     "stored": len(stored),
@@ -599,7 +643,11 @@ async def handle_maintain(server, arguments: dict) -> List[types.TextContent]:
     from mcp_memory_service.consolidation.contradictions import detect_contradictions, CONTRADICTION_ENABLED
     if CONTRADICTION_ENABLED:
         try:
-            contradiction_result = await detect_contradictions(storage, dry_run=dry_run)
+            from .graph import get_graph_storage
+            contradiction_graph = await get_graph_storage() if not dry_run else None
+            contradiction_result = await detect_contradictions(
+                storage, dry_run=dry_run, graph=contradiction_graph
+            )
             report["steps"]["contradictions"] = contradiction_result
         except Exception as e:
             report["steps"]["contradictions"] = {"error": str(e)}
@@ -613,3 +661,50 @@ async def handle_maintain(server, arguments: dict) -> List[types.TextContent]:
 
     _last_maintain_run = report
     return [types.TextContent(type="text", text=json.dumps(report, indent=2, default=str))]
+
+
+# =============================================================================
+# Conflict Detection & Resolution Handlers
+# =============================================================================
+
+
+async def handle_memory_conflicts(server, arguments: dict) -> List[types.TextContent]:
+    """List unresolved memory conflicts."""
+    await server._ensure_storage_initialized()
+    conflicts = await server.storage.get_conflicts()
+    if not conflicts:
+        return [types.TextContent(type="text", text="No unresolved conflicts found.")]
+
+    lines = [f"Found {len(conflicts)} conflict(s):\n"]
+    for c in conflicts:
+        lines.append(f"- {c['hash_a'][:12]} vs {c['hash_b'][:12]} "
+                     f"(similarity: {c['similarity']:.2f}, divergence: {c.get('divergence', '?')})")
+        lines.append(f"  A: {c['content_a'][:100]}")
+        lines.append(f"  B: {c['content_b'][:100]}")
+    return [types.TextContent(type="text", text="\n".join(lines))]
+
+
+async def handle_memory_resolve(server, arguments: dict) -> List[types.TextContent]:
+    """Resolve a memory conflict. Accepts single pair or batch (hashes list)."""
+    await server._ensure_storage_initialized()
+
+    # Batch mode: list of {winner_hash, loser_hash} dicts
+    hashes = arguments.get("hashes")
+    if hashes and isinstance(hashes, list):
+        results = []
+        for pair in hashes:
+            w = pair.get("winner_hash", "")
+            l = pair.get("loser_hash", "")
+            if w and l:
+                ok, msg = await server.storage.resolve_conflict(w, l)
+                results.append(msg)
+        return [types.TextContent(type="text", text=f"Resolved {len(results)} conflict(s):\n" + "\n".join(results))]
+
+    # Single mode (backward compat)
+    winner = arguments.get("winner_hash", "")
+    loser = arguments.get("loser_hash", "")
+    if not winner or not loser:
+        return [types.TextContent(type="text", text="Error: winner_hash and loser_hash required (or pass hashes list for batch)")]
+
+    ok, msg = await server.storage.resolve_conflict(winner, loser)
+    return [types.TextContent(type="text", text=msg)]

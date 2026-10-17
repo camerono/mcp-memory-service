@@ -12,6 +12,7 @@ Usage:
     python scripts/maintenance/improve_memory_ontology.py [--dry-run] [--start-chunk N]
 """
 
+import os
 import requests
 import json
 import sys
@@ -26,6 +27,10 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # API Configuration
 API_BASE_URLS = ["http://127.0.0.1:8000/api", "https://127.0.0.1:8000/api"]
 HEADERS = {"Content-Type": "application/json"}
+# Authenticate when the server requires an API key (MCP_API_KEY env var).
+_API_KEY = os.environ.get("MCP_API_KEY", "").strip()
+if _API_KEY:
+    HEADERS["Authorization"] = f"Bearer {_API_KEY}"
 
 
 def get_working_api_url() -> str:
@@ -100,6 +105,8 @@ def make_request(method, endpoint, **kwargs):
     """Make HTTP request with proper SSL handling."""
     url = f"{API_URL}{endpoint}"
     kwargs["verify"] = kwargs.get("verify", VERIFY_SSL)
+    # Always send auth/content headers; merge with any per-call overrides.
+    kwargs["headers"] = {**HEADERS, **kwargs.get("headers", {})}
     return requests.request(method, url, **kwargs)
 
 

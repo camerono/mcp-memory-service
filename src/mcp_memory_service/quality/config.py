@@ -29,9 +29,19 @@ class QualityConfig:
     openai_compat_model: Optional[str] = None      # e.g. qwen2.5:7b-instruct
     openai_compat_api_key: Optional[str] = None    # optional; use "ollama" for Ollama
 
-    # Quality boost (AI + implicit signals combination)
+    # Quality boost — search-side reranking (see config/quality.py, consumed by
+    # the storage backends). Kept here because the store-time blend below used
+    # to piggyback on these two fields.
     boost_enabled: bool = False
-    boost_weight: float = 0.3  # Weight for implicit signals when combining with AI
+    boost_weight: float = 0.3
+
+    # Store-time blend of implicit signals into the AI score (QualityScorer).
+    # Separate from the search-side knobs above: there, a higher weight means
+    # "trust the quality score more"; here it means "trust the classifier less".
+    # Both defaults are inherited from the boost settings when the dedicated
+    # variables are unset, so existing deployments keep their behaviour (#179).
+    implicit_blend_enabled: bool = False
+    implicit_weight: float = 0.3
 
     # Fallback scoring (DeBERTa primary, MS-MARCO rescue for technical content)
     # NOTE: Fallback mode not recommended - MS-MARCO is query-relevance model, not quality classifier
@@ -41,7 +51,22 @@ class QualityConfig:
 
     @classmethod
     def from_env(cls) -> 'QualityConfig':
-        """Load configuration from environment variables."""
+        """Load configuration from environment variables.
+
+        ``MCP_QUALITY_IMPLICIT_BLEND_ENABLED`` and ``MCP_QUALITY_IMPLICIT_WEIGHT``
+        control the store-time blend. When unset they fall back to the boost
+        settings, which is what drove the blend before #179 — so nobody's stored
+        scores shift because of this change.
+        """
+        boost_enabled = os.getenv('MCP_QUALITY_BOOST_ENABLED', 'false').lower() == 'true'
+        boost_weight = float(os.getenv('MCP_QUALITY_BOOST_WEIGHT', '0.3'))
+
+        blend_raw = os.getenv('MCP_QUALITY_IMPLICIT_BLEND_ENABLED')
+        implicit_blend_enabled = (
+            blend_raw.lower() == 'true' if blend_raw is not None else boost_enabled
+        )
+        implicit_weight = float(os.getenv('MCP_QUALITY_IMPLICIT_WEIGHT', str(boost_weight)))
+
         return cls(
             enabled=os.getenv('MCP_QUALITY_SYSTEM_ENABLED', 'true').lower() == 'true',
             ai_provider=os.getenv('MCP_QUALITY_AI_PROVIDER', 'local'),
@@ -52,8 +77,10 @@ class QualityConfig:
             openai_compat_base_url=os.getenv('MCP_QUALITY_AI_BASE_URL'),
             openai_compat_model=os.getenv('MCP_QUALITY_AI_MODEL'),
             openai_compat_api_key=os.getenv('MCP_QUALITY_AI_API_KEY'),
-            boost_enabled=os.getenv('MCP_QUALITY_BOOST_ENABLED', 'false').lower() == 'true',
-            boost_weight=float(os.getenv('MCP_QUALITY_BOOST_WEIGHT', '0.3')),
+            boost_enabled=boost_enabled,
+            boost_weight=boost_weight,
+            implicit_blend_enabled=implicit_blend_enabled,
+            implicit_weight=implicit_weight,
             fallback_enabled=os.getenv('MCP_QUALITY_FALLBACK_ENABLED', 'false').lower() == 'true',
             deberta_threshold=float(os.getenv('MCP_QUALITY_DEBERTA_THRESHOLD', '0.6')),
             ms_marco_threshold=float(os.getenv('MCP_QUALITY_MSMARCO_THRESHOLD', '0.7'))
@@ -70,6 +97,9 @@ class QualityConfig:
 
         if not 0.0 <= self.boost_weight <= 1.0:
             raise ValueError(f"boost_weight must be between 0.0 and 1.0, got {self.boost_weight}")
+
+        if not 0.0 <= self.implicit_weight <= 1.0:
+            raise ValueError(f"implicit_weight must be between 0.0 and 1.0, got {self.implicit_weight}")
 
         # Validate fallback thresholds
         if not 0.0 <= self.deberta_threshold <= 1.0:
@@ -179,3 +209,33 @@ def validate_model_selection(model_name: str) -> dict:
             f"Supported models: {list(SUPPORTED_MODELS.keys())}"
         )
     return SUPPORTED_MODELS[model_name]
+
+
+# --- Quality model composition (#1312) -------------------------------------
+# quality_score is a single materialized "effective" value written from two
+# origin fields kept separately in metadata: computed_quality (machine) and
+# user_rating (human -1/0/+1). Consumers that read quality_score need no change;
+# retention (forgetting) reads computed_quality directly so a human down-vote
+# de-ranks search without changing the keep/forget verdict.
+
+# Human rating -1/0/+1 mapped to a search-facing effective value. A thumbs-down
+# de-ranks hard (0.25) without pinning to an absolute floor (0.0); a single
+# thumbs-up (0.9) does not claim more certainty than the scorer's top band.
+USER_RATING_TO_QUALITY = {-1: 0.25, 0: 0.5, 1: 0.9}
+
+
+def effective_quality(computed=None, user_rating=None) -> float:
+    """Compose the materialized effective quality_score from the two origins.
+
+    Human rating wins when present (mapped via USER_RATING_TO_QUALITY); otherwise
+    the machine computed_quality; otherwise the 0.5 default. computed_quality is
+    never consumed here in a way that erases it — callers keep it as its own field.
+    """
+    if user_rating is not None:
+        try:
+            return USER_RATING_TO_QUALITY[int(user_rating)]
+        except (KeyError, ValueError, TypeError):
+            pass
+    if computed is not None:
+        return float(computed)
+    return 0.5

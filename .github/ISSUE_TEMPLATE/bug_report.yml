@@ -64,6 +64,7 @@ body:
         - sqlite-vec (local)
         - cloudflare (remote)
         - hybrid (sqlite + cloudflare)
+        - milvus (community-maintained)
         - unsure
     validations:
       required: true

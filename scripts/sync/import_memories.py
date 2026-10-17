@@ -35,7 +35,8 @@ sys.path.insert(0, str(project_root / "src"))
 
 from mcp_memory_service.storage.sqlite_vec import SqliteVecMemoryStorage
 from mcp_memory_service.sync.importer import MemoryImporter
-from mcp_memory_service.config import SQLITE_VEC_PATH, STORAGE_BACKEND
+from mcp_memory_service.config import SQLITE_VEC_PATH, EMBEDDING_MODEL_NAME
+from mcp_memory_service.compat import _sanitize_log_value
 
 # Configure logging
 logging.basicConfig(
@@ -47,10 +48,11 @@ logger = logging.getLogger(__name__)
 
 def get_default_db_path() -> Path:
     """Get the default database path for this platform."""
-    if STORAGE_BACKEND == 'sqlite_vec' and SQLITE_VEC_PATH:
+    # Set for both sqlite_vec and hybrid, whose primary is the same SQLite file.
+    if SQLITE_VEC_PATH:
         return Path(SQLITE_VEC_PATH)
     else:
-        # Fallback to BASE_DIR if not using sqlite_vec backend
+        # Fallback to BASE_DIR for backends without a local SQLite file
         from mcp_memory_service.config import BASE_DIR
         return Path(BASE_DIR) / "sqlite_vec.db"
 
@@ -110,7 +112,10 @@ async def import_memories(
     try:
         # Initialize storage
         logger.info("Initializing SQLite-vec storage...")
-        storage = SqliteVecMemoryStorage(str(db_path))
+        # Same model as the server (factory.py passes EMBEDDING_MODEL_NAME): a fresh
+        # database is built at this model's dimension, and the imported memories are
+        # embedded with it.
+        storage = SqliteVecMemoryStorage(str(db_path), embedding_model=EMBEDDING_MODEL_NAME)
         await storage.initialize()
         
         # Create importer
@@ -156,11 +161,20 @@ async def import_memories(
         logger.info(f"  Total processed: {result['total_processed']}")
         logger.info(f"  Successfully imported: {result['imported']}")
         logger.info(f"  Duplicates skipped: {result['duplicates_skipped']}")
+        logger.info(f"  Rejected by storage: {result['rejected']}")
         logger.info(f"  Errors: {result['errors']}")
         
         logger.info(f"  Source breakdown:")
         for source, stats in result['sources'].items():
-            logger.info(f"    {source}: {stats['imported']}/{stats['total']} imported, {stats['duplicates']} duplicates")
+            logger.info(f"    {_sanitize_log_value(source)}: {stats['imported']}/{stats['total']} imported, {stats['duplicates']} duplicates, {stats['rejected']} rejected")
+        for rejection in result['rejections']:
+            # Hash, store and reason come from the export file and the storage: sanitise before logging.
+            logger.info(
+                "    rejected %s (%s): %s",
+                _sanitize_log_value(rejection['content_hash'][:12]),
+                _sanitize_log_value(rejection['store']),
+                _sanitize_log_value(rejection['reason']),
+            )
         
         if not dry_run and result['imported'] > 0:
             # Show next steps

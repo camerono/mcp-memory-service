@@ -11,6 +11,10 @@ The MCP Memory Service supports native Cloudflare integration using Vectorize fo
 
 This setup provides global distribution, automatic scaling, and cost-effective pay-per-use pricing.
 
+> **No Cloudflare account?** The hybrid backend can sync to a self-hosted MCP Memory Service
+> instead (`MCP_HYBRID_SECONDARY_BACKEND=http`); see the
+> [self-hosted sync hub guide](guides/self-hosted-sync-hub.md).
+
 ## 🚀 Quick Start
 
 For users who want to get started immediately:
@@ -43,11 +47,11 @@ export CLOUDFLARE_D1_DATABASE_ID="your-d1-database-id"
 export CLOUDFLARE_R2_BUCKET="mcp-memory-content"  # Optional
 
 # 4. Test and start
-python -m src.mcp_memory_service.server
+memory launch                   # HTTP server (background, recommended)
 
 # Alternative startup methods:
-# uv run memory server          # Modern CLI (recommended)
-# python scripts/run_memory_server.py  # Direct script execution
+# memory server                 # MCP stdio (for Claude Desktop)
+# python -m mcp_memory_service.server  # MCP stdio (module form)
 ```
 
 > **⚠️ Important**: Cloudflare backend uses Workers AI for embedding generation, so do NOT use `scripts/memory_offline.py` which sets offline mode. Use the standard startup methods above instead.
@@ -264,7 +268,7 @@ curl -X POST http://localhost:8000/api/memories \
   }'
 
 # Search memories
-curl -X POST http://localhost:8000/api/memories/search \
+curl -X POST http://localhost:8000/api/search \
   -H "Content-Type: application/json" \
   -d '{
     "query": "test memory",
@@ -272,7 +276,7 @@ curl -X POST http://localhost:8000/api/memories/search \
   }'
 
 # Get statistics
-curl http://localhost:8000/api/stats
+curl http://localhost:8000/api/memory-stats
 ```
 
 **Option C: Automated Resource Setup**
@@ -331,17 +335,20 @@ python scripts/import_to_cloudflare.py --input cloudflare_export.json
 
 ### From Legacy ChromaDB Data
 
-ChromaDB was removed in v8.0.0. If you still have ChromaDB data, export it from the [`chromadb-legacy`](https://github.com/doobidoo/mcp-memory-service/tree/chromadb-legacy) branch first (see [guides/chromadb-migration.md](guides/chromadb-migration.md)) and then import the resulting JSON into Cloudflare:
+ChromaDB was removed in v8.0.0. If you still have ChromaDB data, convert it to SQLite-vec on the [`chromadb-legacy-final`](https://github.com/doobidoo/mcp-memory-service/tree/chromadb-legacy-final) tag first (see [guides/chromadb-migration.md](guides/chromadb-migration.md)), then export that database to JSON on main and import it into Cloudflare:
 
 ```bash
-# On the chromadb-legacy branch — produce a backup JSON
-git checkout chromadb-legacy
-python scripts/migration/migrate_chroma_to_sqlite.py --backup ~/chromadb_backup.json
+# On the chromadb-legacy-final tag: ChromaDB -> SQLite-vec
+git checkout chromadb-legacy-final
+python scripts/migration/migrate_chroma_to_sqlite.py \
+    --chroma-path /path/to/chroma_db --sqlite-path ~/chroma_export.db
 
-# Back on main — switch to Cloudflare and import
+# Back on main: SQLite-vec -> JSON -> Cloudflare (Cloudflare credentials set as above)
 git checkout main
 export MCP_MEMORY_STORAGE_BACKEND=cloudflare
-python scripts/import_to_cloudflare.py --input ~/chromadb_backup.json
+python scripts/migration/migrate_to_cloudflare.py export \
+    --source sqlite_vec --source-path ~/chroma_export.db --output ~/chromadb_backup.json
+python scripts/migration/migrate_to_cloudflare.py import --input ~/chromadb_backup.json
 ```
 
 ## Troubleshooting
@@ -427,8 +434,8 @@ python -m src.mcp_memory_service.server --debug
 # Check backend health
 curl http://localhost:8000/api/health
 
-# Get detailed statistics
-curl http://localhost:8000/api/stats
+# Get detailed statistics (authenticated)
+curl http://localhost:8000/api/health/detailed
 ```
 
 ## Limitations
@@ -582,7 +589,7 @@ For issues and questions:
 1. **Documentation**: Check this guide and API documentation
 2. **GitHub Issues**: Report bugs at the project repository
 3. **Cloudflare Support**: For Cloudflare service-specific issues
-4. **Community**: Join the project Discord/community channels
+4. **Community**: Ask in [GitHub Discussions](https://github.com/doobidoo/mcp-memory-service/discussions)
 
 ## Performance Benchmarks
 
